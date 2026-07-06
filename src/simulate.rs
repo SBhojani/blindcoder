@@ -15,7 +15,12 @@
 //!   * `true_value = quality − cost_sensitivity · normalized_price`; best = argmax.
 //!   * rating: difficulty `d ~ U{0..4}`; `base = 4·quality − 2`;
 //!     `latent = base − difficulty_drag·d + Normal(0,noise)`; `perf = round(clamp(latent,−2,2))`.
-//!     `difficulty_credit` is meant to cancel `difficulty_drag`.
+//!     `difficulty_credit` cancels `difficulty_drag` for *successful* work only (the scorer gates
+//!     credit on `perf > 0`), so a good model on a hard task is not penalised, but a failure is
+//!     not laundered into a win.
+//!   * **rating sparsity** (`rate_prob`): only a fraction of sessions get rated (real users rate
+//!     ~1/day). The decay clock still advances with wall time, so sparse feedback = less evidence
+//!     over the same span — the biggest sim-vs-reality gap, and the honest convergence stress.
 
 use clap::Args;
 use config::Config;
@@ -51,6 +56,10 @@ pub struct SimulateArgs {
     /// Rating observation noise (std-dev, in performance points).
     #[arg(long, default_value_t = 0.8)]
     pub noise: f64,
+    /// Probability that a session actually gets rated (1.0 = every session; real users rate a
+    /// fraction). `rate * rate_prob` = ratings/day — the honest evidence-accrual rate.
+    #[arg(long, default_value_t = 1.0)]
+    pub rate_prob: f64,
     /// Trailing window (sessions) for the convergence / rate metrics.
     #[arg(long, default_value_t = 50)]
     pub window: usize,
@@ -105,6 +114,9 @@ pub struct SweepArgs {
     pub difficulty_drag: f64,
     #[arg(long, default_value_t = 0.8)]
     pub noise: f64,
+    /// Probability that a session actually gets rated (1.0 = every session).
+    #[arg(long, default_value_t = 1.0)]
+    pub rate_prob: f64,
     #[arg(long, default_value_t = 50)]
     pub window: usize,
     #[arg(long, default_value_t = 0.8)]
@@ -146,6 +158,8 @@ struct Harness {
     seed: u64,
     difficulty_drag: f64,
     noise: f64,
+    /// Probability a session gets rated (1.0 = dense; < 1.0 = sparse feedback).
+    rate_prob: f64,
     window: usize,
     converge_at: f64,
     value_epsilon: f64,
@@ -266,11 +280,16 @@ fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
             ttc = Some(s + 1);
         }
 
-        let d = rng.gen_range(0..=4) as f64;
-        let base = 4.0 * quality[picked] - 2.0;
-        let latent = base - h.difficulty_drag * d + rating_noise.sample(rng);
-        let perf = latent.round().clamp(-2.0, 2.0);
-        raw_events[picked].push((now, perf, d));
+        // Sparse feedback: only a fraction of sessions get rated. The decay clock still advances
+        // with wall time, so sparsity means less evidence over the same span — the real test.
+        // (`>= 1.0` short-circuits the coin draw so dense runs stay bit-for-bit reproducible.)
+        if h.rate_prob >= 1.0 || rng.gen::<f64>() < h.rate_prob {
+            let d = rng.gen_range(0..=4) as f64;
+            let base = 4.0 * quality[picked] - 2.0;
+            let latent = base - h.difficulty_drag * d + rating_noise.sample(rng);
+            let perf = latent.round().clamp(-2.0, 2.0);
+            raw_events[picked].push((now, perf, d));
+        }
     }
 
     let best_rate = window_rate(&best_hist, h.sessions, h.window);
@@ -344,6 +363,9 @@ pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
     if args.pool == 0 || args.sessions == 0 || args.trials == 0 {
         anyhow::bail!("--pool, --sessions and --trials must all be >= 1");
     }
+    if !(0.0..=1.0).contains(&args.rate_prob) || args.rate_prob <= 0.0 {
+        anyhow::bail!("--rate-prob must be in (0, 1]");
+    }
     let t = effective_tuneables(
         cfg,
         Overrides {
@@ -363,6 +385,7 @@ pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
         seed: args.seed,
         difficulty_drag: args.difficulty_drag,
         noise: args.noise,
+        rate_prob: args.rate_prob,
         window: args.window,
         converge_at: args.converge_at,
         value_epsilon: args.value_epsilon,
@@ -377,8 +400,8 @@ pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
     println!("blindcoder simulate — selector convergence harness");
     println!("──────────────────────────────────────────────────");
     println!(
-        "pool={}  sessions={}  trials={}  rate={}/day  difficulty_drag={}  noise={}  value_ε={}",
-        h.pool, h.sessions, h.trials, h.rate, h.difficulty_drag, h.noise, h.value_epsilon
+        "pool={}  sessions={}  trials={}  rate={}/day  rate_prob={} ({:.2} ratings/day)  difficulty_drag={}  noise={}  value_ε={}",
+        h.pool, h.sessions, h.trials, h.rate, h.rate_prob, h.rate * h.rate_prob, h.difficulty_drag, h.noise, h.value_epsilon
     );
     println!(
         "tuneables: cost_sensitivity={}  difficulty_credit={}  rating_half_life={}d  exploration={}  score_spread={}",
@@ -419,10 +442,13 @@ pub fn run_sweep(args: &SweepArgs, cfg: &Config) -> anyhow::Result<()> {
     if args.pools.is_empty() || args.explorations.is_empty() {
         anyhow::bail!("--pools and --explorations must each have at least one value");
     }
+    if !(0.0..=1.0).contains(&args.rate_prob) || args.rate_prob <= 0.0 {
+        anyhow::bail!("--rate-prob must be in (0, 1]");
+    }
     let prune = !args.no_prune;
     eprintln!(
-        "# sweep: sessions={} trials={} rate={}/day noise={} difficulty_drag={} value_ε={} pruning={} drift={} jump_rate={}",
-        args.sessions, args.trials, args.rate, args.noise, args.difficulty_drag, args.value_epsilon,
+        "# sweep: sessions={} trials={} rate={}/day rate_prob={} noise={} difficulty_drag={} value_ε={} pruning={} drift={} jump_rate={}",
+        args.sessions, args.trials, args.rate, args.rate_prob, args.noise, args.difficulty_drag, args.value_epsilon,
         if prune { "on" } else { "off" }, args.drift, args.jump_rate
     );
     println!("pool,exploration,value_eff,gap_captured,good_rate,best_rate,converged_frac,median_ttc,verdict");
@@ -447,6 +473,7 @@ pub fn run_sweep(args: &SweepArgs, cfg: &Config) -> anyhow::Result<()> {
                 seed: args.seed,
                 difficulty_drag: args.difficulty_drag,
                 noise: args.noise,
+                rate_prob: args.rate_prob,
                 window: args.window,
                 converge_at: args.converge_at,
                 value_epsilon: args.value_epsilon,

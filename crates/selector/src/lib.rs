@@ -75,11 +75,19 @@ fn logistic(x: f64) -> f64 {
 
 /// Map one rating to a session score in `(0, 1)`.
 ///
-/// `adjusted_performance = performance_points + difficulty_credit * difficulty_points` — so
-/// "fine on a hard task" can match or beat "great on a trivial task" — then squashed through a
+/// Difficulty credit is a *fairness* correction for a model that drew harder work — so "fine on a
+/// hard task" can match or beat "great on a trivial task". But it must never rescue a failure: a
+/// bad performance on a hard task is still a failure, not a win. So the credit only applies to
+/// non-negative (successful) performance; a negative `performance_points` earns no credit and is
+/// scored purely on its own merit. `adjusted = performance_points + credit`, squashed through a
 /// logistic of scale `score_spread`.
 pub fn session_score(r: &Rating, t: &Tuneables) -> f64 {
-    let adjusted = r.performance_points + t.difficulty_credit * r.difficulty_points;
+    let credit = if r.performance_points > 0.0 {
+        t.difficulty_credit * r.difficulty_points
+    } else {
+        0.0
+    };
+    let adjusted = r.performance_points + credit;
     logistic(adjusted / t.score_spread)
 }
 
@@ -299,7 +307,52 @@ mod tests {
         assert_eq!(prune_dominated(&cands, &t).len(), 2);
     }
 
+    #[test]
+    fn hard_failure_is_not_a_win() {
+        // Regression: perf -2 on a difficulty-4 task must score as a loss (< 0.5), not a win.
+        // Before the credit-gating fix this was -2 + 0.75*4 = +1 -> logistic(0.5) ~ 0.62 (a "win").
+        let t = Tuneables::default();
+        let hard_fail = session_score(
+            &Rating { performance_points: -2.0, difficulty_points: 4.0, age_days: 0.0 },
+            &t,
+        );
+        assert!(hard_fail < 0.5, "hard failure scored {hard_fail} (should be a loss)");
+        // It should match a plain failure of the same performance — difficulty gives no credit.
+        let plain_fail = session_score(
+            &Rating { performance_points: -2.0, difficulty_points: 0.0, age_days: 0.0 },
+            &t,
+        );
+        assert_eq!(hard_fail, plain_fail);
+    }
+
+    #[test]
+    fn hard_success_still_beats_trivial_success() {
+        // The fairness correction is preserved: acing a hard task outranks acing a trivial one.
+        let t = Tuneables::default();
+        let hard_win = session_score(
+            &Rating { performance_points: 2.0, difficulty_points: 4.0, age_days: 0.0 },
+            &t,
+        );
+        let trivial_win = session_score(
+            &Rating { performance_points: 2.0, difficulty_points: 0.0, age_days: 0.0 },
+            &t,
+        );
+        assert!(hard_win > trivial_win);
+    }
+
     proptest! {
+        #[test]
+        fn hard_task_credit_never_rescues_a_failure(
+            perf in -2.0f64..=0.0, diff in 0.0f64..=4.0
+        ) {
+            // For any non-positive performance, adding difficulty must not change the score:
+            // credit is gated on success, so a failure is scored on its own merit regardless of difficulty.
+            let t = Tuneables::default();
+            let with_diff = session_score(&Rating { performance_points: perf, difficulty_points: diff, age_days: 0.0 }, &t);
+            let no_diff = session_score(&Rating { performance_points: perf, difficulty_points: 0.0, age_days: 0.0 }, &t);
+            prop_assert_eq!(with_diff, no_diff);
+        }
+
         #[test]
         fn session_score_in_unit_interval(
             perf in -2.0f64..=2.0, diff in 0.0f64..=4.0

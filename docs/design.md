@@ -31,8 +31,10 @@ value_score = quality_guess − cost_sensitivity × normalized_price
 - **Price is the shelf rate, normalized pool-relative** (the priciest eligible candidate ≈ 1.0),
   so `cost_sensitivity` means the same thing regardless of absolute prices.
 - **Ratings are two questions:** how well it did (`-2..+2`) and how hard the task was (`0..4`).
-  They combine as `performance + difficulty_credit × difficulty`, so handling a hard task fairly
-  can outrank acing a trivial one — the fairness correction for a model that drew harder work.
+  They combine as `performance + difficulty_credit × difficulty` **for successful performance
+  only** (a negative `performance` earns no difficulty credit), so handling a hard task well can
+  outrank acing a trivial one — a fairness correction for a model that drew harder work, without
+  letting difficulty rescue an outright failure.
 - **Belief is an event-sourced fold,** not a mutable score: replay the rating events with
   recency decay (a configurable half-life) at pick time.
 
@@ -46,6 +48,27 @@ the selector actually converge, at a realistic pool size and session volume, or 
 permanent random explorer?* Synthetic raters with a known ground truth drive the real selector;
 it reports best-arm pick-rate over time, cumulative regret vs. a random baseline, and
 time-to-converge, and prints a GO / MARGINAL / NO-GO verdict. Use it to size the pool and tune.
+
+**Rating sparsity is the load-bearing stress axis.** Real users rate only a fraction of sessions
+(~1/day), not every one, so the honest question is whether the selector accrues enough evidence
+per arm under *sparse* feedback. The `--rate-prob` knob (probability a session gets rated;
+`rate × rate_prob` = ratings/day) exposes this, and it is where the design's size ceiling comes
+from:
+
+- **A small pool (3–4) degrades gracefully** — at ~1 rating/day it still captures ~0.71–0.80 of
+  the value gap (MARGINAL). This is the recommended operating point.
+- **A large pool (8) collapses** — at ~1 rating/day it falls to NO-GO (~0.58 value-efficiency,
+  <30 % of trials converge), and a **longer horizon does not rescue it**: at 4× the sessions the
+  steady-state efficiency is still ~0.58, because recency decay caps effective evidence density —
+  old ratings fade as fast as sparse new ones arrive. The lever is *fewer candidates*, not *more
+  time*.
+- **Sparsity compounds with drift** — sparse feedback on a moving target (`--drift`) is the true
+  worst case (pool=3 ≈ 0.47 value-efficiency), reinforcing that the goal is robustness, not a
+  maximal stationary metric.
+
+The prior every-session-rated harness was optimistic (its rater was the exact inverse of the
+scorer). The sparsity axis is what makes the go/no-go non-circular. **Conclusion: bound the pool
+(≈3–4).**
 
 ## Storage
 
