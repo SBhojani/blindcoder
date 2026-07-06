@@ -1,0 +1,59 @@
+# blindcoder example configuration.
+#
+# Copy to $XDG_CONFIG_HOME/blindcoder/config.toml (usually ~/.config/blindcoder/config.toml)
+# and edit. Every field is optional and falls back to the pinned default shown below.
+# Precedence is: command-line flag > environment variable > this file > built-in default.
+
+# --- selector tuneables ---------------------------------------------------------------------
+
+# Price vs quality trade-off. 0 = ignore price (best quality); 0.5 = balanced;
+# 1.0 = cost counts as a full quality point; 2.0 = ruthlessly cheap.
+cost_sensitivity = 0.5
+
+# Which shelf price feeds the cost bias. Blended because agentic context-resending makes input
+# token volume large even though input is cheaper per token.
+[cost_basis]
+input_weight = 0.70
+output_weight = 0.30
+
+# How much a model's quality belief is shared across providers (0 = fully separate,
+# 1 = identical everywhere).
+provider_pooling = 0.3
+
+# Extra credit for handling hard tasks, so "fine on hard" can outrank "great on trivial".
+difficulty_credit = 0.75
+
+# Recency: older ratings decay with this half-life (days). Lower = trust recent more.
+rating_half_life_days = 60
+
+# <1 = exploit/commit faster; >1 = explore more. The selector auto-balances, so 1.0 is neutral.
+exploration = 1.0
+
+# How decisively a single rating moves the track record (logistic scale; larger = gentler).
+score_spread = 2.0
+
+# Track price history for the entire catalog (not just models you use). Off by default.
+track_market = false
+
+# How often to re-poll prices for the active pool (hours).
+price_refresh_interval_hours = 24
+
+# --- safety knobs ---------------------------------------------------------------------------
+
+# Per-session spend kill-switch (USD). A session exceeding this is halted and you are prompted.
+# A catastrophe bound on runaway agentic loops, not a budget lever. 0 disables it.
+max_session_cost_usd = 5.0
+
+# Freshness bound (days) on hand-maintained data-policy entries. Past this age a curated ZDR
+# assertion is treated as stale and its models are excluded (fail-closed).
+curated_policy_max_age_days = 90
+
+# --- providers ------------------------------------------------------------------------------
+# Declare each backend once. Put the real API key in the environment variable named by
+# `key_env` (never inline it here in a file you might share).
+
+# [[providers]]
+# slug = "openrouter"
+# base_url = "https://openrouter.ai/api/v1"
+# wire = "openai"
+# key_env = "OPENROUTER_API_KEY"

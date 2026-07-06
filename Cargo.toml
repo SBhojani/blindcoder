@@ -1,0 +1,29 @@
+[package]
+name = "blindcoder"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "A blind, cost/quality-aware router for agentic coding CLIs."
+repository = "https://github.com/SBhojani/blindcoder"
+rust-version = "1.74"
+
+[[bin]]
+name = "blindcoder"
+path = "src/main.rs"
+
+[workspace]
+members = ["crates/selector", "crates/config", "crates/alias", "crates/store", "crates/backend"]
+
+[dependencies]
+selector = { path = "crates/selector" }
+config = { path = "crates/config" }
+alias = { path = "crates/alias" }
+store = { path = "crates/store" }
+backend = { path = "crates/backend" }
+clap = { version = "4", features = ["derive"] }
+anyhow = "1"
+rand = "0.8"
+rand_distr = "0.4"
+
+[profile.release]
+lto = true

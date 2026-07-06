@@ -1,0 +1,17 @@
+# Build artifacts
+/target/
+**/*.rs.bk
+
+# User state — never published.
+# The authoritative event log (SQLite) also holds the alias<->model map (the blind key);
+# publishing it would both leak usage and defeat the blind. Wire archives are local-only too.
+*.db
+*.db-wal
+*.db-shm
+/wire/
+*.warc.gz
+
+# Real config and secrets (ship config.example.toml instead)
+/config.toml
+.env
+*.key

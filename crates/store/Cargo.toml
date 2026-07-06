@@ -1,0 +1,10 @@
+[package]
+name = "store"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "blindcoder store: append-only, event-sourced SQLite (the full M0 schema, written once)."
+
+[dependencies]
+anyhow = "1"
+rusqlite = { version = "0.31", features = ["bundled"] }

@@ -1,0 +1,9 @@
+[package]
+name = "backend"
+version = "0.0.0"
+edition = "2021"
+license = "Apache-2.0"
+description = "blindcoder backend seam: the Backend transport trait (grows from a trivial proxy into the full tee)."
+
+[dependencies]
+anyhow = "1"
