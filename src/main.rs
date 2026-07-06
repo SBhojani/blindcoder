@@ -29,6 +29,8 @@ struct Cli {
 enum Cmd {
     /// Offline convergence harness: synthetic raters drive the real selector (the M0 go/no-go).
     Simulate(simulate::SimulateArgs),
+    /// Grid form of `simulate`: sweep pool × exploration, CSV to stdout.
+    Sweep(simulate::SweepArgs),
     /// Launch a blinded agentic session. (Lands in M0's `run`/M1 — not yet implemented.)
     Run,
     /// Rate a past session after the fact. (Later milestone.)
@@ -45,6 +47,7 @@ fn main() -> anyhow::Result<()> {
 
     match cli.cmd {
         Cmd::Simulate(args) => simulate::run(&args, &cfg),
+        Cmd::Sweep(args) => simulate::run_sweep(&args, &cfg),
         Cmd::Run | Cmd::Rate | Cmd::Reveal | Cmd::Stats => {
             eprintln!(
                 "This subcommand lands in a later milestone. M0 delivers `simulate` \

@@ -1,20 +1,21 @@
-//! `blindcoder simulate` — the offline convergence harness.
+//! `blindcoder simulate` — the offline convergence harness (and `sweep`, its grid form).
 //!
-//! This is the project-killer test. Synthetic raters with a **known ground truth** drive the
-//! *real* [`selector`] crate; we measure whether the selector actually converges onto the
-//! best-value candidate (and how fast) versus staying a permanent random explorer. No model
-//! calls, no blind to leak — just the decision core under a controlled world.
+//! Synthetic raters with a **known ground truth** drive the *real* [`selector`] crate; we measure
+//! whether the selector routes to good *value*, and how fast. No model calls, no blind to leak.
+//!
+//! Two views of "did it converge?":
+//!   * **best-arm pick-rate** — how often it picks *the single* highest-value candidate. Strict:
+//!     picking a near-tie #2 scores as a total miss.
+//!   * **value capture** — a router only needs to capture *value*, not name the best arm. We
+//!     report a within-ε "good-rate" (picked value within `value_epsilon` of the best) and a
+//!     **value efficiency** (1 − regret / random-baseline regret), which is the honest headline.
 //!
 //! World model per trial:
-//!   * Each candidate has a hidden true quality `q ∈ (0,1)` and a shelf price.
-//!   * The best candidate is the one maximizing the *true* value
-//!     `q - cost_sensitivity * normalized_price`.
-//!   * Each session: the selector picks; the world returns a noisy rating whose performance
-//!     rises with the model's quality and falls with task difficulty (`difficulty_drag`). The
-//!     selector's `difficulty_credit` is meant to correct that drag back out.
-//!
-//! We report cumulative regret, the best-candidate pick-rate over time, and time-to-converge,
-//! averaged over independent trials — plus the random-choice baseline for context.
+//!   * candidate `i`: hidden `quality ∈ (0.20,0.95)`, `price` log-uniform over ≈ $0.10–$15/Mtok.
+//!   * `true_value = quality − cost_sensitivity · normalized_price`; best = argmax.
+//!   * rating: difficulty `d ~ U{0..4}`; `base = 4·quality − 2`;
+//!     `latent = base − difficulty_drag·d + Normal(0,noise)`; `perf = round(clamp(latent,−2,2))`.
+//!     `difficulty_credit` is meant to cancel `difficulty_drag`.
 
 use clap::Args;
 use config::Config;
@@ -22,6 +23,10 @@ use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Normal};
 use selector::{fold_track_record, normalize_prices, pick, value_score, Candidate, Rating, Tuneables};
+
+// ---------------------------------------------------------------------------------------------
+// CLI args
+// ---------------------------------------------------------------------------------------------
 
 #[derive(Args, Debug)]
 pub struct SimulateArgs {
@@ -46,140 +51,358 @@ pub struct SimulateArgs {
     /// Rating observation noise (std-dev, in performance points).
     #[arg(long, default_value_t = 0.8)]
     pub noise: f64,
-    /// Trailing window (sessions) for the best-arm pick-rate convergence check.
+    /// Trailing window (sessions) for the convergence / rate metrics.
     #[arg(long, default_value_t = 50)]
     pub window: usize,
-    /// Convergence threshold: best-arm pick-rate over the trailing window.
-    #[arg(long, default_value_t = 0.7)]
+    /// Convergence threshold on the within-ε value good-rate.
+    #[arg(long, default_value_t = 0.8)]
     pub converge_at: f64,
+    /// A pick is "good" if its true value is within this of the best candidate's.
+    #[arg(long, default_value_t = 0.05)]
+    pub value_epsilon: f64,
+
+    // --- selector tuneable overrides (fall back to config when unset) ---
+    #[arg(long)]
+    pub exploration: Option<f64>,
+    #[arg(long)]
+    pub cost_sensitivity: Option<f64>,
+    #[arg(long)]
+    pub score_spread: Option<f64>,
+    #[arg(long)]
+    pub difficulty_credit: Option<f64>,
+    #[arg(long)]
+    pub rating_half_life: Option<f64>,
 }
 
-struct TrueModel {
-    quality: f64,
-    raw_price: f64,
+#[derive(Args, Debug)]
+pub struct SweepArgs {
+    /// Pool sizes to sweep (comma-separated).
+    #[arg(long, value_delimiter = ',', default_value = "3,4,5,6,8")]
+    pub pools: Vec<usize>,
+    /// Exploration values to sweep (comma-separated).
+    #[arg(long, value_delimiter = ',', default_value = "0.5,0.7,1.0")]
+    pub explorations: Vec<f64>,
+    #[arg(long, default_value_t = 400)]
+    pub sessions: usize,
+    #[arg(long, default_value_t = 30)]
+    pub trials: usize,
+    #[arg(long, default_value_t = 3.0)]
+    pub rate: f64,
+    #[arg(long, default_value_t = 1)]
+    pub seed: u64,
+    #[arg(long, default_value_t = 0.75)]
+    pub difficulty_drag: f64,
+    #[arg(long, default_value_t = 0.8)]
+    pub noise: f64,
+    #[arg(long, default_value_t = 50)]
+    pub window: usize,
+    #[arg(long, default_value_t = 0.8)]
+    pub converge_at: f64,
+    #[arg(long, default_value_t = 0.05)]
+    pub value_epsilon: f64,
 }
 
-struct TrialResult {
-    cumulative_regret: f64,
-    final_window_best_rate: f64,
-    time_to_converge: Option<usize>,
-    /// Best-arm pick-rate at 25/50/75/100% checkpoints.
-    checkpoints: [f64; 4],
+// ---------------------------------------------------------------------------------------------
+// Harness core (shared by `simulate` and `sweep`)
+// ---------------------------------------------------------------------------------------------
+
+/// One fully-specified experiment.
+struct Harness {
+    pool: usize,
+    sessions: usize,
+    trials: usize,
+    rate: f64,
+    seed: u64,
+    difficulty_drag: f64,
+    noise: f64,
+    window: usize,
+    converge_at: f64,
+    value_epsilon: f64,
+    t: Tuneables,
 }
 
-/// Run the harness and print a report.
-pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
-    if args.pool == 0 || args.sessions == 0 || args.trials == 0 {
-        anyhow::bail!("--pool, --sessions and --trials must all be >= 1");
+/// Aggregated (trial-averaged) results.
+struct Aggregate {
+    /// Final-window rate of picking *the* best candidate.
+    best_rate: f64,
+    /// Final-window rate of picking a candidate within `value_epsilon` of the best.
+    good_rate: f64,
+    /// Final-window value efficiency: 1 − mean regret / random-baseline per-session regret.
+    value_eff_window: f64,
+    /// Cumulative value efficiency (share of the total regret gap captured vs random).
+    gap_captured: f64,
+    /// Fraction of trials whose trailing good-rate reached `converge_at`.
+    converged_frac: f64,
+    median_ttc: Option<usize>,
+    /// Good-rate at 25/50/75/100 % checkpoints.
+    cp_good: [f64; 4],
+    /// Best-arm rate at the same checkpoints.
+    cp_best: [f64; 4],
+}
+
+struct Trial {
+    best_rate: f64,
+    good_rate: f64,
+    value_eff_window: f64,
+    gap_captured: f64,
+    ttc: Option<usize>,
+    cp_good: [f64; 4],
+    cp_best: [f64; 4],
+}
+
+fn run_config(h: &Harness) -> Aggregate {
+    let mut trials = Vec::with_capacity(h.trials);
+    for k in 0..h.trials {
+        let mut rng = StdRng::seed_from_u64(h.seed.wrapping_add(k as u64));
+        trials.push(run_trial(h, &mut rng));
     }
-    let t = cfg.tuneables();
-
-    let mut results = Vec::with_capacity(args.trials);
-    let mut random_regret_sum = 0.0;
-    for trial in 0..args.trials {
-        let mut rng = StdRng::seed_from_u64(args.seed.wrapping_add(trial as u64));
-        let (res, random_regret) = run_trial(args, &t, &mut rng);
-        random_regret_sum += random_regret;
-        results.push(res);
-    }
-
-    report(args, cfg, &t, &results, random_regret_sum / args.trials as f64);
-    Ok(())
+    aggregate(h, &trials)
 }
 
-fn run_trial(args: &SimulateArgs, t: &Tuneables, rng: &mut StdRng) -> (TrialResult, f64) {
-    // --- draw a hidden world ---
-    let models: Vec<TrueModel> = (0..args.pool)
-        .map(|_| TrueModel {
-            quality: rng.gen_range(0.20..0.95),
-            // Prices span cheap-open ($0.10) to premium ($15) per Mtok, log-uniform.
-            raw_price: 10f64.powf(rng.gen_range(-1.0..1.18)),
-        })
-        .collect();
-    let norm_price = normalize_prices(&models.iter().map(|m| m.raw_price).collect::<Vec<_>>());
-    let true_value: Vec<f64> = (0..args.pool)
-        .map(|i| value_score(models[i].quality, norm_price[i], t))
-        .collect();
+fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
+    let t = &h.t;
+
+    // hidden world
+    let quality: Vec<f64> = (0..h.pool).map(|_| rng.gen_range(0.20..0.95)).collect();
+    let raw_price: Vec<f64> = (0..h.pool).map(|_| 10f64.powf(rng.gen_range(-1.0..1.18))).collect();
+    let norm_price = normalize_prices(&raw_price);
+    let true_value: Vec<f64> = (0..h.pool).map(|i| value_score(quality[i], norm_price[i], t)).collect();
     let best = argmax(&true_value);
     let best_value = true_value[best];
+    let mean_value = true_value.iter().sum::<f64>() / h.pool as f64;
+    let random_regret_ps = best_value - mean_value; // expected per-session regret of random choice
 
-    // Random-choice baseline: expected per-session regret if you picked uniformly.
-    let mean_value = true_value.iter().sum::<f64>() / args.pool as f64;
-    let random_regret_per_session = best_value - mean_value;
+    let noise = Normal::new(0.0, h.noise.max(1e-9)).unwrap();
+    let mut raw_events: Vec<Vec<(f64, f64, f64)>> = vec![Vec::new(); h.pool];
+    let mut buf: Vec<Rating> = Vec::new();
 
-    // --- run the sessions ---
-    let noise = Normal::new(0.0, args.noise.max(1e-9)).unwrap();
-    let mut events: Vec<Vec<Rating>> = vec![Vec::new(); args.pool];
-    // store (rating_time_days, perf, diff) so we can recompute ages each pick
-    let mut raw_events: Vec<Vec<(f64, f64, f64)>> = vec![Vec::new(); args.pool];
+    let mut regret_hist = vec![0.0f64; h.sessions];
+    let mut best_hist = vec![false; h.sessions];
+    let mut good_hist = vec![false; h.sessions];
+    let mut ttc = None;
 
-    let mut cumulative_regret = 0.0;
-    let mut hit_history = vec![false; args.sessions];
-    let mut time_to_converge = None;
-
-    for s in 0..args.sessions {
-        let now_days = s as f64 / args.rate;
-
-        // Fold each candidate's events into a fresh track record (ages relative to now).
-        let cands: Vec<Candidate> = (0..args.pool)
+    for s in 0..h.sessions {
+        let now = s as f64 / h.rate;
+        let cands: Vec<Candidate> = (0..h.pool)
             .map(|i| {
-                events[i].clear();
+                buf.clear();
                 for &(ts, perf, diff) in &raw_events[i] {
-                    events[i].push(Rating {
-                        performance_points: perf,
-                        difficulty_points: diff,
-                        age_days: now_days - ts,
-                    });
+                    buf.push(Rating { performance_points: perf, difficulty_points: diff, age_days: now - ts });
                 }
-                Candidate {
-                    id: i,
-                    track: fold_track_record(&events[i], t),
-                    normalized_price: norm_price[i],
-                }
+                Candidate { id: i, track: fold_track_record(&buf, t), normalized_price: norm_price[i] }
             })
             .collect();
 
         let picked = pick(&cands, t, rng);
-        cumulative_regret += best_value - true_value[picked];
-        hit_history[s] = picked == best;
+        regret_hist[s] = best_value - true_value[picked];
+        best_hist[s] = picked == best;
+        good_hist[s] = true_value[picked] >= best_value - h.value_epsilon;
 
-        // Convergence: first session after which the trailing window stays above threshold.
-        if time_to_converge.is_none() && s + 1 >= args.window {
-            let rate = window_rate(&hit_history, s + 1, args.window);
-            if rate >= args.converge_at {
-                time_to_converge = Some(s + 1);
-            }
+        if ttc.is_none() && s + 1 >= h.window && window_rate(&good_hist, s + 1, h.window) >= h.converge_at {
+            ttc = Some(s + 1);
         }
 
-        // World returns a noisy rating for the picked candidate.
-        let difficulty = rng.gen_range(0..=4) as f64;
-        // Baseline (difficulty 0) performance from quality: q=0 -> -2, q=1 -> +2.
-        let base = 4.0 * models[picked].quality - 2.0;
-        let latent = base - args.difficulty_drag * difficulty + noise.sample(rng);
+        let d = rng.gen_range(0..=4) as f64;
+        let base = 4.0 * quality[picked] - 2.0;
+        let latent = base - h.difficulty_drag * d + noise.sample(rng);
         let perf = latent.round().clamp(-2.0, 2.0);
-        raw_events[picked].push((now_days, perf, difficulty));
+        raw_events[picked].push((now, perf, d));
     }
 
-    let final_window_best_rate = window_rate(&hit_history, args.sessions, args.window);
-    let checkpoints = [
-        window_rate(&hit_history, args.sessions / 4, args.window.min(args.sessions / 4).max(1)),
-        window_rate(&hit_history, args.sessions / 2, args.window),
-        window_rate(&hit_history, args.sessions * 3 / 4, args.window),
-        final_window_best_rate,
+    let best_rate = window_rate(&best_hist, h.sessions, h.window);
+    let good_rate = window_rate(&good_hist, h.sessions, h.window);
+    let win_regret = window_mean(&regret_hist, h.sessions, h.window);
+    let value_eff_window = if random_regret_ps < 1e-9 { 1.0 } else { 1.0 - win_regret / random_regret_ps };
+    let cum_regret: f64 = regret_hist.iter().sum();
+    let random_cum = random_regret_ps * h.sessions as f64;
+    let gap_captured = if random_cum < 1e-9 { 1.0 } else { 1.0 - cum_regret / random_cum };
+
+    let q = |frac: f64| ((h.sessions as f64 * frac) as usize).max(1);
+    let cp_good = [
+        window_rate(&good_hist, q(0.25), h.window),
+        window_rate(&good_hist, q(0.50), h.window),
+        window_rate(&good_hist, q(0.75), h.window),
+        good_rate,
+    ];
+    let cp_best = [
+        window_rate(&best_hist, q(0.25), h.window),
+        window_rate(&best_hist, q(0.50), h.window),
+        window_rate(&best_hist, q(0.75), h.window),
+        best_rate,
     ];
 
-    (
-        TrialResult {
-            cumulative_regret,
-            final_window_best_rate,
-            time_to_converge,
-            checkpoints,
-        },
-        random_regret_per_session * args.sessions as f64,
-    )
+    Trial { best_rate, good_rate, value_eff_window, gap_captured, ttc, cp_good, cp_best }
 }
 
-/// Best-arm pick-rate over the `window` sessions ending at `end` (exclusive upper bound).
+fn aggregate(h: &Harness, trials: &[Trial]) -> Aggregate {
+    let n = trials.len() as f64;
+    let avg = |f: fn(&Trial) -> f64| trials.iter().map(f).sum::<f64>() / n;
+    let converged: Vec<usize> = trials.iter().filter_map(|t| t.ttc).collect();
+    let mut cp_good = [0.0; 4];
+    let mut cp_best = [0.0; 4];
+    for t in trials {
+        for k in 0..4 {
+            cp_good[k] += t.cp_good[k] / n;
+            cp_best[k] += t.cp_best[k] / n;
+        }
+    }
+    let _ = h;
+    Aggregate {
+        best_rate: avg(|t| t.best_rate),
+        good_rate: avg(|t| t.good_rate),
+        value_eff_window: avg(|t| t.value_eff_window),
+        gap_captured: avg(|t| t.gap_captured),
+        converged_frac: converged.len() as f64 / n,
+        median_ttc: median(&converged),
+        cp_good,
+        cp_best,
+    }
+}
+
+/// Value-based verdict: a router needs to capture value, not name the single best arm.
+fn verdict(a: &Aggregate) -> &'static str {
+    if a.value_eff_window >= 0.90 && a.good_rate >= 0.80 {
+        "GO — captures ~all achievable value and reliably lands within tolerance."
+    } else if a.value_eff_window >= 0.70 {
+        "MARGINAL — captures most of the value but leaves some on the table."
+    } else {
+        "NO-GO — leaves substantial value uncaptured; bound the pool / retune / stronger signal."
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Entry points
+// ---------------------------------------------------------------------------------------------
+
+/// `simulate` — one config, a human-readable report.
+pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
+    if args.pool == 0 || args.sessions == 0 || args.trials == 0 {
+        anyhow::bail!("--pool, --sessions and --trials must all be >= 1");
+    }
+    let t = effective_tuneables(
+        cfg,
+        args.exploration,
+        args.cost_sensitivity,
+        args.score_spread,
+        args.difficulty_credit,
+        args.rating_half_life,
+    );
+    let h = Harness {
+        pool: args.pool,
+        sessions: args.sessions,
+        trials: args.trials,
+        rate: args.rate,
+        seed: args.seed,
+        difficulty_drag: args.difficulty_drag,
+        noise: args.noise,
+        window: args.window,
+        converge_at: args.converge_at,
+        value_epsilon: args.value_epsilon,
+        t,
+    };
+    let a = run_config(&h);
+    let random_rate = 1.0 / h.pool as f64;
+
+    println!("blindcoder simulate — selector convergence harness");
+    println!("──────────────────────────────────────────────────");
+    println!(
+        "pool={}  sessions={}  trials={}  rate={}/day  difficulty_drag={}  noise={}  value_ε={}",
+        h.pool, h.sessions, h.trials, h.rate, h.difficulty_drag, h.noise, h.value_epsilon
+    );
+    println!(
+        "tuneables: cost_sensitivity={}  difficulty_credit={}  rating_half_life={}d  exploration={}  score_spread={}",
+        t.cost_sensitivity, t.difficulty_credit, t.rating_half_life_days, t.exploration, t.score_spread
+    );
+    println!();
+    println!("value capture (the router's actual job):");
+    println!("   value efficiency (final window): {:.2}   (1.00 = perfect, 0.00 = random)", a.value_eff_window);
+    println!("   cumulative gap captured vs random: {:.0}%", 100.0 * a.gap_captured);
+    println!("   within-ε good-rate (final window): {:.2}", a.good_rate);
+    println!("   good-rate over training  25%: {:.2}   50%: {:.2}   75%: {:.2}   100%: {:.2}", a.cp_good[0], a.cp_good[1], a.cp_good[2], a.cp_good[3]);
+    println!();
+    println!("best-arm identification (strict; picks THE best of {}):", h.pool);
+    println!("   over training  25%: {:.2}   50%: {:.2}   75%: {:.2}   100%: {:.2}", a.cp_best[0], a.cp_best[1], a.cp_best[2], a.cp_best[3]);
+    println!("   random-choice baseline: {:.2}", random_rate);
+    println!();
+    println!("convergence (good-rate ≥ {:.2} sustained over {} sessions):", h.converge_at, h.window);
+    match a.median_ttc {
+        Some(m) => println!("   {:.0}% of trials converged; median ≈ {} sessions ({:.1} days)", 100.0 * a.converged_frac, m, m as f64 / h.rate),
+        None => println!("   {:.0}% of trials converged", 100.0 * a.converged_frac),
+    }
+    println!();
+    println!("verdict: {}", verdict(&a));
+    Ok(())
+}
+
+/// `sweep` — a grid over pool × exploration, CSV to stdout.
+pub fn run_sweep(args: &SweepArgs, cfg: &Config) -> anyhow::Result<()> {
+    if args.pools.is_empty() || args.explorations.is_empty() {
+        anyhow::bail!("--pools and --explorations must each have at least one value");
+    }
+    eprintln!(
+        "# sweep: sessions={} trials={} rate={}/day noise={} difficulty_drag={} value_ε={}",
+        args.sessions, args.trials, args.rate, args.noise, args.difficulty_drag, args.value_epsilon
+    );
+    println!("pool,exploration,value_eff,gap_captured,good_rate,best_rate,converged_frac,median_ttc,verdict");
+    for &pool in &args.pools {
+        for &expl in &args.explorations {
+            let t = effective_tuneables(cfg, Some(expl), None, None, None, None);
+            let h = Harness {
+                pool,
+                sessions: args.sessions,
+                trials: args.trials,
+                rate: args.rate,
+                seed: args.seed,
+                difficulty_drag: args.difficulty_drag,
+                noise: args.noise,
+                window: args.window,
+                converge_at: args.converge_at,
+                value_epsilon: args.value_epsilon,
+                t,
+            };
+            let a = run_config(&h);
+            let tag = verdict(&a).split(' ').next().unwrap_or("?");
+            let ttc = a.median_ttc.map(|m| m.to_string()).unwrap_or_else(|| "-".to_string());
+            println!(
+                "{},{:.2},{:.3},{:.3},{:.3},{:.3},{:.2},{},{}",
+                pool, expl, a.value_eff_window, a.gap_captured, a.good_rate, a.best_rate, a.converged_frac, ttc, tag
+            );
+        }
+    }
+    Ok(())
+}
+
+fn effective_tuneables(
+    cfg: &Config,
+    exploration: Option<f64>,
+    cost_sensitivity: Option<f64>,
+    score_spread: Option<f64>,
+    difficulty_credit: Option<f64>,
+    rating_half_life: Option<f64>,
+) -> Tuneables {
+    let mut t = cfg.tuneables();
+    if let Some(v) = exploration {
+        t.exploration = v;
+    }
+    if let Some(v) = cost_sensitivity {
+        t.cost_sensitivity = v;
+    }
+    if let Some(v) = score_spread {
+        t.score_spread = v;
+    }
+    if let Some(v) = difficulty_credit {
+        t.difficulty_credit = v;
+    }
+    if let Some(v) = rating_half_life {
+        t.rating_half_life_days = v;
+    }
+    t
+}
+
+// ---------------------------------------------------------------------------------------------
+// small helpers
+// ---------------------------------------------------------------------------------------------
+
 fn window_rate(hits: &[bool], end: usize, window: usize) -> f64 {
     if end == 0 {
         return 0.0;
@@ -187,6 +410,15 @@ fn window_rate(hits: &[bool], end: usize, window: usize) -> f64 {
     let start = end.saturating_sub(window);
     let slice = &hits[start..end];
     slice.iter().filter(|&&h| h).count() as f64 / slice.len() as f64
+}
+
+fn window_mean(xs: &[f64], end: usize, window: usize) -> f64 {
+    if end == 0 {
+        return 0.0;
+    }
+    let start = end.saturating_sub(window);
+    let slice = &xs[start..end];
+    slice.iter().sum::<f64>() / slice.len() as f64
 }
 
 fn argmax(xs: &[f64]) -> usize {
@@ -197,58 +429,6 @@ fn argmax(xs: &[f64]) -> usize {
         }
     }
     best
-}
-
-fn mean(xs: impl Iterator<Item = f64>, n: usize) -> f64 {
-    xs.sum::<f64>() / n as f64
-}
-
-fn report(args: &SimulateArgs, cfg: &Config, t: &Tuneables, results: &[TrialResult], random_regret: f64) {
-    let n = results.len();
-    let avg_regret = mean(results.iter().map(|r| r.cumulative_regret), n);
-    let avg_final = mean(results.iter().map(|r| r.final_window_best_rate), n);
-    let converged: Vec<usize> = results.iter().filter_map(|r| r.time_to_converge).collect();
-    let converge_frac = converged.len() as f64 / n as f64;
-    let median_ttc = median(&converged);
-    let random_rate = 1.0 / args.pool as f64;
-
-    let cp = |k: usize| mean(results.iter().map(|r| r.checkpoints[k]), n);
-
-    println!("blindcoder simulate — selector convergence harness");
-    println!("──────────────────────────────────────────────────");
-    println!(
-        "pool={}  sessions={}  trials={}  rate={}/day  difficulty_drag={}  noise={}",
-        args.pool, args.sessions, args.trials, args.rate, args.difficulty_drag, args.noise
-    );
-    println!(
-        "tuneables: cost_sensitivity={}  difficulty_credit={}  rating_half_life={}d  exploration={}  score_spread={}",
-        t.cost_sensitivity, t.difficulty_credit, t.rating_half_life_days, t.exploration, t.score_spread
-    );
-    println!("config source: max_session_cost=${}  (curated_policy_max_age={}d)", cfg.max_session_cost_usd, cfg.curated_policy_max_age_days);
-    println!();
-    println!("best-arm pick-rate over training (trailing window = {} sessions):", args.window);
-    println!("   25%: {:.2}   50%: {:.2}   75%: {:.2}   100%: {:.2}", cp(0), cp(1), cp(2), cp(3));
-    println!("   random-choice baseline: {:.2}", random_rate);
-    println!();
-    println!("cumulative regret (lower = better):");
-    println!("   selector: {:.2}", avg_regret);
-    println!("   random baseline: {:.2}   → selector captures {:.0}% of the gap", random_regret, 100.0 * (1.0 - avg_regret / random_regret.max(1e-9)));
-    println!();
-    println!("convergence (best-arm rate ≥ {:.2} sustained):", args.converge_at);
-    match median_ttc {
-        Some(m) => println!("   {:.0}% of trials converged; median time-to-converge ≈ {} sessions ({:.1} days)", 100.0 * converge_frac, m, m as f64 / args.rate),
-        None => println!("   {:.0}% of trials converged (no median available)", 100.0 * converge_frac),
-    }
-    println!("   final-window best-arm rate: {:.2}", avg_final);
-    println!();
-    let verdict = if avg_final >= args.converge_at && converge_frac >= 0.5 {
-        "GO — selector converges at this pool size / session volume."
-    } else if avg_final >= 2.0 * random_rate {
-        "MARGINAL — learns, but does not reliably lock on; consider bounding the pool or retuning."
-    } else {
-        "NO-GO — selector stays near random; the design needs a smaller/bounded pool or stronger signal."
-    };
-    println!("verdict: {verdict}");
 }
 
 fn median(xs: &[usize]) -> Option<usize> {
