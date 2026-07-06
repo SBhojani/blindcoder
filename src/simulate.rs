@@ -77,6 +77,12 @@ pub struct SimulateArgs {
     /// Disable cost-dominance pruning (on by default).
     #[arg(long)]
     pub no_prune: bool,
+    /// Quality random-walk std per simulated day — the best candidate can move (0 = stationary).
+    #[arg(long, default_value_t = 0.0)]
+    pub drift: f64,
+    /// Expected regime jumps per candidate per simulated day (a level reset; 0 = none).
+    #[arg(long, default_value_t = 0.0)]
+    pub jump_rate: f64,
 }
 
 #[derive(Args, Debug)]
@@ -110,6 +116,21 @@ pub struct SweepArgs {
     /// Disable cost-dominance pruning (on by default).
     #[arg(long)]
     pub no_prune: bool,
+    /// Quality random-walk std per simulated day (0 = stationary).
+    #[arg(long, default_value_t = 0.0)]
+    pub drift: f64,
+    /// Expected regime jumps per candidate per simulated day (0 = none).
+    #[arg(long, default_value_t = 0.0)]
+    pub jump_rate: f64,
+    // fixed tuneable overrides held constant across the grid (exploration is the swept axis)
+    #[arg(long)]
+    pub cost_sensitivity: Option<f64>,
+    #[arg(long)]
+    pub score_spread: Option<f64>,
+    #[arg(long)]
+    pub difficulty_credit: Option<f64>,
+    #[arg(long)]
+    pub rating_half_life: Option<f64>,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -129,6 +150,10 @@ struct Harness {
     converge_at: f64,
     value_epsilon: f64,
     prune: bool,
+    /// Quality random-walk std per simulated day (0 = stationary world).
+    drift: f64,
+    /// Expected regime jumps per candidate per simulated day (0 = none).
+    jump_rate: f64,
     t: Tuneables,
 }
 
@@ -172,28 +197,49 @@ fn run_config(h: &Harness) -> Aggregate {
 
 fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
     let t = &h.t;
+    let dt = 1.0 / h.rate; // simulated days per session
 
-    // hidden world
-    let quality: Vec<f64> = (0..h.pool).map(|_| rng.gen_range(0.20..0.95)).collect();
+    // hidden world — qualities may drift over the run (non-stationary); prices are fixed.
+    let mut quality: Vec<f64> = (0..h.pool).map(|_| rng.gen_range(0.20..0.95)).collect();
     let raw_price: Vec<f64> = (0..h.pool).map(|_| 10f64.powf(rng.gen_range(-1.0..1.18))).collect();
     let norm_price = normalize_prices(&raw_price);
-    let true_value: Vec<f64> = (0..h.pool).map(|i| value_score(quality[i], norm_price[i], t)).collect();
-    let best = argmax(&true_value);
-    let best_value = true_value[best];
-    let mean_value = true_value.iter().sum::<f64>() / h.pool as f64;
-    let random_regret_ps = best_value - mean_value; // expected per-session regret of random choice
 
-    let noise = Normal::new(0.0, h.noise.max(1e-9)).unwrap();
+    let rating_noise = Normal::new(0.0, h.noise.max(1e-9)).unwrap();
+    let drift_step = if h.drift > 0.0 {
+        Some(Normal::new(0.0, h.drift * dt.sqrt()).unwrap())
+    } else {
+        None
+    };
+
     let mut raw_events: Vec<Vec<(f64, f64, f64)>> = vec![Vec::new(); h.pool];
     let mut buf: Vec<Rating> = Vec::new();
 
     let mut regret_hist = vec![0.0f64; h.sessions];
+    let mut random_regret_hist = vec![0.0f64; h.sessions]; // per-session random-choice regret (drift-aware)
     let mut best_hist = vec![false; h.sessions];
     let mut good_hist = vec![false; h.sessions];
     let mut ttc = None;
 
     for s in 0..h.sessions {
         let now = s as f64 / h.rate;
+
+        // evolve the world: quality random-walk drift + occasional regime jumps (level resets).
+        if s > 0 {
+            for i in 0..h.pool {
+                if h.jump_rate > 0.0 && rng.gen::<f64>() < h.jump_rate * dt {
+                    quality[i] = rng.gen_range(0.20..0.95);
+                } else if let Some(step) = &drift_step {
+                    quality[i] = (quality[i] + step.sample(rng)).clamp(0.05, 0.98);
+                }
+            }
+        }
+
+        // current-session ground truth — the best candidate can move under drift.
+        let true_value: Vec<f64> = (0..h.pool).map(|i| value_score(quality[i], norm_price[i], t)).collect();
+        let best = argmax(&true_value);
+        let best_value = true_value[best];
+        random_regret_hist[s] = best_value - true_value.iter().sum::<f64>() / h.pool as f64;
+
         let cands: Vec<Candidate> = (0..h.pool)
             .map(|i| {
                 buf.clear();
@@ -222,7 +268,7 @@ fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
 
         let d = rng.gen_range(0..=4) as f64;
         let base = 4.0 * quality[picked] - 2.0;
-        let latent = base - h.difficulty_drag * d + noise.sample(rng);
+        let latent = base - h.difficulty_drag * d + rating_noise.sample(rng);
         let perf = latent.round().clamp(-2.0, 2.0);
         raw_events[picked].push((now, perf, d));
     }
@@ -230,9 +276,10 @@ fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
     let best_rate = window_rate(&best_hist, h.sessions, h.window);
     let good_rate = window_rate(&good_hist, h.sessions, h.window);
     let win_regret = window_mean(&regret_hist, h.sessions, h.window);
-    let value_eff_window = if random_regret_ps < 1e-9 { 1.0 } else { 1.0 - win_regret / random_regret_ps };
+    let win_random = window_mean(&random_regret_hist, h.sessions, h.window);
+    let value_eff_window = if win_random < 1e-9 { 1.0 } else { 1.0 - win_regret / win_random };
     let cum_regret: f64 = regret_hist.iter().sum();
-    let random_cum = random_regret_ps * h.sessions as f64;
+    let random_cum: f64 = random_regret_hist.iter().sum();
     let gap_captured = if random_cum < 1e-9 { 1.0 } else { 1.0 - cum_regret / random_cum };
 
     let q = |frac: f64| ((h.sessions as f64 * frac) as usize).max(1);
@@ -320,6 +367,8 @@ pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
         converge_at: args.converge_at,
         value_epsilon: args.value_epsilon,
         prune: !args.no_prune,
+        drift: args.drift,
+        jump_rate: args.jump_rate,
         t,
     };
     let a = run_config(&h);
@@ -339,6 +388,11 @@ pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
         "pruning: {}",
         if h.prune { format!("on (confidence={} std-devs)", t.prune_confidence) } else { "off".to_string() }
     );
+    if h.drift > 0.0 || h.jump_rate > 0.0 {
+        println!("world: NON-STATIONARY (drift={}/day, jump_rate={}/candidate/day) — the best arm moves", h.drift, h.jump_rate);
+    } else {
+        println!("world: stationary");
+    }
     println!();
     println!("value capture (the router's actual job):");
     println!("   value efficiency (final window): {:.2}   (1.00 = perfect, 0.00 = random)", a.value_eff_window);
@@ -367,16 +421,23 @@ pub fn run_sweep(args: &SweepArgs, cfg: &Config) -> anyhow::Result<()> {
     }
     let prune = !args.no_prune;
     eprintln!(
-        "# sweep: sessions={} trials={} rate={}/day noise={} difficulty_drag={} value_ε={} pruning={}",
+        "# sweep: sessions={} trials={} rate={}/day noise={} difficulty_drag={} value_ε={} pruning={} drift={} jump_rate={}",
         args.sessions, args.trials, args.rate, args.noise, args.difficulty_drag, args.value_epsilon,
-        if prune { "on" } else { "off" }
+        if prune { "on" } else { "off" }, args.drift, args.jump_rate
     );
     println!("pool,exploration,value_eff,gap_captured,good_rate,best_rate,converged_frac,median_ttc,verdict");
     for &pool in &args.pools {
         for &expl in &args.explorations {
             let t = effective_tuneables(
                 cfg,
-                Overrides { exploration: Some(expl), prune_confidence: args.prune_confidence, ..Default::default() },
+                Overrides {
+                    exploration: Some(expl),
+                    prune_confidence: args.prune_confidence,
+                    cost_sensitivity: args.cost_sensitivity,
+                    score_spread: args.score_spread,
+                    difficulty_credit: args.difficulty_credit,
+                    rating_half_life: args.rating_half_life,
+                },
             );
             let h = Harness {
                 pool,
@@ -390,6 +451,8 @@ pub fn run_sweep(args: &SweepArgs, cfg: &Config) -> anyhow::Result<()> {
                 converge_at: args.converge_at,
                 value_epsilon: args.value_epsilon,
                 prune,
+                drift: args.drift,
+                jump_rate: args.jump_rate,
                 t,
             };
             let a = run_config(&h);
