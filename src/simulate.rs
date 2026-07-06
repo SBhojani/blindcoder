@@ -22,7 +22,7 @@ use config::Config;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Normal};
-use selector::{fold_track_record, normalize_prices, pick, value_score, Candidate, Rating, Tuneables};
+use selector::{fold_track_record, normalize_prices, pick, prune_dominated, value_score, Candidate, Rating, Tuneables};
 
 // ---------------------------------------------------------------------------------------------
 // CLI args
@@ -72,6 +72,11 @@ pub struct SimulateArgs {
     pub difficulty_credit: Option<f64>,
     #[arg(long)]
     pub rating_half_life: Option<f64>,
+    #[arg(long)]
+    pub prune_confidence: Option<f64>,
+    /// Disable cost-dominance pruning (on by default).
+    #[arg(long)]
+    pub no_prune: bool,
 }
 
 #[derive(Args, Debug)]
@@ -100,6 +105,11 @@ pub struct SweepArgs {
     pub converge_at: f64,
     #[arg(long, default_value_t = 0.05)]
     pub value_epsilon: f64,
+    #[arg(long)]
+    pub prune_confidence: Option<f64>,
+    /// Disable cost-dominance pruning (on by default).
+    #[arg(long)]
+    pub no_prune: bool,
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -118,6 +128,7 @@ struct Harness {
     window: usize,
     converge_at: f64,
     value_epsilon: f64,
+    prune: bool,
     t: Tuneables,
 }
 
@@ -193,7 +204,14 @@ fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
             })
             .collect();
 
-        let picked = pick(&cands, t, rng);
+        // Cost-dominance pruning: pick only among candidates that can still plausibly win.
+        let picked = if h.prune {
+            let active = prune_dominated(&cands, t);
+            let sub: Vec<Candidate> = active.iter().map(|&i| cands[i].clone()).collect();
+            active[pick(&sub, t, rng)]
+        } else {
+            pick(&cands, t, rng)
+        };
         regret_hist[s] = best_value - true_value[picked];
         best_hist[s] = picked == best;
         good_hist[s] = true_value[picked] >= best_value - h.value_epsilon;
@@ -281,11 +299,14 @@ pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
     }
     let t = effective_tuneables(
         cfg,
-        args.exploration,
-        args.cost_sensitivity,
-        args.score_spread,
-        args.difficulty_credit,
-        args.rating_half_life,
+        Overrides {
+            exploration: args.exploration,
+            cost_sensitivity: args.cost_sensitivity,
+            score_spread: args.score_spread,
+            difficulty_credit: args.difficulty_credit,
+            rating_half_life: args.rating_half_life,
+            prune_confidence: args.prune_confidence,
+        },
     );
     let h = Harness {
         pool: args.pool,
@@ -298,6 +319,7 @@ pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
         window: args.window,
         converge_at: args.converge_at,
         value_epsilon: args.value_epsilon,
+        prune: !args.no_prune,
         t,
     };
     let a = run_config(&h);
@@ -312,6 +334,10 @@ pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
     println!(
         "tuneables: cost_sensitivity={}  difficulty_credit={}  rating_half_life={}d  exploration={}  score_spread={}",
         t.cost_sensitivity, t.difficulty_credit, t.rating_half_life_days, t.exploration, t.score_spread
+    );
+    println!(
+        "pruning: {}",
+        if h.prune { format!("on (confidence={} std-devs)", t.prune_confidence) } else { "off".to_string() }
     );
     println!();
     println!("value capture (the router's actual job):");
@@ -339,14 +365,19 @@ pub fn run_sweep(args: &SweepArgs, cfg: &Config) -> anyhow::Result<()> {
     if args.pools.is_empty() || args.explorations.is_empty() {
         anyhow::bail!("--pools and --explorations must each have at least one value");
     }
+    let prune = !args.no_prune;
     eprintln!(
-        "# sweep: sessions={} trials={} rate={}/day noise={} difficulty_drag={} value_ε={}",
-        args.sessions, args.trials, args.rate, args.noise, args.difficulty_drag, args.value_epsilon
+        "# sweep: sessions={} trials={} rate={}/day noise={} difficulty_drag={} value_ε={} pruning={}",
+        args.sessions, args.trials, args.rate, args.noise, args.difficulty_drag, args.value_epsilon,
+        if prune { "on" } else { "off" }
     );
     println!("pool,exploration,value_eff,gap_captured,good_rate,best_rate,converged_frac,median_ttc,verdict");
     for &pool in &args.pools {
         for &expl in &args.explorations {
-            let t = effective_tuneables(cfg, Some(expl), None, None, None, None);
+            let t = effective_tuneables(
+                cfg,
+                Overrides { exploration: Some(expl), prune_confidence: args.prune_confidence, ..Default::default() },
+            );
             let h = Harness {
                 pool,
                 sessions: args.sessions,
@@ -358,6 +389,7 @@ pub fn run_sweep(args: &SweepArgs, cfg: &Config) -> anyhow::Result<()> {
                 window: args.window,
                 converge_at: args.converge_at,
                 value_epsilon: args.value_epsilon,
+                prune,
                 t,
             };
             let a = run_config(&h);
@@ -372,29 +404,35 @@ pub fn run_sweep(args: &SweepArgs, cfg: &Config) -> anyhow::Result<()> {
     Ok(())
 }
 
-fn effective_tuneables(
-    cfg: &Config,
+#[derive(Clone, Copy, Default)]
+struct Overrides {
     exploration: Option<f64>,
     cost_sensitivity: Option<f64>,
     score_spread: Option<f64>,
     difficulty_credit: Option<f64>,
     rating_half_life: Option<f64>,
-) -> Tuneables {
+    prune_confidence: Option<f64>,
+}
+
+fn effective_tuneables(cfg: &Config, o: Overrides) -> Tuneables {
     let mut t = cfg.tuneables();
-    if let Some(v) = exploration {
+    if let Some(v) = o.exploration {
         t.exploration = v;
     }
-    if let Some(v) = cost_sensitivity {
+    if let Some(v) = o.cost_sensitivity {
         t.cost_sensitivity = v;
     }
-    if let Some(v) = score_spread {
+    if let Some(v) = o.score_spread {
         t.score_spread = v;
     }
-    if let Some(v) = difficulty_credit {
+    if let Some(v) = o.difficulty_credit {
         t.difficulty_credit = v;
     }
-    if let Some(v) = rating_half_life {
+    if let Some(v) = o.rating_half_life {
         t.rating_half_life_days = v;
+    }
+    if let Some(v) = o.prune_confidence {
+        t.prune_confidence = v;
     }
     t
 }

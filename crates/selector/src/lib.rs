@@ -30,10 +30,16 @@ pub struct Tuneables {
     pub difficulty_credit: f64,
     /// Recency decay half-life for rating events, in days.
     pub rating_half_life_days: f64,
-    /// <1 = exploit/commit faster; >1 = explore more (widens the posterior).
+    /// <1 = exploit/commit faster; >1 = explore more. This scales the *evidenced* part of the
+    /// posterior only — a candidate with zero evidence still draws uniform regardless, so a lower
+    /// value effectively anneals per-candidate (explore the unseen, exploit the well-rated).
     pub exploration: f64,
     /// Logistic scale for squashing a rating into a 0..1 session score. Larger = gentler.
     pub score_spread: f64,
+    /// Confidence width (in posterior std-devs) for cost-dominance pruning. Higher = more
+    /// conservative (prunes less); a candidate is dropped only if its optimistic value still
+    /// trails the strongest candidate's pessimistic value at this width.
+    pub prune_confidence: f64,
 }
 
 impl Default for Tuneables {
@@ -42,8 +48,11 @@ impl Default for Tuneables {
             cost_sensitivity: 0.5,
             difficulty_credit: 0.75,
             rating_half_life_days: 60.0,
-            exploration: 1.0,
+            // Lowered from 1.0 to 0.4 on the strength of the `simulate` sweep: lower exploration
+            // dominates at every pool size (constant 1.0 is a permanent-exploration floor).
+            exploration: 0.4,
             score_spread: 2.0,
+            prune_confidence: 2.0,
         }
     }
 }
@@ -162,6 +171,42 @@ pub fn pick<R: Rng + ?Sized>(cands: &[Candidate], t: &Tuneables, rng: &mut R) ->
     best
 }
 
+/// Cost-aware **dominance pruning**: return the indices of candidates that can still plausibly
+/// win, dropping the ones that provably cannot.
+///
+/// Using each candidate's posterior mean ± `prune_confidence` std-devs as optimistic/pessimistic
+/// quality bounds, a candidate is kept only if its *optimistic* value reaches the strongest
+/// candidate's *pessimistic* value. Because price is known exactly, a costly candidate whose even
+/// best-case value trails a cheaper rival's conservative value can never win on value — so the
+/// selector stops spending picks on it, shrinking the effective pool without an arbitrary cap.
+/// Always keeps at least one candidate; never returns empty.
+pub fn prune_dominated(cands: &[Candidate], t: &Tuneables) -> Vec<usize> {
+    if cands.len() <= 1 {
+        return (0..cands.len()).collect();
+    }
+    let k = t.prune_confidence;
+    // (pessimistic value, optimistic value) per candidate.
+    let bounds: Vec<(f64, f64)> = cands
+        .iter()
+        .map(|c| {
+            let (w, l) = (c.track.wins, c.track.losses);
+            let n = w + l;
+            let mean = w / n;
+            let std = ((w * l) / (n * n * (n + 1.0))).sqrt();
+            let q_lo = (mean - k * std).clamp(0.0, 1.0);
+            let q_hi = (mean + k * std).clamp(0.0, 1.0);
+            (value_score(q_lo, c.normalized_price, t), value_score(q_hi, c.normalized_price, t))
+        })
+        .collect();
+    let best_pess = bounds.iter().map(|b| b.0).fold(f64::NEG_INFINITY, f64::max);
+    let keep: Vec<usize> = (0..cands.len()).filter(|&i| bounds[i].1 >= best_pess).collect();
+    if keep.is_empty() {
+        (0..cands.len()).collect() // defensive: never prune everything
+    } else {
+        keep
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -226,6 +271,32 @@ mod tests {
         }
         // Over the last 100 sessions it should pick the winner well above the 25% random rate.
         assert!(best_hits > 70, "best-arm hits over last 100 = {best_hits}");
+    }
+
+    #[test]
+    fn pruning_drops_a_hopeless_expensive_candidate_but_keeps_the_leader() {
+        let t = Tuneables::default();
+        let cands = vec![
+            // cheap and well-rated
+            Candidate { id: 0, track: TrackRecord { wins: 20.0, losses: 2.0 }, normalized_price: 0.0 },
+            // priciest possible and badly rated → cannot win on value
+            Candidate { id: 1, track: TrackRecord { wins: 2.0, losses: 20.0 }, normalized_price: 1.0 },
+        ];
+        let keep = prune_dominated(&cands, &t);
+        assert!(keep.contains(&0), "the leader must be kept");
+        assert!(!keep.contains(&1), "the hopeless expensive candidate should be pruned");
+        assert!(!keep.is_empty());
+    }
+
+    #[test]
+    fn pruning_keeps_genuinely_uncertain_candidates() {
+        let t = Tuneables::default();
+        // two blank-slate candidates at the same price: nothing is known, prune nothing.
+        let cands = vec![
+            Candidate { id: 0, track: TrackRecord::blank(), normalized_price: 0.5 },
+            Candidate { id: 1, track: TrackRecord::blank(), normalized_price: 0.5 },
+        ];
+        assert_eq!(prune_dominated(&cands, &t).len(), 2);
     }
 
     proptest! {

@@ -55,6 +55,8 @@ pub struct Config {
     pub rating_half_life_days: f64,
     pub exploration: f64,
     pub score_spread: f64,
+    /// Confidence width (posterior std-devs) for cost-dominance pruning; higher = prunes less.
+    pub prune_confidence: f64,
     pub track_market: bool,
     pub price_refresh_interval_hours: f64,
     // --- safety knobs ---
@@ -75,8 +77,9 @@ impl Default for Config {
             provider_pooling: 0.3,
             difficulty_credit: 0.75,
             rating_half_life_days: 60.0,
-            exploration: 1.0,
+            exploration: 0.4,
             score_spread: 2.0,
+            prune_confidence: 2.0,
             track_market: false,
             price_refresh_interval_hours: 24.0,
             max_session_cost_usd: 5.0,
@@ -126,6 +129,7 @@ impl Config {
             rating_half_life_days: self.rating_half_life_days,
             exploration: self.exploration,
             score_spread: self.score_spread,
+            prune_confidence: self.prune_confidence,
         }
     }
 }

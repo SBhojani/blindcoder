@@ -26,11 +26,18 @@ difficulty_credit = 0.75
 # Recency: older ratings decay with this half-life (days). Lower = trust recent more.
 rating_half_life_days = 60
 
-# <1 = exploit/commit faster; >1 = explore more. The selector auto-balances, so 1.0 is neutral.
-exploration = 1.0
+# <1 = exploit/commit faster; >1 = explore more. This scales only the *evidenced* part of the
+# posterior — an unrated candidate still draws uniform, so a lower value anneals per-candidate
+# (explore the unseen, exploit the well-rated). Default lowered to 0.4 on simulate evidence.
+exploration = 0.4
 
 # How decisively a single rating moves the track record (logistic scale; larger = gentler).
 score_spread = 2.0
+
+# Cost-dominance pruning width, in posterior std-devs. A candidate is dropped only when its
+# optimistic value still trails the strongest candidate's pessimistic value at this width.
+# Higher = more conservative (prunes less). 2.0 prunes only provably-hopeless candidates.
+prune_confidence = 2.0
 
 # Track price history for the entire catalog (not just models you use). Off by default.
 track_market = false
