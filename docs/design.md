@@ -114,11 +114,14 @@ transport having to price mid-stream.
 That token×shelf-price figure is an **estimate**, not the bill. A model on an aggregating gateway has
 no single price — different serving providers charge differently, the listed price is usually the
 cheapest, and a privacy filter (routing only to zero-data-retention providers) deliberately excludes
-the cheap ones, so the effective rate is higher than any headline number. The estimate is fine for
-the cap and the cost-tilt (relative ordering is what the selector needs), but the **authoritative**
-cost is what the provider reports after the fact — capturing that provider-reported cost into
-`realized_cost` (falling back to the estimate when none is returned) is the accurate path, and where
-the accounting is headed.
+the cheap ones, so the effective rate is higher than any headline number. (Observed in live testing:
+one model listed five serving providers spanning a ~1.6× spread; a zero-data-retention filter routed
+to a mid-priced one, and the bill matched *that* provider to the cent — not the cheapest headline
+price.) Worse, the per-provider data policy often is not exposed, so which price you will actually pay
+is not predictable in advance. The estimate is fine for the cap and the cost-tilt (relative ordering
+is what the selector needs), but the **authoritative** cost is what the provider reports after the
+fact — capturing that provider-reported cost into `realized_cost` (falling back to the estimate when
+none is returned) is the accurate path, and where the accounting is headed.
 
 The M0 transport is a small **streaming reverse proxy**: `run` binds it on a local port, and for
 each request it rewrites the blind model to the real slug, merges the provider's `extra_body`,
