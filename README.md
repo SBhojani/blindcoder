@@ -13,11 +13,11 @@ who did it, and over time the router sends more of your work to whatever quietly
 
 > **Status: early (milestone M0).** The permanent decision core — the selector, the
 > append-only store schema, the config surface, and the aliasing — is real and tested, and
-> [`simulate`](#simulate) (the offline convergence harness) validates the selector. `run` and
-> `rate` are wired to that core: `run` seeds the pool, makes a real blind pick, and records the
-> session; `rate` records your feedback. The one piece still stubbed is the **forwarding
-> transport** — until it lands, `run` picks and logs but does not proxy the request. The
-> production proxy (raw-capture tee, fail-closed privacy) is M1 (see [Roadmap](#roadmap)).
+> [`simulate`](#simulate) (the offline convergence harness) validates the selector. `run` now
+> stands up a **streaming forwarding proxy**: it makes a blind pick, proxies your session to the
+> chosen model (rewriting the model on the wire, streaming responses straight back, enforcing a
+> cost cap), and records it; `rate` records your feedback afterward. The hardening — a
+> raw-capture tee and fail-closed per-request privacy — is M1 (see [Roadmap](#roadmap)).
 
 ## Why blind?
 
@@ -76,22 +76,30 @@ baseline, and a time-to-converge estimate, ending in a plain GO / MARGINAL / NO-
 ## run and rate
 
 Once you have declared a pool in your config (see [Configuration](#configuration)), `run` makes
-a blind pick and opens a session, and `rate` records how it went afterward:
+a blind pick and stands up a local forwarding proxy; point your OpenAI-compatible CLI at it,
+work, then end the session and `rate` how it went:
 
 ```sh
-blindcoder run                        # seeds the pool, picks a blinded model, records a session
+blindcoder run
+#   blindcoder: routing a blinded session (picked from a pool of 4).
+#     point your OpenAI-compatible CLI at:  http://127.0.0.1:8787/v1
+#     model to request:  x7k2:q4m9   (any value works; the proxy rewrites it)
+#     cost cap:  $5.00 ...
+#     press Ctrl-C to end the session and record it.
+
 blindcoder rate --session <id> --performance 1 --difficulty 3
 ```
 
-`run` prints the blinded alias it chose (never the real name) and the session id. `performance`
-is `-2..=2` and `difficulty` is `0..=4`; difficulty is asked *after* the session, against the
-finished work, so the rating is not anchored on an up-front guess. Made a mistake? Rate again
-with `--supersedes <old-rating-id>` — corrections supersede, they never overwrite.
+The proxy rewrites the model on the wire to the real one, forwards to the provider, streams the
+response straight back, and tallies token usage — halting the session if the estimated spend
+reaches your `max_session_cost_usd`. It prints the blinded alias (never the real name) and the
+session id. `performance` is `-2..=2` and `difficulty` is `0..=4`; difficulty is asked *after*
+the session, against the finished work, so the rating is not anchored on an up-front guess. Made
+a mistake? Rate again with `--supersedes <old-rating-id>` — corrections supersede, never overwrite.
 
-> **Note:** the **forwarding transport is not built yet**, so `run` currently makes the real
-> selection and records the session but does not proxy the request to the model. It closes the
-> session tagged `transport_unimplemented`. The transport lands next; the selection, aliasing,
-> and logging around it are real today.
+> **M0 limitation:** the proxy forwards `/v1/models` untouched, so a CLI that lists models will
+> see real provider names. Blinding covers the chat path; a models-list rewrite comes with the M1
+> proxy hardening.
 
 ## Configuration
 
@@ -122,7 +130,7 @@ to prove it structurally rather than by hope:
 ## Roadmap
 
 - **M0** — the persistent core (selector · store · config · alias), `simulate` (validation), and
-  `run`/`rate` wired to it (blind pick + session logging; forwarding transport still stubbed).
+  `run`/`rate` over a streaming forwarding proxy (blind pick, real proxying, cost cap, logging).
   ← *here*
 - **M1** — the production proxy: raw-capture tee and fail-closed per-request privacy.
 - **M2** — capture levels and byte-exact wire archives; a standing serve mode.

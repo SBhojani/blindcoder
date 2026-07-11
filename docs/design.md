@@ -107,10 +107,18 @@ was spent.**
 The split is: **mechanism in the backend, policy in the router.** The backend just observes usage
 and can be told to stop; the router owns the threshold and the token→cost estimate. So
 `max_session_cost_usd` is a genuine kill-switch (halt the session and prompt) rather than an
-after-the-fact report — a **catastrophe bound on runaway agentic loops, not a budget lever**. When
-a transport can't price mid-stream, the router falls back to tokens × unit price so the cap still
-fires. The M0 transport doesn't stream, so the cap can't fire on it yet — an honest limitation that
-disappears when the streaming tee lands, behind the same trait, with no change above the seam.
+after-the-fact report — a **catastrophe bound on runaway agentic loops, not a budget lever**. The
+router prices each usage tick as tokens × the pick's shelf price, so the cap fires without the
+transport having to price mid-stream.
+
+The M0 transport is a small **streaming reverse proxy**: `run` binds it on a local port, and for
+each request it rewrites the blind model to the real slug, merges the provider's `extra_body`,
+forwards with the API key and `extra_headers`, and streams the response straight back while
+tallying the `usage` block into cumulative token counts (the `Usage` events the cap acts on).
+Point any OpenAI-compatible CLI at it. Two honest M0 limitations: it accounts usage per completed
+response rather than token-by-token mid-stream, and it forwards `/v1/models` untouched (so a CLI
+that lists models sees real names — blinding covers the chat path). Both tighten with the M1
+tee, behind this same trait, with no change above the seam.
 
 ## simulate — the go/no-go
 
@@ -160,7 +168,7 @@ Route only to endpoints that do not retain or train on your prompts, and make th
 ## Milestones
 
 - **M0** — the permanent core (selector · store · config · alias), `simulate`, and `run`/`rate`
-  wired to it (real blind pick + session logging; the forwarding transport is still stubbed).
+  over a streaming forwarding proxy (real blind pick, live proxying, cost cap, session logging).
 - **M1** — the production proxy: raw-capture tee, fail-closed per-request privacy.
 - **M2** — capture levels, byte-exact wire archives, a standing serve mode.
 - **M3** — many providers, subscription cap-safety, optional whole-market price tracking.
