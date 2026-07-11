@@ -5,6 +5,7 @@
 //! subcommands (`run`/`rate`/`reveal`/`stats`) are wired to the persistent core but land in
 //! later milestones.
 
+mod run;
 mod simulate;
 
 use clap::{Parser, Subcommand};
@@ -31,10 +32,10 @@ enum Cmd {
     Simulate(simulate::SimulateArgs),
     /// Grid form of `simulate`: sweep pool × exploration, CSV to stdout.
     Sweep(simulate::SweepArgs),
-    /// Launch a blinded agentic session. (Lands in M0's `run`/M1 — not yet implemented.)
+    /// Pick a blinded model and record a session. (Forwarding transport lands next milestone.)
     Run,
-    /// Rate a past session after the fact. (Later milestone.)
-    Rate,
+    /// Rate a past session after the fact (difficulty captured post-hoc; corrections supersede).
+    Rate(run::RateArgs),
     /// Unmask a session's model — gated and logged. (Later milestone.)
     Reveal,
     /// Show per-alias quality/cost/value leaderboards. (Later milestone.)
@@ -48,11 +49,13 @@ fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Simulate(args) => simulate::run(&args, &cfg),
         Cmd::Sweep(args) => simulate::run_sweep(&args, &cfg),
-        Cmd::Run | Cmd::Rate | Cmd::Reveal | Cmd::Stats => {
+        Cmd::Run => run::run(&cfg),
+        Cmd::Rate(args) => run::rate(&args),
+        Cmd::Reveal | Cmd::Stats => {
             eprintln!(
-                "This subcommand lands in a later milestone. M0 delivers `simulate` \
-                 (and the persistent selector/store/config/alias core it exercises).\n\
-                 Try:  blindcoder simulate --help"
+                "This subcommand lands in a later milestone. Available now: `simulate`, `sweep`, \
+                 `run`, `rate`.\n\
+                 Try:  blindcoder run --help"
             );
             std::process::exit(2);
         }
