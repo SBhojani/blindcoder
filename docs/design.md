@@ -41,6 +41,40 @@ value_score = quality_guess − cost_sensitivity × normalized_price
 The selector is pure — no I/O, no clock, no ambient randomness — which is what makes it
 property-testable and what the `simulate` harness drives.
 
+## Providers, the pool, and the proxy
+
+blindcoder is **provider-generic by construction.** Any OpenAI-compatible
+`/chat/completions` endpoint is a candidate; the code never branches on which provider it is.
+Everything provider-specific is *data* in the config, not a code path:
+
+- A provider is `{ slug, base_url, wire, key_env }` plus two passthrough hooks —
+  **`extra_headers`** (verbatim per-request headers, e.g. attribution) and **`extra_body`** (a
+  JSON object merged into every request body, e.g. provider-routing or data-policy/ZDR flags).
+  This is how per-provider behaviour is expressed without a branch, so adding a new backend is a
+  config edit, not a code change.
+- Each provider lists its **models** as `{ canonical_key, real_slug, optional prices }`.
+  `canonical_key` is the provider-neutral identity the selector learns on, so the *same* model
+  offered by two providers shares one quality belief while the two compete on price. `real_slug`
+  is what that provider's API expects in the `model` field. **Omitting prices marks a free
+  tier** — it simply competes as a zero-cost candidate (no separate "is free" flag).
+
+A useful consequence: a pool of only-free models makes the cost term inert (every candidate is
+$0), so the selector reduces to a pure quality race. Mixing in at least one priced provider is
+what exercises the cost/quality trade-off — which is the whole point of the router.
+
+**The proxy is a rewrite, not a translation.** For one session the router picks a candidate,
+starts a session, and forwards requests to the chosen endpoint with just two edits to the wire
+body: the blind `model` field is replaced with the resolved `real_slug`, and the provider's
+`extra_body` is shallow-merged in. The resolved model is always written last, so a stray or
+hostile `extra_body.model` can never route around the blind. The blind→real crossing happens
+only inside the **reveal gate** (reason: routing) and is journaled, so it stays auditable and
+the real identity never leaks to the user.
+
+`run` performs the pick, resolves the route through the gate, and records the session; `rate`
+appends the two-question rating afterward (a correction supersedes rather than edits). Difficulty
+is captured *after* the session, framed against the finished artifact, to avoid anchoring the
+rating on an up-front guess.
+
 ## simulate — the go/no-go
 
 Before building any proxy, `simulate` answers the one question that can kill the design: *does

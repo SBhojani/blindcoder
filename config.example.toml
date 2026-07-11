@@ -56,11 +56,43 @@ max_session_cost_usd = 5.0
 curated_policy_max_age_days = 90
 
 # --- providers ------------------------------------------------------------------------------
-# Declare each backend once. Put the real API key in the environment variable named by
-# `key_env` (never inline it here in a file you might share).
+# Declare each backend and the models it offers. Put the real API key in the environment
+# variable named by `key_env` (never inline it here in a file you might share). Any
+# OpenAI-compatible /chat/completions endpoint works — blindcoder never branches on which
+# provider it is; everything provider-specific below is data, not code.
+#
+# Two knobs keep it provider-blind:
+#   * extra_headers — extra HTTP headers sent on every request (e.g. attribution).
+#   * extra_body    — a JSON object merged into every request body (e.g. provider-routing or
+#                     data-policy/ZDR preferences).
+#
+# `canonical_key` is the provider-neutral identity the selector learns on: the SAME model
+# offered by two providers should share one canonical_key, so its quality belief pools across
+# providers while the two compete on price. `real_slug` is what that provider's API expects in
+# the request `model` field. Omit prices for a free tier — it competes as a zero-cost candidate.
 
+# A free provider (no prices, no passthrough needed).
+# [[providers]]
+# slug = "groq"
+# base_url = "https://api.groq.com/openai/v1"
+# wire = "openai"
+# key_env = "GROQ_API_KEY"
+#
+#   [[providers.models]]
+#   canonical_key = "kimi-k2"
+#   real_slug = "moonshotai/kimi-k2-instruct"
+
+# A priced gateway provider (same model, priced; attribution header + a routing body flag).
 # [[providers]]
 # slug = "openrouter"
 # base_url = "https://openrouter.ai/api/v1"
 # wire = "openai"
 # key_env = "OPENROUTER_API_KEY"
+# extra_headers = { "X-Title" = "blindcoder" }
+# extra_body = { "provider" = { "require_parameters" = true } }
+#
+#   [[providers.models]]
+#   canonical_key = "kimi-k2"            # same model as above → shared quality belief
+#   real_slug = "moonshotai/kimi-k2"
+#   input_per_mtok = 0.55
+#   output_per_mtok = 2.2
