@@ -19,6 +19,25 @@ cross-provider comparison still works, while the display name (`provider_token:m
 reveals nothing. The real identity is resolved only through a **reveal gate**, so unmasking is an
 explicit, recorded act.
 
+### What blinding protects — and where it leaks
+
+Blinding defends against the thing that actually biases ratings: **name-driven prior belief**
+("it's the expensive famous one, must be good"). It does *not* claim perfect anonymity, and it
+is honest to say where it can leak:
+
+- **Cost and latency are tells.** A visibly pricey or conspicuously slow response narrows the
+  guess. Mitigation: the rating is collected *before* any cost is shown, so the number can't
+  anchor the score; cost enters only the selector's math, not your judgement.
+- **Models self-identify.** A model may name itself in its output, or have a recognizable style.
+  Blinding can't prevent this; it only avoids *volunteering* the identity.
+- **A small pool is low-entropy.** With two or three candidates, a confident guess is sometimes
+  right by chance. The tokens stop *deterministic* de-anonymization (a hash wouldn't), not
+  informed inference.
+
+The design goal is therefore "don't hand you the label," not "make identification impossible."
+Peeking is always available through the reveal gate — it is just made deliberate and logged,
+because every peek biases the ratings that follow.
+
 ## The selector
 
 For each candidate, draw a plausible quality from its Beta posterior (Thompson sampling), then
@@ -75,6 +94,24 @@ appends the two-question rating afterward (a correction supersedes rather than e
 is captured *after* the session, framed against the finished artifact, to avoid anchoring the
 rating on an up-front guess.
 
+## The transport seam
+
+Everything above the `Backend` trait (selector, store, config, aliasing, the CLI) is written for
+real at M0 and never rewritten; everything below it — the actual byte-forwarding — grows in place
+across milestones. The seam is deliberately a **session lifecycle**, not a single blocking call:
+the router `start`s a session, then observes usage events and can `abort` mid-flight before
+`finish`. That shape exists for one reason — **a per-session spend cap can only be enforced by a
+transport that reports cost *as it streams*; a one-shot call could only report it after the money
+was spent.**
+
+The split is: **mechanism in the backend, policy in the router.** The backend just observes usage
+and can be told to stop; the router owns the threshold and the token→cost estimate. So
+`max_session_cost_usd` is a genuine kill-switch (halt the session and prompt) rather than an
+after-the-fact report — a **catastrophe bound on runaway agentic loops, not a budget lever**. When
+a transport can't price mid-stream, the router falls back to tokens × unit price so the cap still
+fires. The M0 transport doesn't stream, so the cap can't fire on it yet — an honest limitation that
+disappears when the streaming tee lands, behind the same trait, with no change above the seam.
+
 ## simulate — the go/no-go
 
 Before building any proxy, `simulate` answers the one question that can kill the design: *does
@@ -122,8 +159,8 @@ Route only to endpoints that do not retain or train on your prompts, and make th
 
 ## Milestones
 
-- **M0** — the permanent core (selector · store · config · alias) plus `simulate` and a minimal
-  blind `run`.
+- **M0** — the permanent core (selector · store · config · alias), `simulate`, and `run`/`rate`
+  wired to it (real blind pick + session logging; the forwarding transport is still stubbed).
 - **M1** — the production proxy: raw-capture tee, fail-closed per-request privacy.
 - **M2** — capture levels, byte-exact wire archives, a standing serve mode.
 - **M3** — many providers, subscription cap-safety, optional whole-market price tracking.

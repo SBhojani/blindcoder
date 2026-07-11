@@ -12,10 +12,12 @@ The point is to judge models on results, not reputation: you rate the work witho
 who did it, and over time the router sends more of your work to whatever quietly performs.
 
 > **Status: early (milestone M0).** The permanent decision core — the selector, the
-> append-only store schema, the config surface, and the aliasing — is real and tested. The
-> runnable deliverable today is [`simulate`](#simulate), the offline convergence harness that
-> validates the selector before any proxy work. The blind daily-driver (`run`) and the rest of
-> the subcommands land in later milestones (see [Roadmap](#roadmap)).
+> append-only store schema, the config surface, and the aliasing — is real and tested, and
+> [`simulate`](#simulate) (the offline convergence harness) validates the selector. `run` and
+> `rate` are wired to that core: `run` seeds the pool, makes a real blind pick, and records the
+> session; `rate` records your feedback. The one piece still stubbed is the **forwarding
+> transport** — until it lands, `run` picks and logs but does not proxy the request. The
+> production proxy (raw-capture tee, fail-closed privacy) is M1 (see [Roadmap](#roadmap)).
 
 ## Why blind?
 
@@ -71,6 +73,26 @@ cargo run -- simulate --help
 It prints the best-arm pick-rate over training, cumulative regret against the random-choice
 baseline, and a time-to-converge estimate, ending in a plain GO / MARGINAL / NO-GO verdict.
 
+## run and rate
+
+Once you have declared a pool in your config (see [Configuration](#configuration)), `run` makes
+a blind pick and opens a session, and `rate` records how it went afterward:
+
+```sh
+blindcoder run                        # seeds the pool, picks a blinded model, records a session
+blindcoder rate --session <id> --performance 1 --difficulty 3
+```
+
+`run` prints the blinded alias it chose (never the real name) and the session id. `performance`
+is `-2..=2` and `difficulty` is `0..=4`; difficulty is asked *after* the session, against the
+finished work, so the rating is not anchored on an up-front guess. Made a mistake? Rate again
+with `--supersedes <old-rating-id>` — corrections supersede, they never overwrite.
+
+> **Note:** the **forwarding transport is not built yet**, so `run` currently makes the real
+> selection and records the session but does not proxy the request to the model. It closes the
+> session tagged `transport_unimplemented`. The transport lands next; the selection, aliasing,
+> and logging around it are real today.
+
 ## Configuration
 
 blindcoder is config-file-first. Copy [`config.example.toml`](config.example.toml) to your
@@ -99,8 +121,9 @@ to prove it structurally rather than by hope:
 
 ## Roadmap
 
-- **M0** — the persistent core (selector · store · config · alias) plus `simulate` (validation)
-  and a minimal blind `run`. ← *here*
+- **M0** — the persistent core (selector · store · config · alias), `simulate` (validation), and
+  `run`/`rate` wired to it (blind pick + session logging; forwarding transport still stubbed).
+  ← *here*
 - **M1** — the production proxy: raw-capture tee and fail-closed per-request privacy.
 - **M2** — capture levels and byte-exact wire archives; a standing serve mode.
 - **M3** — many providers, subscription cap-safety, optional market price tracking.
