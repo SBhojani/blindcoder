@@ -88,6 +88,18 @@ CREATE TABLE IF NOT EXISTS ratings (
   supersedes_rating_id INTEGER REFERENCES ratings(id)
 );
 
+-- Reveal journal: every unmask of an alias→identity is an append-only event, so peeking at a
+-- model's identity (which biases future ratings) stays visible in the history. `reason` mirrors
+-- the alias-crate `RevealReason` ('user_requested' | 'routing'); `session_id` is nullable because
+-- a `reveal` subcommand may unmask an alias outside any one session.
+CREATE TABLE IF NOT EXISTS reveals (
+  id          INTEGER PRIMARY KEY AUTOINCREMENT,
+  alias       TEXT NOT NULL,
+  session_id  INTEGER REFERENCES sessions(id),
+  reason      TEXT NOT NULL,
+  revealed_at TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 -- Append-only enforcement: block UPDATE/DELETE on the integrity-critical tables.
 CREATE TRIGGER IF NOT EXISTS sessions_no_update BEFORE UPDATE ON sessions
   BEGIN SELECT RAISE(ABORT, 'append-only: sessions are immutable'); END;
@@ -109,5 +121,13 @@ CREATE TRIGGER IF NOT EXISTS aliases_no_update BEFORE UPDATE ON aliases
 CREATE TRIGGER IF NOT EXISTS aliases_no_delete BEFORE DELETE ON aliases
   BEGIN SELECT RAISE(ABORT, 'append-only: the alias blind-key is immutable'); END;
 
+CREATE TRIGGER IF NOT EXISTS reveals_no_update BEFORE UPDATE ON reveals
+  BEGIN SELECT RAISE(ABORT, 'append-only: reveals are immutable'); END;
+CREATE TRIGGER IF NOT EXISTS reveals_no_delete BEFORE DELETE ON reveals
+  BEGIN SELECT RAISE(ABORT, 'append-only: reveals are immutable'); END;
+
 CREATE INDEX IF NOT EXISTS ratings_by_session ON ratings(session_id);
 CREATE INDEX IF NOT EXISTS sessions_by_alias ON sessions(alias);
+-- The superseding pointer is the hot path of the effective-ratings fold; index it so excluding
+-- corrected ratings never devolves into a scan.
+CREATE INDEX IF NOT EXISTS ratings_supersedes ON ratings(supersedes_rating_id);
