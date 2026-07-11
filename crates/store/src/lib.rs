@@ -12,6 +12,18 @@ use std::path::Path;
 /// The full append-only schema, applied on open (idempotent — every statement is `IF NOT EXISTS`).
 pub const SCHEMA: &str = include_str!("schema.sql");
 
+/// An effective rating with its age already resolved to days, ready to fold. Age is computed by
+/// SQLite (`julianday('now') - julianday(rated_at)`) so the binary needs no datetime dependency and
+/// the selector stays clock-free — the store owns the one clock, as it already does for row
+/// timestamps.
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgedRating {
+    pub canonical_key: String,
+    pub performance_points: f64,
+    pub difficulty_points: f64,
+    pub age_days: f64,
+}
+
 /// A resolved routing target for an alias: everything the transport needs to forward one request.
 /// The proxy reaches this only through the reveal gate (reason: routing) — it is the single place
 /// an alias becomes a real identity.
@@ -140,6 +152,38 @@ impl Store {
         Ok(rows)
     }
 
+    /// Like [`effective_ratings`](Self::effective_ratings) but with the age resolved to days in
+    /// SQL, ready for the recency-decayed fold. Same supersede semantics — corrections collapse to
+    /// the tip, no double-count.
+    pub fn effective_ratings_aged(&self) -> Result<Vec<AgedRating>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.canonical_key,
+                    r.performance_points,
+                    r.difficulty_points,
+                    julianday('now') - julianday(r.rated_at) AS age_days
+             FROM ratings r
+             JOIN sessions s ON s.id = r.session_id
+             JOIN aliases  a ON a.alias = s.alias
+             WHERE r.id NOT IN (
+                 SELECT supersedes_rating_id
+                 FROM ratings
+                 WHERE supersedes_rating_id IS NOT NULL
+             )
+             ORDER BY r.rated_at ASC, r.id ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AgedRating {
+                    canonical_key: r.get(0)?,
+                    performance_points: r.get::<_, i64>(1)? as f64,
+                    difficulty_points: r.get::<_, i64>(2)? as f64,
+                    age_days: r.get::<_, f64>(3)?.max(0.0),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
     // --- pool seeding: providers, catalog, prices (mutable registries, not the append-only log) ---
 
     /// Insert or refresh a provider record (routing facts only; not identity-critical, so mutable).
@@ -181,7 +225,9 @@ impl Store {
                 |r| Ok((r.get(0)?, r.get(1)?)),
             )
             .optional()?;
-        if latest == Some((input_per_mtok, output_per_mtok)) {
+        // Treat "no row yet" as equivalent to an all-unpriced observation, so seeding a free model
+        // (both None) records nothing, and re-seeding an unchanged price is a no-op either way.
+        if latest.unwrap_or((None, None)) == (input_per_mtok, output_per_mtok) {
             return Ok(());
         }
         self.conn.execute(
@@ -444,15 +490,15 @@ mod tests {
     #[test]
     fn seed_resolve_route_round_trips() {
         let s = Store::open_in_memory().unwrap();
-        s.upsert_provider("groq", "https://api.groq.com/openai/v1", "openai").unwrap();
-        s.upsert_model("kimi-k2", "groq", "moonshotai/kimi-k2-instruct").unwrap();
-        let a = Alias { provider_token: "gr0q".into(), model_token: "k2tk".into() };
-        s.insert_alias(&a, "kimi-k2", "groq").unwrap();
+        s.upsert_provider("prov-a", "http://prov-a.test/v1", "openai").unwrap();
+        s.upsert_model("model-x", "prov-a", "prov-a/model-x").unwrap();
+        let a = Alias { provider_token: "pt01".into(), model_token: "mt01".into() };
+        s.insert_alias(&a, "model-x", "prov-a").unwrap();
 
         let route = s.resolve_route(&a.display()).unwrap().expect("route resolves");
-        assert_eq!(route.real_slug, "moonshotai/kimi-k2-instruct");
-        assert_eq!(route.base_url, "https://api.groq.com/openai/v1");
-        assert_eq!(route.canonical_key, "kimi-k2");
+        assert_eq!(route.real_slug, "prov-a/model-x");
+        assert_eq!(route.base_url, "http://prov-a.test/v1");
+        assert_eq!(route.canonical_key, "model-x");
         assert!(s.resolve_route("nope:nope").unwrap().is_none());
     }
 
@@ -461,18 +507,18 @@ mod tests {
         // The same canonical_key under two providers must reuse one model-token so the blinded
         // aliases still reveal they are the same model.
         let s = Store::open_in_memory().unwrap();
-        assert!(s.model_token_for("kimi-k2").unwrap().is_none());
-        let a = Alias { provider_token: "gr0q".into(), model_token: "k2tk".into() };
-        s.insert_alias(&a, "kimi-k2", "groq").unwrap();
-        assert_eq!(s.model_token_for("kimi-k2").unwrap().as_deref(), Some("k2tk"));
-        assert_eq!(s.provider_token_for("groq").unwrap().as_deref(), Some("gr0q"));
+        assert!(s.model_token_for("model-x").unwrap().is_none());
+        let a = Alias { provider_token: "pt01".into(), model_token: "mt01".into() };
+        s.insert_alias(&a, "model-x", "prov-a").unwrap();
+        assert_eq!(s.model_token_for("model-x").unwrap().as_deref(), Some("mt01"));
+        assert_eq!(s.provider_token_for("prov-a").unwrap().as_deref(), Some("pt01"));
     }
 
     #[test]
     fn prices_append_on_change_only() {
         let s = Store::open_in_memory().unwrap();
-        s.record_price_if_changed("kimi-k2", "or", Some(0.55), Some(2.2)).unwrap();
-        s.record_price_if_changed("kimi-k2", "or", Some(0.55), Some(2.2)).unwrap(); // unchanged → no-op
+        s.record_price_if_changed("model-x", "prov-a", Some(0.55), Some(2.2)).unwrap();
+        s.record_price_if_changed("model-x", "prov-a", Some(0.55), Some(2.2)).unwrap(); // unchanged → no-op
         let n: i64 = s
             .conn
             .query_row("SELECT count(*) FROM price_history", [], |r| r.get(0))
