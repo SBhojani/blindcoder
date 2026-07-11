@@ -96,6 +96,9 @@ curated_policy_max_age_days = 90
 #   order = ["prov-a","prov-b"]     -> try these providers in this order
 #   only = ["prov-a"] / ignore=[..] -> restrict to / exclude specific providers
 #   allow_fallbacks = false         -> use only the top provider (strict; fails if it is down)
+#   max_price = { completion = 2.0, prompt = 0.5 }
+#                                   -> only providers at/below these RATES ($/Mtok); hard fail if none
+#                                      (a rate ceiling, NOT a per-request spend cap — cost = rate x tokens)
 # (Provider slugs for order/only/ignore come from the documented GET /api/v1/providers list — read
 #  each entry's `slug`. Whether a given provider serves a model under ZDR is not in that list; probe
 #  it: only=[slug] + zdr=true + allow_fallbacks=false either routes there or errors.)

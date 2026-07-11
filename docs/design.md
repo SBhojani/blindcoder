@@ -114,6 +114,12 @@ after-the-fact report — a **catastrophe bound on runaway agentic loops, not a 
 router prices each usage tick as tokens × the pick's shelf price, so the cap fires without the
 transport having to price mid-stream.
 
+This is a *spend* cap (total dollars this session), distinct from a *rate* ceiling. Some gateways
+also accept a per-request rate ceiling — e.g. OpenRouter's `provider.max_price`, a hard `$/Mtok`
+bound that refuses any provider above it — a useful complement passed straight through the config's
+request-body hooks, but not a substitute: a rate ceiling bounds `$/token`, the session cap bounds
+total `$`, and only the latter stops a cheap model looping forever.
+
 That token×shelf-price figure is an **estimate**, not the bill. A model on an aggregating gateway has
 no single price — several serving providers offer it at different rates — and by default the gateway
 **load-balances across the eligible providers**, so which one (and which price) you get varies run to
