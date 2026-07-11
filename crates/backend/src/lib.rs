@@ -14,6 +14,8 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+pub mod rewrite;
+
 /// The chosen candidate for a session. The real slug is present here because the transport needs
 /// it to route; it reaches this struct only via the alias reveal gate (reason: routing).
 #[derive(Clone, Debug)]
