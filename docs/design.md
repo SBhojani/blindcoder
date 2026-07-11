@@ -111,6 +111,15 @@ after-the-fact report — a **catastrophe bound on runaway agentic loops, not a 
 router prices each usage tick as tokens × the pick's shelf price, so the cap fires without the
 transport having to price mid-stream.
 
+That token×shelf-price figure is an **estimate**, not the bill. A model on an aggregating gateway has
+no single price — different serving providers charge differently, the listed price is usually the
+cheapest, and a privacy filter (routing only to zero-data-retention providers) deliberately excludes
+the cheap ones, so the effective rate is higher than any headline number. The estimate is fine for
+the cap and the cost-tilt (relative ordering is what the selector needs), but the **authoritative**
+cost is what the provider reports after the fact — capturing that provider-reported cost into
+`realized_cost` (falling back to the estimate when none is returned) is the accurate path, and where
+the accounting is headed.
+
 The M0 transport is a small **streaming reverse proxy**: `run` binds it on a local port, and for
 each request it rewrites the blind model to the real slug, merges the provider's `extra_body`,
 forwards with the API key and `extra_headers`, and streams the response straight back while
