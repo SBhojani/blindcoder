@@ -96,9 +96,11 @@ curated_policy_max_age_days = 90
 #   order = ["prov-a","prov-b"]     -> try these providers in this order
 #   only = ["prov-a"] / ignore=[..] -> restrict to / exclude specific providers
 #   allow_fallbacks = false         -> use only the top provider (strict; fails if it is down)
-# These AND together — a privacy filter can exclude the cheapest provider, so the price you pay is
-# often NOT the headline/cheapest one. `sort = "price"` + a ZDR filter gives the cheapest compliant
-# provider deterministically; even so, treat input/output prices below as an estimate.
+# These AND together. By DEFAULT the gateway load-balances across all ELIGIBLE providers, so without
+# `sort` the price varies run to run and is often not the cheapest (the privacy filters restrict the
+# eligible set but do not sort it). `sort = "price"` + a ZDR filter routes to the cheapest compliant
+# provider deterministically. Even so, treat the input/output prices below as an estimate — the
+# gateway returns the real per-request cost inline in the response usage.
 # [[providers]]
 # slug = "openrouter"
 # base_url = "https://openrouter.ai/api/v1"

@@ -112,16 +112,17 @@ router prices each usage tick as tokens × the pick's shelf price, so the cap fi
 transport having to price mid-stream.
 
 That token×shelf-price figure is an **estimate**, not the bill. A model on an aggregating gateway has
-no single price — different serving providers charge differently, the listed price is usually the
-cheapest, and a privacy filter (routing only to zero-data-retention providers) deliberately excludes
-the cheap ones, so the effective rate is higher than any headline number. (Observed in live testing:
-one model listed five serving providers spanning a ~1.6× spread; a zero-data-retention filter routed
-to a mid-priced one, and the bill matched *that* provider to the cent — not the cheapest headline
-price.) Worse, the per-provider data policy often is not exposed, so which price you will actually pay
-is not predictable in advance. The estimate is fine for the cap and the cost-tilt (relative ordering
-is what the selector needs), but the **authoritative** cost is what the provider reports after the
-fact — capturing that provider-reported cost into `realized_cost` (falling back to the estimate when
-none is returned) is the accurate path, and where the accounting is headed.
+no single price — several serving providers offer it at different rates — and by default the gateway
+**load-balances across the eligible providers**, so which one (and which price) you get varies run to
+run and is often not the cheapest. (Observed in live testing: one model was served by five providers
+spanning a ~1.6× spread; back-to-back requests under the same settings landed on different providers,
+and the bill matched whichever one served that call, to the cent.) You *can* pin it — sorting by
+price routes to the cheapest eligible provider deterministically — but even that can drift as
+providers come and go. The estimate is fine for the cap and the cost-tilt (relative ordering is what
+the selector needs); for the **authoritative** figure, gateways typically return the real per-request
+cost inline in the response (a `cost` field alongside token usage), so the accurate path is to record
+that reported cost into `realized_cost`, falling back to the estimate only when none is returned.
+That is where the accounting is headed.
 
 The M0 transport is a small **streaming reverse proxy**: `run` binds it on a local port, and for
 each request it rewrites the blind model to the real slug, merges the provider's `extra_body`,
