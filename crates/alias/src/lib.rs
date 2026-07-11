@@ -51,12 +51,17 @@ pub enum RevealReason {
 }
 
 impl RevealGate {
-    /// Resolve an alias to its real slug via the caller-supplied lookup, tagging the reason. In
-    /// M1+ this is where the reveal is journaled; at M0 it centralizes the single crossing point
-    /// so nothing else touches the mapping directly.
-    pub fn reveal<F>(&self, alias: &Alias, reason: RevealReason, lookup: F) -> Option<String>
+    /// Resolve an alias to its real identity via the caller-supplied lookup, tagging the reason. In
+    /// M1+ this is where the reveal is journaled; at M0 it centralizes the single crossing point so
+    /// nothing else touches the mapping directly.
+    ///
+    /// Generic over the unmasked payload `T` so one gate serves every crossing: a user-facing
+    /// reveal wants the real-slug `String`, routing wants the full routing target (`Route`), and the
+    /// gate need not know the difference. Keeping the payload type at the call site is what lets the
+    /// alias crate stay decoupled from `store` while still funnelling every unmask through here.
+    pub fn reveal<T, F>(&self, alias: &Alias, reason: RevealReason, lookup: F) -> Option<T>
     where
-        F: FnOnce(&Alias) -> Option<String>,
+        F: FnOnce(&Alias) -> Option<T>,
     {
         let _ = reason;
         lookup(alias)
