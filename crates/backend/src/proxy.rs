@@ -9,7 +9,7 @@
 //! this same shape (raw capture + fail-closed privacy) behind the unchanged trait.
 
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
@@ -28,7 +28,7 @@ use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
-use crate::rewrite::{parse_usage, rewrite_request};
+use crate::rewrite::{mask_json_body, mask_sse_line, parse_usage, rewrite_request};
 use crate::{AbortReason, Backend, Pick, Session, SessionEvent, SessionOutcome, UsageSnapshot};
 
 /// A ready-to-run forwarding proxy. Constructed per session by the router with the picked
@@ -61,11 +61,15 @@ impl ProxyBackend {
     }
 }
 
-/// Cumulative per-session token usage, shared between the request handlers and the session handle.
+/// Cumulative per-session usage, shared between the request handlers and the session handle.
+/// Provider-reported cost is accumulated in integer nano-dollars (float-atomic-free) and only
+/// surfaced when at least one response actually reported a cost.
 #[derive(Default)]
 struct Cumulative {
     prompt: AtomicU64,
     completion: AtomicU64,
+    cost_nano: AtomicU64,
+    has_cost: AtomicBool,
 }
 
 impl Cumulative {
@@ -74,7 +78,20 @@ impl Cumulative {
         let prompt = self.prompt.fetch_add(u.prompt_tokens, Ordering::Relaxed) + u.prompt_tokens;
         let completion =
             self.completion.fetch_add(u.completion_tokens, Ordering::Relaxed) + u.completion_tokens;
-        UsageSnapshot { prompt_tokens: prompt, completion_tokens: completion, cost_so_far: None }
+        if let Some(c) = u.cost_so_far {
+            self.cost_nano.fetch_add((c * 1e9).round() as u64, Ordering::Relaxed);
+            self.has_cost.store(true, Ordering::Relaxed);
+        }
+        UsageSnapshot { prompt_tokens: prompt, completion_tokens: completion, cost_so_far: self.cost() }
+    }
+
+    /// Cumulative provider-reported cost in dollars, or `None` if no response reported one.
+    fn cost(&self) -> Option<f64> {
+        if self.has_cost.load(Ordering::Relaxed) {
+            Some(self.cost_nano.load(Ordering::Relaxed) as f64 / 1e9)
+        } else {
+            None
+        }
     }
 
     fn totals(&self) -> (u64, u64) {
@@ -86,6 +103,7 @@ impl Cumulative {
 struct ProxyState {
     base_url: String,
     real_slug: String,
+    alias: String,
     api_key: Option<String>,
     extra_headers: Vec<(String, String)>,
     extra_body: serde_json::Map<String, Value>,
@@ -170,23 +188,53 @@ async fn proxy_handler(
 
     let status = upstream.status();
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
+    let is_sse = content_type
+        .as_ref()
+        .and_then(|c| c.to_str().ok())
+        .map(|s| s.contains("event-stream"))
+        .unwrap_or(false);
 
-    // Stream chunks straight back while accumulating the full body, then account usage from it.
+    // Stream the response back with the model masked to the alias (SSE: per-frame, preserving
+    // streaming; JSON: buffered once). We account usage from the *masked* bytes — masking only
+    // touches `model`/fingerprints, never `usage`/`cost`.
     let st2 = st.clone();
+    let alias = st.alias.clone();
     let stream = async_stream::stream! {
         let mut acc: Vec<u8> = Vec::new();
         let mut bytes_stream = upstream.bytes_stream();
-        while let Some(item) = bytes_stream.next().await {
-            match item {
-                Ok(chunk) => {
-                    acc.extend_from_slice(&chunk);
-                    yield Ok::<Bytes, std::io::Error>(chunk);
-                }
-                Err(e) => {
-                    yield Err(std::io::Error::new(std::io::ErrorKind::Other, e));
-                    break;
+        if is_sse {
+            let mut linebuf: Vec<u8> = Vec::new();
+            while let Some(item) = bytes_stream.next().await {
+                match item {
+                    Ok(chunk) => {
+                        linebuf.extend_from_slice(&chunk);
+                        while let Some(pos) = linebuf.iter().position(|&b| b == b'\n') {
+                            let raw: Vec<u8> = linebuf.drain(..=pos).collect();
+                            let text = String::from_utf8_lossy(&raw);
+                            let core = text.trim_end_matches('\n').trim_end_matches('\r');
+                            let out = format!("{}\n", mask_sse_line(core, &alias));
+                            acc.extend_from_slice(out.as_bytes());
+                            yield Ok::<Bytes, std::io::Error>(Bytes::from(out.into_bytes()));
+                        }
+                    }
+                    Err(e) => { yield Err(std::io::Error::new(std::io::ErrorKind::Other, e)); break; }
                 }
             }
+            if !linebuf.is_empty() {
+                let masked = mask_sse_line(&String::from_utf8_lossy(&linebuf), &alias);
+                acc.extend_from_slice(masked.as_bytes());
+                yield Ok(Bytes::from(masked.into_bytes()));
+            }
+        } else {
+            while let Some(item) = bytes_stream.next().await {
+                match item {
+                    Ok(chunk) => acc.extend_from_slice(&chunk),
+                    Err(e) => { yield Err(std::io::Error::new(std::io::ErrorKind::Other, e)); break; }
+                }
+            }
+            let masked = mask_json_body(&acc, &alias);
+            acc = masked.clone();
+            yield Ok(Bytes::from(masked));
         }
         if let Some(u) = extract_usage(&acc) {
             let snapshot = st2.cumulative.add(&u);
@@ -216,7 +264,7 @@ struct ProxySession {
 
 #[async_trait]
 impl Backend for ProxyBackend {
-    async fn start(&self, pick: &Pick, _alias: &str) -> Result<Box<dyn Session>> {
+    async fn start(&self, pick: &Pick, alias: &str) -> Result<Box<dyn Session>> {
         let listener = TcpListener::bind(self.bind_addr)
             .await
             .with_context(|| format!("binding proxy listener on {}", self.bind_addr))?;
@@ -227,6 +275,7 @@ impl Backend for ProxyBackend {
         let state = Arc::new(ProxyState {
             base_url: pick.base_url.trim_end_matches('/').to_string(),
             real_slug: pick.real_slug.clone(),
+            alias: alias.to_string(),
             api_key: self.api_key.clone(),
             extra_headers: self.extra_headers.clone(),
             extra_body: self.extra_body.clone(),
@@ -272,7 +321,7 @@ impl Session for ProxySession {
 
     fn usage(&self) -> UsageSnapshot {
         let (prompt_tokens, completion_tokens) = self.cumulative.totals();
-        UsageSnapshot { prompt_tokens, completion_tokens, cost_so_far: None }
+        UsageSnapshot { prompt_tokens, completion_tokens, cost_so_far: self.cumulative.cost() }
     }
 
     async fn abort(&mut self, reason: AbortReason) {
@@ -291,7 +340,7 @@ impl Session for ProxySession {
         }
         let (prompt_tokens, completion_tokens) = self.cumulative.totals();
         Ok(SessionOutcome {
-            realized_cost: None,
+            realized_cost: self.cumulative.cost(), // provider-reported when available, else None
             prompt_tokens: Some(prompt_tokens),
             completion_tokens: Some(completion_tokens),
             error_kind: None,
@@ -308,7 +357,7 @@ impl Session for ProxySession {
 mod tests {
     use super::*;
     use axum::routing::post;
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::sync::Mutex;
 
     /// End-to-end against a mock upstream: the proxy must rewrite the blind model to the real slug,
@@ -327,8 +376,9 @@ mod tests {
                     *up_state.lock().unwrap() =
                         v.get("model").and_then(Value::as_str).map(String::from);
                     axum::Json(json!({
+                        "model": "prov/model-x", "provider": "AcmeProv",
                         "choices": [{"message": {"content": "ok"}}],
-                        "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                        "usage": {"prompt_tokens": 10, "completion_tokens": 5, "cost": 0.0012}
                     }))
                 }
             }),
@@ -365,23 +415,30 @@ mod tests {
             .unwrap();
         let text = resp.text().await.unwrap();
         assert!(text.contains("ok"), "response body streamed back: {text}");
+        // Response is masked: the real slug/provider must NOT leak; the model reads as the alias.
+        let body: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["model"], "al:al", "response model masked to the alias");
+        assert!(body.get("provider").is_none(), "provider fingerprint stripped");
+        assert!(!text.contains("prov/model-x"), "real slug must not appear in the response");
 
-        // Upstream saw the real slug, never the alias — the rewrite happened.
+        // Upstream saw the real slug in the *request*, never the alias — the request rewrite happened.
         assert_eq!(captured.lock().unwrap().as_deref(), Some("prov/model-x"));
 
-        // The response's usage surfaced as a cumulative event.
+        // The response's usage + provider-reported cost surfaced as a cumulative event.
         match sess.next_event().await.unwrap() {
             SessionEvent::Usage(u) => {
                 assert_eq!(u.prompt_tokens, 10);
                 assert_eq!(u.completion_tokens, 5);
+                assert_eq!(u.cost_so_far, Some(0.0012)); // captured from usage.cost
             }
             other => panic!("expected a Usage event, got {other:?}"),
         }
 
-        // finish reports the accumulated totals; no abort → natural end.
+        // finish reports the accumulated totals + the real cost; no abort → natural end.
         let outcome = sess.finish().await.unwrap();
         assert_eq!(outcome.prompt_tokens, Some(10));
         assert_eq!(outcome.completion_tokens, Some(5));
+        assert_eq!(outcome.realized_cost, Some(0.0012));
         assert_eq!(outcome.terminated_by, None);
     }
 }
