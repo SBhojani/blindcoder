@@ -4,12 +4,35 @@
 //! columns*, never restructure. Append-only semantics are enforced by triggers in the DB itself,
 //! so a buggy caller cannot silently rewrite history.
 
+use alias::Alias;
 use anyhow::Result;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::path::Path;
 
 /// The full append-only schema, applied on open (idempotent — every statement is `IF NOT EXISTS`).
 pub const SCHEMA: &str = include_str!("schema.sql");
+
+/// A resolved routing target for an alias: everything the transport needs to forward one request.
+/// The proxy reaches this only through the reveal gate (reason: routing) — it is the single place
+/// an alias becomes a real identity.
+#[derive(Clone, Debug, PartialEq)]
+pub struct Route {
+    pub canonical_key: String,
+    pub provider_slug: String,
+    pub real_slug: String,
+    pub base_url: String,
+    pub wire: String,
+}
+
+/// The latest known price for one model at one provider. `None` fields mean free/unpriced — a
+/// zero-cost candidate in the pool.
+#[derive(Clone, Debug, PartialEq)]
+pub struct PricePoint {
+    pub canonical_key: String,
+    pub provider_slug: String,
+    pub input_per_mtok: Option<f64>,
+    pub output_per_mtok: Option<f64>,
+}
 
 /// One *effective* rating: a rating event that has not been superseded by a later correction,
 /// resolved to the model (`canonical_key`) it rated. This is the exact shape the belief-fold
@@ -116,6 +139,209 @@ impl Store {
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(rows)
     }
+
+    // --- pool seeding: providers, catalog, prices (mutable registries, not the append-only log) ---
+
+    /// Insert or refresh a provider record (routing facts only; not identity-critical, so mutable).
+    pub fn upsert_provider(&self, slug: &str, base_url: &str, wire: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO providers (slug, base_url, wire) VALUES (?1, ?2, ?3)
+             ON CONFLICT(slug) DO UPDATE SET base_url = excluded.base_url, wire = excluded.wire",
+            rusqlite::params![slug, base_url, wire],
+        )?;
+        Ok(())
+    }
+
+    /// Insert or refresh a model's provider-native slug in the catalog.
+    pub fn upsert_model(&self, canonical_key: &str, provider_slug: &str, real_slug: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO catalog (canonical_key, provider_slug, real_slug) VALUES (?1, ?2, ?3)
+             ON CONFLICT(canonical_key, provider_slug) DO UPDATE SET real_slug = excluded.real_slug",
+            rusqlite::params![canonical_key, provider_slug, real_slug],
+        )?;
+        Ok(())
+    }
+
+    /// Append a price observation, but only when it differs from the latest — the series is
+    /// append-on-change, so re-seeding an unchanged price adds no row.
+    pub fn record_price_if_changed(
+        &self,
+        canonical_key: &str,
+        provider_slug: &str,
+        input_per_mtok: Option<f64>,
+        output_per_mtok: Option<f64>,
+    ) -> Result<()> {
+        let latest: Option<(Option<f64>, Option<f64>)> = self
+            .conn
+            .query_row(
+                "SELECT input_per_mtok, output_per_mtok FROM price_history
+                 WHERE canonical_key = ?1 AND provider_slug = ?2
+                 ORDER BY observed_at DESC, rowid DESC LIMIT 1",
+                rusqlite::params![canonical_key, provider_slug],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .optional()?;
+        if latest == Some((input_per_mtok, output_per_mtok)) {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT INTO price_history (canonical_key, provider_slug, input_per_mtok, output_per_mtok)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![canonical_key, provider_slug, input_per_mtok, output_per_mtok],
+        )?;
+        Ok(())
+    }
+
+    /// The latest price per (model, provider) — the price side of the candidate pool.
+    pub fn latest_prices(&self) -> Result<Vec<PricePoint>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT p.canonical_key, p.provider_slug, p.input_per_mtok, p.output_per_mtok
+             FROM price_history p
+             JOIN (
+                 SELECT canonical_key, provider_slug, MAX(observed_at) AS mx
+                 FROM price_history GROUP BY canonical_key, provider_slug
+             ) latest
+               ON latest.canonical_key = p.canonical_key
+              AND latest.provider_slug = p.provider_slug
+              AND latest.mx = p.observed_at",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(PricePoint {
+                    canonical_key: r.get(0)?,
+                    provider_slug: r.get(1)?,
+                    input_per_mtok: r.get(2)?,
+                    output_per_mtok: r.get(3)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    // --- the blind key: alias mint/read/resolve (append-only, minted lazily) ---
+
+    /// The model-token already assigned to this `canonical_key` under *any* provider, if any. The
+    /// same model shares one model-token across providers so cross-provider matching survives
+    /// blinding (`x7k2:q4m9` vs `b3wp:q4m9`).
+    pub fn model_token_for(&self, canonical_key: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT model_token FROM aliases WHERE canonical_key = ?1 LIMIT 1",
+                [canonical_key],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The provider-token already assigned to this provider, if any (reused across its models).
+    pub fn provider_token_for(&self, provider_slug: &str) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT provider_token FROM aliases WHERE provider_slug = ?1 LIMIT 1",
+                [provider_slug],
+                |r| r.get(0),
+            )
+            .optional()?)
+    }
+
+    /// The alias already minted for this (model, provider), if any.
+    pub fn alias_for(&self, canonical_key: &str, provider_slug: &str) -> Result<Option<Alias>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT provider_token, model_token FROM aliases
+                 WHERE canonical_key = ?1 AND provider_slug = ?2",
+                rusqlite::params![canonical_key, provider_slug],
+                |r| Ok(Alias { provider_token: r.get(0)?, model_token: r.get(1)? }),
+            )
+            .optional()?)
+    }
+
+    /// Persist a freshly minted alias (immutable once written).
+    pub fn insert_alias(&self, alias: &Alias, canonical_key: &str, provider_slug: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO aliases (alias, provider_token, model_token, canonical_key, provider_slug)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                alias.display(),
+                alias.provider_token,
+                alias.model_token,
+                canonical_key,
+                provider_slug
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Resolve an alias display string to its real routing target — the reveal-gated crossing from
+    /// blind identity to real slug + provider endpoint.
+    pub fn resolve_route(&self, alias_display: &str) -> Result<Option<Route>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT a.canonical_key, a.provider_slug, c.real_slug, p.base_url, p.wire
+                 FROM aliases a
+                 JOIN catalog   c ON c.canonical_key = a.canonical_key AND c.provider_slug = a.provider_slug
+                 JOIN providers p ON p.slug = a.provider_slug
+                 WHERE a.alias = ?1",
+                [alias_display],
+                |r| {
+                    Ok(Route {
+                        canonical_key: r.get(0)?,
+                        provider_slug: r.get(1)?,
+                        real_slug: r.get(2)?,
+                        base_url: r.get(3)?,
+                        wire: r.get(4)?,
+                    })
+                },
+            )
+            .optional()?)
+    }
+
+    // --- session lifecycle events ---
+
+    /// Open a session row; returns its id. Start facts are immutable (append-only table).
+    pub fn record_session_start(
+        &self,
+        alias_display: &str,
+        cli: Option<&str>,
+        tuneables_json: Option<&str>,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO sessions (alias, cli, tuneables_json) VALUES (?1, ?2, ?3)",
+            rusqlite::params![alias_display, cli, tuneables_json],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Record the terminal metadata event for a session (one per session, append-only).
+    /// `terminated_by` mirrors the backend-crate `AbortReason::as_str()` (`None` = natural end).
+    pub fn record_session_end(
+        &self,
+        session_id: i64,
+        realized_cost: Option<f64>,
+        prompt_tokens: Option<i64>,
+        completion_tokens: Option<i64>,
+        error_kind: Option<&str>,
+        terminated_by: Option<&str>,
+    ) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO session_end
+                 (session_id, realized_cost, prompt_tokens, completion_tokens, error_kind, terminated_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                session_id,
+                realized_cost,
+                prompt_tokens,
+                completion_tokens,
+                error_kind,
+                terminated_by
+            ],
+        )?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -213,6 +439,67 @@ mod tests {
         assert_eq!(eff.len(), 2);
         let keys: Vec<&str> = eff.iter().map(|r| r.canonical_key.as_str()).collect();
         assert!(keys.contains(&"acme/model-x") && keys.contains(&"acme/model-y"));
+    }
+
+    #[test]
+    fn seed_resolve_route_round_trips() {
+        let s = Store::open_in_memory().unwrap();
+        s.upsert_provider("groq", "https://api.groq.com/openai/v1", "openai").unwrap();
+        s.upsert_model("kimi-k2", "groq", "moonshotai/kimi-k2-instruct").unwrap();
+        let a = Alias { provider_token: "gr0q".into(), model_token: "k2tk".into() };
+        s.insert_alias(&a, "kimi-k2", "groq").unwrap();
+
+        let route = s.resolve_route(&a.display()).unwrap().expect("route resolves");
+        assert_eq!(route.real_slug, "moonshotai/kimi-k2-instruct");
+        assert_eq!(route.base_url, "https://api.groq.com/openai/v1");
+        assert_eq!(route.canonical_key, "kimi-k2");
+        assert!(s.resolve_route("nope:nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn model_token_is_shared_across_providers() {
+        // The same canonical_key under two providers must reuse one model-token so the blinded
+        // aliases still reveal they are the same model.
+        let s = Store::open_in_memory().unwrap();
+        assert!(s.model_token_for("kimi-k2").unwrap().is_none());
+        let a = Alias { provider_token: "gr0q".into(), model_token: "k2tk".into() };
+        s.insert_alias(&a, "kimi-k2", "groq").unwrap();
+        assert_eq!(s.model_token_for("kimi-k2").unwrap().as_deref(), Some("k2tk"));
+        assert_eq!(s.provider_token_for("groq").unwrap().as_deref(), Some("gr0q"));
+    }
+
+    #[test]
+    fn prices_append_on_change_only() {
+        let s = Store::open_in_memory().unwrap();
+        s.record_price_if_changed("kimi-k2", "or", Some(0.55), Some(2.2)).unwrap();
+        s.record_price_if_changed("kimi-k2", "or", Some(0.55), Some(2.2)).unwrap(); // unchanged → no-op
+        let n: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM price_history", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(n, 1, "unchanged re-seed must not append");
+
+        let latest = s.latest_prices().unwrap();
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].input_per_mtok, Some(0.55));
+    }
+
+    #[test]
+    fn session_lifecycle_records_start_and_terminated_end() {
+        let s = Store::open_in_memory().unwrap();
+        let sid = s.record_session_start("x7k2:q4m9", Some("opencode"), None).unwrap();
+        s.record_session_end(sid, Some(0.0), Some(1200), Some(340), None, Some("cost_cap"))
+            .unwrap();
+        let (cost, term): (Option<f64>, Option<String>) = s
+            .conn
+            .query_row(
+                "SELECT realized_cost, terminated_by FROM session_end WHERE session_id = ?1",
+                [sid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cost, Some(0.0));
+        assert_eq!(term.as_deref(), Some("cost_cap"));
     }
 
     #[test]

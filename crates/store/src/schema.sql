@@ -75,7 +75,11 @@ CREATE TABLE IF NOT EXISTS session_end (
   realized_cost     REAL,
   prompt_tokens     INTEGER,
   completion_tokens INTEGER,
-  error_kind        TEXT
+  error_kind        TEXT,
+  -- How the session was stopped early ('cost_cap' | 'user'), NULL for natural completion. A
+  -- deliberate policy stop is distinct from `error_kind` (a backend failure), so the selector can
+  -- tell "we halted it" apart from "it broke". Mirrors the backend-crate `AbortReason`.
+  terminated_by     TEXT
 );
 
 -- Ratings as append-only events; the track record is a fold over these. Corrections supersede.

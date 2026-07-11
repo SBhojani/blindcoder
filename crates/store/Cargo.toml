@@ -8,3 +8,4 @@ description = "blindcoder store: append-only, event-sourced SQLite (the full M0 
 [dependencies]
 anyhow = "1"
 rusqlite = { version = "0.31", features = ["bundled"] }
+alias = { path = "../alias" }
