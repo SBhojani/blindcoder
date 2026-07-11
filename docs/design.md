@@ -182,6 +182,10 @@ model↔rating↔cost↔time signal the selector needs — **no prompts or code*
 supersede (a new row), never edit; database triggers enforce append-only. Raw wire archives, if
 ever enabled, are disposable files outside the database, referenced only by convention.
 
+The schema evolves through **versioned migrations** (`rusqlite_migration`, tracked by SQLite's
+`PRAGMA user_version`): a frozen baseline plus append-only `M::up` steps, applied atomically on
+open so a database holding real ratings upgrades **in place** rather than being dropped.
+
 ## Privacy
 
 Route only to endpoints that do not retain or train on your prompts, and make that structural:
