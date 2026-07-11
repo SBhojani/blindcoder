@@ -10,8 +10,10 @@ use anyhow::{Context, Result};
 use clap::Args;
 use rand::Rng;
 use std::collections::HashMap;
+use std::net::SocketAddr;
 
 use alias::{mint_token, Alias, RevealGate, RevealReason, TOKEN_LEN};
+use backend::{AbortReason, Backend, Pick, ProxyBackend, SessionEvent};
 use config::{Config, CostBasis, ModelConfig};
 use selector::{
     fold_track_record, normalize_prices, pick, prune_dominated, Candidate, Rating, TrackRecord,
@@ -24,10 +26,13 @@ use store::Store;
 /// entry of the same `canonical_key` (cross-provider), but keeps its own price.
 struct PoolEntry {
     canonical_key: String,
-    #[allow(dead_code)] // carried for diagnostics / the forthcoming transport; not read in M0
     provider_slug: String,
     alias: Alias,
     raw_price: f64,
+    /// Split shelf prices for this model at this provider (per Mtok); `None` = free. Used to
+    /// estimate realized cost and to drive the mid-session cost cap.
+    input_per_mtok: Option<f64>,
+    output_per_mtok: Option<f64>,
 }
 
 /// Open the authoritative DB at `$XDG_DATA_HOME/blindcoder/blindcoder.db`.
@@ -117,6 +122,8 @@ fn build_pool(store: &Store, cfg: &Config) -> Result<(Vec<Candidate>, Vec<PoolEn
                 provider_slug: p.slug.clone(),
                 alias,
                 raw_price: blended_price(m, &cfg.cost_basis),
+                input_per_mtok: m.input_per_mtok,
+                output_per_mtok: m.output_per_mtok,
             });
         }
     }
@@ -144,7 +151,8 @@ fn choose<R: Rng + ?Sized>(cands: &[Candidate], t: &Tuneables, rng: &mut R) -> u
     active[pick(&sub, t, rng)]
 }
 
-/// `blindcoder run`: pick a blinded model and record the session. Forwarding is the next milestone.
+/// `blindcoder run`: pick a blinded model, stand up the forwarding proxy, drive the session (cost
+/// cap + Ctrl-C), and record it. Point your OpenAI-compatible CLI at the printed endpoint.
 pub fn run(cfg: &Config) -> Result<()> {
     let store = open_store()?;
     let mut rng = rand::thread_rng();
@@ -161,25 +169,150 @@ pub fn run(cfg: &Config) -> Result<()> {
     let entry = &entries[idx];
     let alias_display = entry.alias.display();
 
-    let sid = store.record_session_start(&alias_display, Some("opencode"), None)?;
+    let provider = cfg
+        .providers
+        .iter()
+        .find(|p| p.slug == entry.provider_slug)
+        .context("picked provider is missing from config")?;
 
     // The one place blind→real happens: routing needs the real routing target. The lookup runs
     // inside the reveal gate (the single audited crossing point) and is journaled, so the crossing
     // stays auditable and the real identity never leaks to stdout.
+    let sid = store.record_session_start(&alias_display, Some("proxy"), None)?;
     let route = RevealGate
         .reveal(&entry.alias, RevealReason::Routing, |a| {
             store.resolve_route(&a.display()).ok().flatten()
         })
         .context("route must resolve for the picked alias")?;
     store.record_reveal(&alias_display, Some(sid), "routing")?;
-    let _ = &route; // consumed by the transport in the next milestone; resolved here to prove wiring
 
-    println!("blindcoder: picked {alias_display} (blind) from a pool of {}", entries.len());
-    println!("  session #{sid} recorded.");
-    println!("  the forwarding transport lands next — no request was proxied this run.");
+    // Resolve the provider's credentials + passthrough hooks (all data, no provider branch).
+    let api_key = match &provider.key_env {
+        Some(var) => Some(
+            std::env::var(var)
+                .with_context(|| format!("API key env var {var} is not set for provider {}", provider.slug))?,
+        ),
+        None => None,
+    };
+    let extra_headers: Vec<(String, String)> =
+        provider.extra_headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let mut extra_body = serde_json::Map::new();
+    for (k, v) in &provider.extra_body {
+        if let Ok(jv) = serde_json::to_value(v) {
+            extra_body.insert(k.clone(), jv);
+        }
+    }
 
-    store.record_session_end(sid, None, None, None, Some("transport_unimplemented"), None)?;
+    let bind_addr: SocketAddr = cfg
+        .proxy_addr
+        .parse()
+        .with_context(|| format!("invalid proxy_addr {:?} in config", cfg.proxy_addr))?;
+    let in_price = entry.input_per_mtok.unwrap_or(0.0);
+    let out_price = entry.output_per_mtok.unwrap_or(0.0);
+    let cap = cfg.max_session_cost_usd;
+
+    let backend = ProxyBackend::new(bind_addr, api_key, extra_headers, extra_body)?;
+    let pick = Pick {
+        canonical_key: route.canonical_key,
+        real_slug: route.real_slug,
+        base_url: route.base_url,
+    };
+
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("building the async runtime")?;
+    let outcome = runtime.block_on(drive_session(
+        &backend, &pick, &alias_display, entries.len(), cap, in_price, out_price,
+    ))?;
+
+    // Record the terminal event: realized cost from the final token totals, and how it ended.
+    let prompt_tokens = outcome.prompt_tokens.unwrap_or(0);
+    let completion_tokens = outcome.completion_tokens.unwrap_or(0);
+    let realized_cost = cost_usd(prompt_tokens, completion_tokens, in_price, out_price);
+    store.record_session_end(
+        sid,
+        Some(realized_cost),
+        Some(prompt_tokens as i64),
+        Some(completion_tokens as i64),
+        None,
+        outcome.terminated_by.map(|r| r.as_str()),
+    )?;
+
+    let ended = match outcome.terminated_by {
+        Some(AbortReason::CostCap) => "stopped at the cost cap",
+        Some(AbortReason::User) => "stopped by you",
+        None => "ended",
+    };
+    println!(
+        "\nsession #{sid} {ended}: {prompt_tokens} in + {completion_tokens} out tokens, est ${realized_cost:.4}."
+    );
+    println!("  rate it:  blindcoder rate --session {sid} --performance <-2..2> --difficulty <0..4>");
     Ok(())
+}
+
+/// Estimate USD cost from token counts and per-Mtok shelf prices.
+fn cost_usd(prompt_tokens: u64, completion_tokens: u64, in_price: f64, out_price: f64) -> f64 {
+    (prompt_tokens as f64 / 1_000_000.0) * in_price
+        + (completion_tokens as f64 / 1_000_000.0) * out_price
+}
+
+/// Stand up the proxy, print how to point a CLI at it, then run the driver loop until the session
+/// ends naturally, the cost cap fires, or the user hits Ctrl-C. Returns the terminal outcome.
+async fn drive_session(
+    backend: &ProxyBackend,
+    pick: &Pick,
+    alias_display: &str,
+    pool_size: usize,
+    cap: f64,
+    in_price: f64,
+    out_price: f64,
+) -> Result<backend::SessionOutcome> {
+    let mut sess = backend.start(pick, alias_display).await?;
+    let endpoint = sess
+        .endpoint()
+        .map(|a| a.to_string())
+        .unwrap_or_else(|| "the configured proxy_addr".to_string());
+
+    println!("blindcoder: routing a blinded session (picked from a pool of {pool_size}).");
+    println!("  point your OpenAI-compatible CLI at:  http://{endpoint}/v1");
+    println!("  model to request:  {alias_display}   (any value works; the proxy rewrites it)");
+    if cap > 0.0 {
+        println!("  cost cap:  ${cap:.2} (session is halted if the estimate reaches it)");
+    }
+    println!("  press Ctrl-C to end the session and record it.");
+
+    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+    let mut aborting = false;
+    loop {
+        let mut abort_reason = None;
+        tokio::select! {
+            event = sess.next_event() => match event? {
+                SessionEvent::Usage(u) => {
+                    if !aborting && cap > 0.0 {
+                        let spent = cost_usd(u.prompt_tokens, u.completion_tokens, in_price, out_price);
+                        if spent >= cap {
+                            abort_reason = Some(AbortReason::CostCap);
+                        }
+                    }
+                }
+                SessionEvent::Ended => break,
+            },
+            _ = &mut ctrl_c, if !aborting => {
+                abort_reason = Some(AbortReason::User);
+            }
+        }
+        if let Some(reason) = abort_reason {
+            aborting = true;
+            match reason {
+                AbortReason::CostCap => eprintln!("cost cap ${cap:.2} reached — stopping session."),
+                AbortReason::User => eprintln!("\nstopping session…"),
+            }
+            sess.abort(reason).await;
+        }
+    }
+
+    sess.finish().await
 }
 
 /// `blindcoder rate`: append a performance/difficulty rating for a past session (difficulty is

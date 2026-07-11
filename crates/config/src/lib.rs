@@ -95,6 +95,8 @@ pub struct Config {
     /// Freshness bound (days) on hand-maintained ZDR/data-policy entries; past this a curated
     /// entry is treated as stale and its models are excluded (fail-closed).
     pub curated_policy_max_age_days: f64,
+    /// Local address the `run` proxy listens on; point your agentic CLI at `http://<this>/v1`.
+    pub proxy_addr: String,
     // --- backends ---
     pub providers: Vec<ProviderConfig>,
 }
@@ -114,6 +116,7 @@ impl Default for Config {
             price_refresh_interval_hours: 24.0,
             max_session_cost_usd: 5.0,
             curated_policy_max_age_days: 90.0,
+            proxy_addr: "127.0.0.1:8787".to_string(),
             providers: Vec::new(),
         }
     }
