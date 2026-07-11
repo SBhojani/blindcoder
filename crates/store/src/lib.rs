@@ -364,10 +364,12 @@ impl Store {
 
     /// Record the terminal metadata event for a session (one per session, append-only).
     /// `terminated_by` mirrors the backend-crate `AbortReason::as_str()` (`None` = natural end).
+    #[allow(clippy::too_many_arguments)]
     pub fn record_session_end(
         &self,
         session_id: i64,
         realized_cost: Option<f64>,
+        cost_source: Option<&str>,
         prompt_tokens: Option<i64>,
         completion_tokens: Option<i64>,
         error_kind: Option<&str>,
@@ -375,11 +377,12 @@ impl Store {
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO session_end
-                 (session_id, realized_cost, prompt_tokens, completion_tokens, error_kind, terminated_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                 (session_id, realized_cost, cost_source, prompt_tokens, completion_tokens, error_kind, terminated_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
             rusqlite::params![
                 session_id,
                 realized_cost,
+                cost_source,
                 prompt_tokens,
                 completion_tokens,
                 error_kind,
@@ -534,17 +537,18 @@ mod tests {
     fn session_lifecycle_records_start_and_terminated_end() {
         let s = Store::open_in_memory().unwrap();
         let sid = s.record_session_start("x7k2:q4m9", Some("opencode"), None).unwrap();
-        s.record_session_end(sid, Some(0.0), Some(1200), Some(340), None, Some("cost_cap"))
+        s.record_session_end(sid, Some(0.0), Some("provider"), Some(1200), Some(340), None, Some("cost_cap"))
             .unwrap();
-        let (cost, term): (Option<f64>, Option<String>) = s
+        let (cost, src, term): (Option<f64>, Option<String>, Option<String>) = s
             .conn
             .query_row(
-                "SELECT realized_cost, terminated_by FROM session_end WHERE session_id = ?1",
+                "SELECT realized_cost, cost_source, terminated_by FROM session_end WHERE session_id = ?1",
                 [sid],
-                |r| Ok((r.get(0)?, r.get(1)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
             )
             .unwrap();
         assert_eq!(cost, Some(0.0));
+        assert_eq!(src.as_deref(), Some("provider"));
         assert_eq!(term.as_deref(), Some("cost_cap"));
     }
 

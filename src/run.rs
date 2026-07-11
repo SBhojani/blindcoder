@@ -247,13 +247,18 @@ pub fn run(cfg: &Config) -> Result<()> {
         &backend, &pick, &alias_display, entries.len(), cap, in_price, out_price,
     ))?;
 
-    // Record the terminal event: realized cost from the final token totals, and how it ended.
+    // Record the terminal event: how it ended, and the realized cost — the provider-reported figure
+    // when the transport captured one (authoritative), otherwise our tokens × shelf-price estimate.
     let prompt_tokens = outcome.prompt_tokens.unwrap_or(0);
     let completion_tokens = outcome.completion_tokens.unwrap_or(0);
-    let realized_cost = cost_usd(prompt_tokens, completion_tokens, in_price, out_price);
+    let (realized_cost, cost_source) = match outcome.realized_cost {
+        Some(c) => (c, "provider"),
+        None => (cost_usd(prompt_tokens, completion_tokens, in_price, out_price), "estimate"),
+    };
     store.record_session_end(
         sid,
         Some(realized_cost),
+        Some(cost_source),
         Some(prompt_tokens as i64),
         Some(completion_tokens as i64),
         None,
@@ -266,7 +271,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         None => "ended",
     };
     println!(
-        "\nsession #{sid} {ended}: {prompt_tokens} in + {completion_tokens} out tokens, est ${realized_cost:.4}."
+        "\nsession #{sid} {ended}: {prompt_tokens} in + {completion_tokens} out tokens, ${realized_cost:.4} ({cost_source})."
     );
     println!("  rate it:  blindcoder rate --session {sid} --performance <-2..2> --difficulty <0..4>");
     Ok(())
@@ -311,7 +316,10 @@ async fn drive_session(
             event = sess.next_event() => match event? {
                 SessionEvent::Usage(u) => {
                     if !aborting && cap > 0.0 {
-                        let spent = cost_usd(u.prompt_tokens, u.completion_tokens, in_price, out_price);
+                        // Provider-reported cost when the transport captured one; else estimate.
+                        let spent = u
+                            .cost_so_far
+                            .unwrap_or_else(|| cost_usd(u.prompt_tokens, u.completion_tokens, in_price, out_price));
                         if spent >= cap {
                             abort_reason = Some(AbortReason::CostCap);
                         }

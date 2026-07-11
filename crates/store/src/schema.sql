@@ -73,6 +73,11 @@ CREATE TABLE IF NOT EXISTS session_end (
   session_id        INTEGER PRIMARY KEY REFERENCES sessions(id),
   ended_at          TEXT NOT NULL DEFAULT (datetime('now')),
   realized_cost     REAL,
+  -- Where realized_cost came from: 'provider' (authoritative, reported inline by the gateway) or
+  -- 'estimate' (our tokens x shelf-price fallback). The number means different things by origin, so
+  -- the selector/analysis must know which. SQLite has no ENUM type; a CHECK constraint enforces the
+  -- set (NULL allowed for a session with no recorded cost).
+  cost_source       TEXT CHECK (cost_source IS NULL OR cost_source IN ('provider','estimate')),
   prompt_tokens     INTEGER,
   completion_tokens INTEGER,
   error_kind        TEXT,
