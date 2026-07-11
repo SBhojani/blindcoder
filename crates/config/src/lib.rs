@@ -30,7 +30,7 @@ impl Default for CostBasis {
 /// One model offered by a provider. `canonical_key` is the provider-neutral identity the selector
 /// learns on (so the same model under two providers shares a track record); `real_slug` is what the
 /// provider's API actually expects in the request `model` field. Prices are optional — a free
-/// provider (e.g. Groq's free tier) simply omits them and competes as a zero-cost candidate.
+/// provider simply omits them and competes as a zero-cost candidate.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct ModelConfig {
     pub canonical_key: String,
@@ -45,10 +45,10 @@ pub struct ModelConfig {
 /// real key need never sit in the file.
 ///
 /// The two passthrough hooks are what keep the proxy provider-blind: `extra_headers` and
-/// `extra_body` are forwarded verbatim, so provider-specific knobs (OpenRouter's `HTTP-Referer`/
-/// `X-Title`, a ZDR/data-policy body flag, provider-routing preferences) live in config as data
-/// instead of as branches in code. Groq needs neither; OpenRouter uses them for attribution and
-/// privacy. Anything else OpenAI-wire slots in the same way.
+/// `extra_body` are forwarded verbatim, so provider-specific knobs (attribution headers, a
+/// ZDR/data-policy body flag, provider-routing preferences) live in config as data instead of as
+/// branches in code. A bare provider needs neither; a gateway provider uses them for attribution
+/// and privacy. Anything OpenAI-wire slots in the same way.
 #[derive(Clone, Debug, Serialize, Deserialize, Default)]
 pub struct ProviderConfig {
     pub slug: String,
@@ -212,45 +212,46 @@ mod tests {
     }
 
     #[test]
-    fn parses_a_mixed_groq_openrouter_pool() {
-        // Groq: free (no prices), no passthrough. OpenRouter: priced, with attribution + a body flag.
+    fn parses_a_mixed_free_and_priced_pool() {
+        // free-prov: free (no prices), no passthrough. paid-prov: priced, with an attribution
+        // header + a provider-routing body flag. Both offer the same model under different slugs.
         let toml_src = r#"
 [[providers]]
-slug = "groq"
-base_url = "https://api.groq.com/openai/v1"
-key_env = "GROQ_API_KEY"
+slug = "free-prov"
+base_url = "http://free.test/v1"
+key_env = "FREE_PROV_KEY"
 
 [[providers.models]]
-canonical_key = "kimi-k2"
-real_slug = "moonshotai/kimi-k2-instruct"
+canonical_key = "model-x"
+real_slug = "free-prov/model-x"
 
 [[providers]]
-slug = "openrouter"
-base_url = "https://openrouter.ai/api/v1"
-key_env = "OPENROUTER_API_KEY"
+slug = "paid-prov"
+base_url = "http://paid.test/v1"
+key_env = "PAID_PROV_KEY"
 extra_headers = { "X-Title" = "blindcoder" }
 extra_body = { "provider" = { "require_parameters" = true } }
 
 [[providers.models]]
-canonical_key = "kimi-k2"
-real_slug = "moonshotai/kimi-k2"
+canonical_key = "model-x"
+real_slug = "paid-prov/model-x"
 input_per_mtok = 0.55
 output_per_mtok = 2.2
 "#;
         let c: Config = toml::from_str(toml_src).unwrap();
         assert_eq!(c.providers.len(), 2);
 
-        let groq = &c.providers[0];
-        assert_eq!(groq.wire, "openai"); // defaulted
-        assert!(groq.extra_headers.is_empty() && groq.extra_body.is_empty());
-        assert_eq!(groq.models[0].real_slug, "moonshotai/kimi-k2-instruct");
-        assert!(groq.models[0].input_per_mtok.is_none()); // free
+        let free = &c.providers[0];
+        assert_eq!(free.wire, "openai"); // defaulted
+        assert!(free.extra_headers.is_empty() && free.extra_body.is_empty());
+        assert_eq!(free.models[0].real_slug, "free-prov/model-x");
+        assert!(free.models[0].input_per_mtok.is_none()); // free
 
-        let or = &c.providers[1];
-        assert_eq!(or.extra_headers.get("X-Title").map(String::as_str), Some("blindcoder"));
-        assert!(or.extra_body.contains_key("provider"));
+        let paid = &c.providers[1];
+        assert_eq!(paid.extra_headers.get("X-Title").map(String::as_str), Some("blindcoder"));
+        assert!(paid.extra_body.contains_key("provider"));
         // Same canonical_key under both providers — the cross-provider identity the selector shares.
-        assert_eq!(or.models[0].canonical_key, groq.models[0].canonical_key);
-        assert_eq!(or.models[0].output_per_mtok, Some(2.2));
+        assert_eq!(paid.models[0].canonical_key, free.models[0].canonical_key);
+        assert_eq!(paid.models[0].output_per_mtok, Some(2.2));
     }
 }
