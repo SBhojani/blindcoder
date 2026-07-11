@@ -14,7 +14,10 @@
 use anyhow::Result;
 use async_trait::async_trait;
 
+pub mod proxy;
 pub mod rewrite;
+
+pub use proxy::ProxyBackend;
 
 /// The chosen candidate for a session. The real slug is present here because the transport needs
 /// it to route; it reaches this struct only via the alias reveal gate (reason: routing).
@@ -94,33 +97,22 @@ pub trait Session: Send {
 
     /// Wait for teardown to complete and return the terminal metadata.
     async fn finish(self: Box<Self>) -> Result<SessionOutcome>;
+
+    /// The local address the transport is serving on, if it runs a proxy the CLI points at.
+    /// `None` for transports with no listener (e.g. test fakes). Default `None`.
+    fn endpoint(&self) -> Option<std::net::SocketAddr> {
+        None
+    }
 }
 
 /// A session's transport.
 ///
-/// M0: a trivial rewrite-only proxy. M1+: the same impl flowered into a full tee + fail-closed
-/// `VettedEndpoint` privacy proxy emitting `Usage` ticks. The signature is stable across all.
+/// M0: the streaming forwarding proxy in [`mod@proxy`]. M1+: the same impl flowered into a full tee
+/// + fail-closed `VettedEndpoint` privacy proxy. The signature is stable across all.
 #[async_trait]
 pub trait Backend {
     /// Begin a session; returns with a live handle while the transport runs underneath.
     async fn start(&self, pick: &Pick, alias: &str) -> Result<Box<dyn Session>>;
-}
-
-/// The M0 placeholder. The real trivial model-rewrite proxy is filled in as the `run`
-/// subcommand is built out; `simulate` (the M0 go/no-go) needs no transport at all.
-///
-/// Honest limitation, by design: this transport surfaces no streaming usage, so it will never
-/// emit `Usage` and the cost cap cannot fire mid-session on it. Cap enforcement is a property
-/// of *streaming* transports, which arrives with M1's tee — behind this same trait.
-pub struct ProxyBackend;
-
-#[async_trait]
-impl Backend for ProxyBackend {
-    async fn start(&self, _pick: &Pick, _alias: &str) -> Result<Box<dyn Session>> {
-        anyhow::bail!(
-            "ProxyBackend::start is not implemented in M0 — the M0 deliverable is `simulate`"
-        )
-    }
 }
 
 #[cfg(test)]
@@ -269,25 +261,5 @@ mod tests {
         assert_eq!(sess.next_event().await.unwrap(), SessionEvent::Ended);
         let outcome = Box::new(sess).finish().await.unwrap();
         assert_eq!(outcome.terminated_by, Some(AbortReason::User));
-    }
-
-    /// The M0 placeholder refuses to start, telling the truth about what M0 ships.
-    #[tokio::test]
-    async fn proxy_backend_is_degenerate_in_m0() {
-        let res = ProxyBackend
-            .start(
-                &Pick {
-                    canonical_key: "k".into(),
-                    real_slug: "s".into(),
-                    base_url: "http://localhost".into(),
-                },
-                "alias",
-            )
-            .await;
-        let err = match res {
-            Ok(_) => panic!("expected M0 ProxyBackend::start to fail"),
-            Err(e) => e,
-        };
-        assert!(err.to_string().contains("not implemented in M0"));
     }
 }
