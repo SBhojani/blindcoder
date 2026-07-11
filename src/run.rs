@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 
 use alias::{mint_token, Alias, RevealGate, RevealReason, TOKEN_LEN};
 use backend::{AbortReason, Backend, Pick, ProxyBackend, SessionEvent};
-use config::{Config, CostBasis, ModelConfig};
+use config::{Config, CostBasis, ModelConfig, ProviderConfig};
 use selector::{
     fold_track_record, normalize_prices, pick, prune_dominated, Candidate, Rating, TrackRecord,
     Tuneables,
@@ -40,6 +40,33 @@ fn open_store() -> Result<Store> {
     let dir = config::default_data_dir()
         .context("cannot determine data dir (set XDG_DATA_HOME or HOME)")?;
     Store::open(&dir.join("blindcoder.db"))
+}
+
+/// Resolve a provider's API key. The env var named by `key_env` wins when set and non-empty
+/// (consistent with `flag > env > file`); otherwise the inlined `api_key` is used. If auth is
+/// configured (either field present) but nothing resolves, that is a misconfiguration and errors;
+/// a provider with neither field is treated as keyless (no `Authorization` header).
+fn resolve_api_key(p: &ProviderConfig) -> Result<Option<String>> {
+    if let Some(var) = &p.key_env {
+        if let Ok(v) = std::env::var(var) {
+            if !v.trim().is_empty() {
+                return Ok(Some(v));
+            }
+        }
+    }
+    if let Some(k) = &p.api_key {
+        if !k.trim().is_empty() {
+            return Ok(Some(k.clone()));
+        }
+    }
+    if p.key_env.is_some() || p.api_key.is_some() {
+        anyhow::bail!(
+            "provider {}: no API key resolved — set the {} env var or inline api_key in config",
+            p.slug,
+            p.key_env.as_deref().unwrap_or("(unnamed)")
+        );
+    }
+    Ok(None)
 }
 
 /// Blend input/output shelf prices into one number per the config cost basis. A model with no
@@ -187,13 +214,7 @@ pub fn run(cfg: &Config) -> Result<()> {
     store.record_reveal(&alias_display, Some(sid), "routing")?;
 
     // Resolve the provider's credentials + passthrough hooks (all data, no provider branch).
-    let api_key = match &provider.key_env {
-        Some(var) => Some(
-            std::env::var(var)
-                .with_context(|| format!("API key env var {var} is not set for provider {}", provider.slug))?,
-        ),
-        None => None,
-    };
+    let api_key = resolve_api_key(provider)?;
     let extra_headers: Vec<(String, String)> =
         provider.extra_headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
     let mut extra_body = serde_json::Map::new();
@@ -382,6 +403,33 @@ mod tests {
             ..Default::default()
         };
         Config { providers: vec![free, paid], ..Default::default() }
+    }
+
+    #[test]
+    fn api_key_env_wins_then_falls_back_to_inline() {
+        let var = "BLINDCODER_TEST_KEY_PRECEDENCE";
+        let mut p = ProviderConfig {
+            slug: "prov".into(),
+            key_env: Some(var.into()),
+            api_key: Some("inline-key".into()),
+            ..Default::default()
+        };
+        // Env unset → inline is used.
+        std::env::remove_var(var);
+        assert_eq!(resolve_api_key(&p).unwrap().as_deref(), Some("inline-key"));
+        // Env set and non-empty → env wins.
+        std::env::set_var(var, "env-key");
+        assert_eq!(resolve_api_key(&p).unwrap().as_deref(), Some("env-key"));
+        // Empty env is ignored → inline again.
+        std::env::set_var(var, "   ");
+        assert_eq!(resolve_api_key(&p).unwrap().as_deref(), Some("inline-key"));
+        std::env::remove_var(var);
+        // Auth configured but nothing resolves → error.
+        p.api_key = None;
+        assert!(resolve_api_key(&p).is_err());
+        // Neither field → keyless (no auth header), not an error.
+        p.key_env = None;
+        assert!(resolve_api_key(&p).unwrap().is_none());
     }
 
     #[test]

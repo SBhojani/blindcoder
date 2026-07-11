@@ -56,9 +56,14 @@ max_session_cost_usd = 5.0
 curated_policy_max_age_days = 90
 
 # --- providers ------------------------------------------------------------------------------
-# Declare each backend and the models it offers. Put the real API key in the environment
-# variable named by `key_env` (never inline it here in a file you might share). Any
-# OpenAI-compatible /chat/completions endpoint works — blindcoder never branches on which
+# Declare each backend and the models it offers. Provide the API key one of two ways:
+#   * key_env = "GROQ_API_KEY"  — name an env var holding the key (preferred; keep secrets out of
+#                                 files you might share).
+#   * api_key = "sk-..."        — inline the key directly (convenience for a private, un-shared
+#                                 config). If both are given, the env var WINS when it is set and
+#                                 non-empty (precedence: flag > env > file), so a shell export can
+#                                 still override the inline value for a one-off.
+# Any OpenAI-compatible /chat/completions endpoint works — blindcoder never branches on which
 # provider it is; everything provider-specific below is data, not code.
 #
 # Two knobs keep it provider-blind:

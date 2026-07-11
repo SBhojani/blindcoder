@@ -57,6 +57,12 @@ pub struct ProviderConfig {
     pub wire: String,
     #[serde(default)]
     pub key_env: Option<String>,
+    /// API key inlined directly (convenience for a private, un-shared config). The env var named
+    /// by `key_env` takes precedence when it is set and non-empty — consistent with the tool's
+    /// `flag > env > file` precedence — so this is the fallback, and a shell export can still
+    /// override it for a one-off. Prefer `key_env` for anything you might share.
+    #[serde(default)]
+    pub api_key: Option<String>,
     /// Extra HTTP headers sent on every request to this provider.
     #[serde(default)]
     pub extra_headers: BTreeMap<String, String>,
