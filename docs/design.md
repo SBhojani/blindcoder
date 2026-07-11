@@ -48,7 +48,10 @@ value_score = quality_guess − cost_sensitivity × normalized_price
 ```
 
 - **Price is the shelf rate, normalized pool-relative** (the priciest eligible candidate ≈ 1.0),
-  so `cost_sensitivity` means the same thing regardless of absolute prices.
+  so `cost_sensitivity` means the same thing regardless of absolute prices. This matters because
+  catalog rates span roughly four orders of magnitude and are heavily right-skewed (a cheap bulk
+  with a long expensive tail), so an absolute price penalty would behave wildly differently on a
+  cheap pool versus a pricey one; pool-relative normalization keeps the knob meaningful.
 - **Ratings are two questions:** how well it did (`-2..+2`) and how hard the task was (`0..4`).
   They combine as `performance + difficulty_credit × difficulty` **for successful performance
   only** (a negative `performance` earns no difficulty credit), so handling a hard task well can
