@@ -129,21 +129,22 @@ and the bill matched whichever one served that call, to the cent.) You *can* pin
 price routes to the cheapest eligible provider deterministically — but even that can drift as
 providers come and go. The estimate is fine for the cap and the cost-tilt (relative ordering is what
 the selector needs); for the **authoritative** figure, gateways typically return the real per-request
-cost inline in the response (a `cost` field alongside token usage), so the accurate path is to record
-that reported cost into `realized_cost`, falling back to the estimate only when none is returned.
-That is where the accounting is headed.
+cost inline in the response (a `cost` field alongside token usage). The transport captures that and
+records it as `realized_cost`, falling back to the estimate only when none is returned — and
+`session_end` tags the origin (`cost_source` = `provider` | `estimate`) so the number is never
+misread. The reported cost also drives the mid-session cap when present.
 
 The M0 transport is a small **streaming reverse proxy**: `run` binds it on a local port, and for
 each request it rewrites the blind model to the real slug, merges the provider's `extra_body`,
-forwards with the API key and `extra_headers`, and streams the response straight back while
-tallying the `usage` block into cumulative token counts (the `Usage` events the cap acts on).
-Point any OpenAI-compatible CLI at it. Honest M0 limitations, all on the **response** side (the
-request path is fully blinded): it accounts usage per completed response rather than token-by-token
-mid-stream; it forwards `/v1/models` untouched (a CLI that lists models sees real names); and it
-streams responses back verbatim, so the response body's own `model` field (and provider fingerprint
-fields) still name the real model. Blinding today covers the *request* path — response-side
-rewriting (mask the returned `model`, strip fingerprints) lands with the M1 tee, behind this same
-trait, with no change above the seam.
+forwards with the API key and `extra_headers`, and streams the response back while tallying the
+`usage` block into cumulative token counts (the `Usage` events the cap acts on). It blinds **both
+directions**: the request `model` is rewritten to the real slug, and on the way back the response
+`model` is rewritten to the alias with provider fingerprint fields (`provider`, `system_fingerprint`,
+`x_groq`) stripped — per SSE frame so streaming is preserved, or once for a buffered JSON body.
+Point any OpenAI-compatible CLI at it. Remaining M0 limitations: it accounts usage per completed
+response rather than token-by-token mid-stream, and it forwards `/v1/models` untouched (a CLI that
+lists models still sees real names there — the chat path is masked). Both tighten with the M1 tee,
+behind this same trait, with no change above the seam.
 
 ## simulate — the go/no-go
 
