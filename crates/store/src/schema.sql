@@ -1,4 +1,8 @@
--- blindcoder store — append-only, event-sourced schema (M0: full schema, written once).
+-- blindcoder store — append-only, event-sourced schema.
+--
+-- This file is the **frozen v1 baseline** (all statements are IF NOT EXISTS / idempotent). Do NOT
+-- edit it to add or change columns once shipped — later schema changes are versioned MIGRATIONS in
+-- lib.rs, applied via PRAGMA user_version so an existing DB with real data upgrades in place.
 --
 -- Design rules encoded here:
 --   * Never UPDATE/DELETE the integrity-critical tables — corrections SUPERSEDE (a new row that
@@ -73,11 +77,6 @@ CREATE TABLE IF NOT EXISTS session_end (
   session_id        INTEGER PRIMARY KEY REFERENCES sessions(id),
   ended_at          TEXT NOT NULL DEFAULT (datetime('now')),
   realized_cost     REAL,
-  -- Where realized_cost came from: 'provider' (authoritative, reported inline by the gateway) or
-  -- 'estimate' (our tokens x shelf-price fallback). The number means different things by origin, so
-  -- the selector/analysis must know which. SQLite has no ENUM type; a CHECK constraint enforces the
-  -- set (NULL allowed for a session with no recorded cost).
-  cost_source       TEXT CHECK (cost_source IS NULL OR cost_source IN ('provider','estimate')),
   prompt_tokens     INTEGER,
   completion_tokens INTEGER,
   error_kind        TEXT,

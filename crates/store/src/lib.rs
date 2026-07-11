@@ -7,10 +7,29 @@
 use alias::Alias;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
+use rusqlite_migration::{Migrations, M};
 use std::path::Path;
 
-/// The full append-only schema, applied on open (idempotent — every statement is `IF NOT EXISTS`).
+/// The frozen v1 baseline schema (idempotent). Never edited after shipping — see [`migrations`].
 pub const SCHEMA: &str = include_str!("schema.sql");
+
+/// Versioned schema migrations, tracked by SQLite's `PRAGMA user_version` via `rusqlite_migration`
+/// (`to_latest` applies pending ones atomically, in order). Migration 1 is the baseline; every
+/// later change is a new `M::up`. A DB with real data upgrades in place — never dropped.
+///
+/// **Only append** — never edit or reorder a shipped migration. `validate()` (exercised in a test)
+/// guards against that.
+fn migrations() -> Migrations<'static> {
+    Migrations::new(vec![
+        M::up(SCHEMA),
+        // v2: record where realized_cost came from. SQLite has no ENUM, so a CHECK enforces the set
+        // (references only this column + nullable, so ALTER … ADD COLUMN accepts it).
+        M::up(
+            "ALTER TABLE session_end ADD COLUMN cost_source TEXT
+                CHECK (cost_source IS NULL OR cost_source IN ('provider','estimate'));",
+        ),
+    ])
+}
 
 /// An effective rating with its age already resolved to days, ready to fold. Age is computed by
 /// SQLite (`julianday('now') - julianday(rated_at)`) so the binary needs no datetime dependency and
@@ -72,15 +91,15 @@ impl Store {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        let conn = Connection::open(path)?;
-        conn.execute_batch(SCHEMA)?;
+        let mut conn = Connection::open(path)?;
+        migrations().to_latest(&mut conn)?;
         Ok(Self { conn })
     }
 
-    /// An ephemeral in-memory store with the schema applied — used by tests.
+    /// An ephemeral in-memory store, migrated to the current version — used by tests.
     pub fn open_in_memory() -> Result<Self> {
-        let conn = Connection::open_in_memory()?;
-        conn.execute_batch(SCHEMA)?;
+        let mut conn = Connection::open_in_memory()?;
+        migrations().to_latest(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -409,6 +428,47 @@ mod tests {
             )
             .unwrap();
         assert!(n >= 7, "expected the full table set, got {n}");
+    }
+
+    #[test]
+    fn migrations_validate() {
+        // Guards against editing/reordering a shipped migration (rusqlite_migration's own check).
+        migrations().validate().unwrap();
+    }
+
+    #[test]
+    fn migration_upgrades_an_existing_baseline_db_in_place() {
+        // Simulate a pre-migration DB: baseline schema only (v1), a real row, no cost_source.
+        let mut conn = Connection::open_in_memory().unwrap();
+        conn.execute_batch(SCHEMA).unwrap();
+        conn.execute("INSERT INTO sessions (alias) VALUES ('a:b')", []).unwrap();
+        conn.execute("INSERT INTO session_end (session_id, realized_cost) VALUES (1, 0.5)", [])
+            .unwrap();
+        assert!(
+            conn.prepare("SELECT cost_source FROM session_end").is_err(),
+            "cost_source should not exist on the baseline yet"
+        );
+
+        migrations().to_latest(&mut conn).unwrap();
+
+        // Existing data preserved (cost_source defaulted NULL), the new column is usable, and the
+        // CHECK constraint is enforced through the migration.
+        let (cost, src): (f64, Option<String>) = conn
+            .query_row(
+                "SELECT realized_cost, cost_source FROM session_end WHERE session_id = 1",
+                [],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(cost, 0.5);
+        assert_eq!(src, None);
+        conn.execute("INSERT INTO sessions (alias) VALUES ('c:d')", []).unwrap();
+        conn.execute("INSERT INTO session_end (session_id, cost_source) VALUES (2, 'provider')", [])
+            .unwrap();
+        conn.execute("INSERT INTO sessions (alias) VALUES ('e:f')", []).unwrap();
+        assert!(conn
+            .execute("INSERT INTO session_end (session_id, cost_source) VALUES (3, 'bogus')", [])
+            .is_err());
     }
 
     #[test]
