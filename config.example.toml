@@ -96,6 +96,9 @@ curated_policy_max_age_days = 90
 #   order = ["prov-a","prov-b"]     -> try these providers in this order
 #   only = ["prov-a"] / ignore=[..] -> restrict to / exclude specific providers
 #   allow_fallbacks = false         -> use only the top provider (strict; fails if it is down)
+# (Provider slugs for order/only/ignore come from the documented GET /api/v1/providers list — read
+#  each entry's `slug`. Whether a given provider serves a model under ZDR is not in that list; probe
+#  it: only=[slug] + zdr=true + allow_fallbacks=false either routes there or errors.)
 # These AND together. By DEFAULT the gateway load-balances across all ELIGIBLE providers, so without
 # `sort` the price varies run to run and is often not the cheapest (the privacy filters restrict the
 # eligible set but do not sort it). `sort = "price"` + a ZDR filter routes to the cheapest compliant
