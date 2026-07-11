@@ -115,10 +115,13 @@ The M0 transport is a small **streaming reverse proxy**: `run` binds it on a loc
 each request it rewrites the blind model to the real slug, merges the provider's `extra_body`,
 forwards with the API key and `extra_headers`, and streams the response straight back while
 tallying the `usage` block into cumulative token counts (the `Usage` events the cap acts on).
-Point any OpenAI-compatible CLI at it. Two honest M0 limitations: it accounts usage per completed
-response rather than token-by-token mid-stream, and it forwards `/v1/models` untouched (so a CLI
-that lists models sees real names — blinding covers the chat path). Both tighten with the M1
-tee, behind this same trait, with no change above the seam.
+Point any OpenAI-compatible CLI at it. Honest M0 limitations, all on the **response** side (the
+request path is fully blinded): it accounts usage per completed response rather than token-by-token
+mid-stream; it forwards `/v1/models` untouched (a CLI that lists models sees real names); and it
+streams responses back verbatim, so the response body's own `model` field (and provider fingerprint
+fields) still name the real model. Blinding today covers the *request* path — response-side
+rewriting (mask the returned `model`, strip fingerprints) lands with the M1 tee, behind this same
+trait, with no change above the seam.
 
 ## simulate — the go/no-go
 
