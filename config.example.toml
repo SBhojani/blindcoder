@@ -75,6 +75,11 @@ curated_policy_max_age_days = 90
 # offered by two providers should share one canonical_key, so its quality belief pools across
 # providers while the two compete on price. `real_slug` is what that provider's API expects in
 # the request `model` field. Omit prices for a free tier — it competes as a zero-cost candidate.
+#
+# Heads-up for agentic CLIs (OpenCode/aider/…): they send large system prompts + context (tens of
+# thousands of tokens per request). A free tier with a low tokens-per-minute cap will reject those
+# (e.g. Groq's free tier is ~8k TPM, so it can't serve an OpenCode-sized request). For those CLIs,
+# lean on providers/tiers without a tiny TPM cap (paid OpenRouter models, or a provider's dev tier).
 
 # A free provider (no prices, no passthrough needed).
 # [[providers]]
