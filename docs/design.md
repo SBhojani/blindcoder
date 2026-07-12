@@ -141,10 +141,10 @@ forwards with the API key and `extra_headers`, and streams the response back whi
 directions**: the request `model` is rewritten to the real slug, and on the way back the response
 `model` is rewritten to the alias with provider fingerprint fields (`provider`, `system_fingerprint`,
 `x_groq`) stripped — per SSE frame so streaming is preserved, or once for a buffered JSON body.
-Point any OpenAI-compatible CLI at it. Remaining M0 limitations: it accounts usage per completed
-response rather than token-by-token mid-stream, and it forwards `/v1/models` untouched (a CLI that
-lists models still sees real names there — the chat path is masked). Both tighten with the M1 tee,
-behind this same trait, with no change above the seam.
+Point any OpenAI-compatible CLI at it. The catalog is blinded too: `GET …/models` is answered
+locally with just the aliased model, so a CLI's model picker can't deblind the session. The one
+remaining M0 limitation is that it accounts usage per completed response rather than token-by-token
+mid-stream — which tightens with the M1 tee, behind this same trait, with no change above the seam.
 
 ## simulate — the go/no-go
 

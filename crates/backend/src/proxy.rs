@@ -146,6 +146,20 @@ async fn proxy_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    // Blind the model catalog: this session is one picked model, so `GET …/models` returns just the
+    // alias — never the provider's real model list. (Without this the CLI's model picker would show
+    // real names — a deblind vector the request/response masking wouldn't otherwise cover.)
+    if method == Method::GET && uri.path().ends_with("/models") {
+        let list = serde_json::json!({
+            "object": "list",
+            "data": [{ "id": st.alias, "object": "model", "owned_by": "blindcoder" }]
+        });
+        return Response::builder()
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(list.to_string()))
+            .unwrap_or_else(|_| StatusCode::INTERNAL_SERVER_ERROR.into_response());
+    }
+
     // Map the caller's path onto the provider's endpoint: the provider's base_url already carries
     // its version prefix (e.g. .../v1 or .../openai/v1), so append everything after the caller's
     // own "/v1" (or the whole path if it has none).
@@ -440,5 +454,39 @@ mod tests {
         assert_eq!(outcome.completion_tokens, Some(5));
         assert_eq!(outcome.realized_cost, Some(0.0012));
         assert_eq!(outcome.terminated_by, None);
+    }
+
+    /// `GET /v1/models` is served locally as just the alias — the provider's real catalog is never
+    /// forwarded, so a CLI's model list can't deblind the session.
+    #[tokio::test]
+    async fn models_list_returns_only_the_alias() {
+        let backend = ProxyBackend::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Some("test-key".into()),
+            vec![],
+            serde_json::Map::new(),
+        )
+        .unwrap();
+        // base_url points nowhere reachable — the intercept must answer without forwarding upstream.
+        let pick = Pick {
+            canonical_key: "model-x".into(),
+            real_slug: "prov/model-x".into(),
+            base_url: "http://127.0.0.1:1/v1".into(),
+        };
+        let sess = backend.start(&pick, "al:al").await.unwrap();
+        let addr = sess.endpoint().unwrap();
+
+        let text = reqwest::Client::new()
+            .get(format!("http://{addr}/v1/models"))
+            .send()
+            .await
+            .unwrap()
+            .text()
+            .await
+            .unwrap();
+        let v: Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(v["data"].as_array().unwrap().len(), 1);
+        assert_eq!(v["data"][0]["id"], "al:al");
+        assert!(!text.contains("prov/model-x"), "real slug must not leak in the model list");
     }
 }

@@ -97,9 +97,9 @@ session id. `performance` is `-2..=2` and `difficulty` is `0..=4`; difficulty is
 the session, against the finished work, so the rating is not anchored on an up-front guess. Made
 a mistake? Rate again with `--supersedes <old-rating-id>` — corrections supersede, never overwrite.
 
-> **M0 limitation:** the proxy forwards `/v1/models` untouched, so a CLI that lists models will
-> see real provider names. Blinding covers the chat path; a models-list rewrite comes with the M1
-> proxy hardening.
+> **Blinding is end-to-end:** the request `model` is rewritten to the real slug, the response
+> `model` is masked back to the alias (fingerprint fields stripped), and `GET /v1/models` returns
+> just the aliased model — so neither the chat path nor a CLI's model list reveals the real name.
 
 ## Configuration
 
