@@ -254,16 +254,17 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     let prompt_tokens = outcome.prompt_tokens.unwrap_or(0);
     let completion_tokens = outcome.completion_tokens.unwrap_or(0);
     let (realized_cost, cost_source) = match outcome.realized_cost {
-        Some(c) => (c, "provider"),
-        None => (cost_usd(prompt_tokens, completion_tokens, in_price, out_price), "estimate"),
+        Some(c) => (c, CostSource::Provider),
+        None => (cost_usd(prompt_tokens, completion_tokens, in_price, out_price), CostSource::Estimate),
     };
     store.record_session_end(
         sid,
         Some(realized_cost),
-        Some(cost_source),
+        Some(cost_source.as_str()),
         Some(prompt_tokens as i64),
         Some(completion_tokens as i64),
-        None,
+        outcome.error_kind.map(|e| e.as_str()),
+        outcome.error_status,
         outcome.terminated_by.map(|r| r.as_str()),
     )?;
 
@@ -272,8 +273,14 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
         Some(AbortReason::User) => "stopped by you",
         None => "ended",
     };
+    let err_note = match (outcome.error_kind, outcome.error_status) {
+        (Some(e), Some(code)) => format!(" [error: {} ({code})]", e.as_str()),
+        (Some(e), None) => format!(" [error: {}]", e.as_str()),
+        _ => String::new(),
+    };
     println!(
-        "\nsession #{sid} {ended}: {prompt_tokens} in + {completion_tokens} out tokens, ${realized_cost:.4} ({cost_source})."
+        "\nsession #{sid} {ended}{err_note}: {prompt_tokens} in + {completion_tokens} out tokens, ${realized_cost:.4} ({}).",
+        cost_source.as_str()
     );
 
     // Launcher mode ends when the CLI exits → rate inline (still blind). Standing mode leaves it to
@@ -340,6 +347,23 @@ fn opencode_config_content(base_url: &str, alias: &str) -> String {
         "model": format!("blindcoder/{alias}")
     })
     .to_string()
+}
+
+/// Where the recorded `realized_cost` came from — the provider's inline figure (authoritative) or
+/// our tokens × shelf-price estimate. Serialized to `session_end.cost_source` via [`as_str`].
+#[derive(Clone, Copy)]
+enum CostSource {
+    Provider,
+    Estimate,
+}
+
+impl CostSource {
+    fn as_str(&self) -> &'static str {
+        match self {
+            CostSource::Provider => "provider",
+            CostSource::Estimate => "estimate",
+        }
+    }
 }
 
 /// Estimate USD cost from token counts and per-Mtok shelf prices.

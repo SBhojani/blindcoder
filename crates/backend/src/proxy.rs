@@ -29,7 +29,20 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 
 use crate::rewrite::{mask_json_body, mask_sse_line, parse_usage, rewrite_request};
-use crate::{AbortReason, Backend, Pick, Session, SessionEvent, SessionOutcome, UsageSnapshot};
+use crate::{AbortReason, Backend, ErrorKind, Pick, Session, SessionEvent, SessionOutcome, UsageSnapshot};
+
+/// Map an upstream HTTP status to an [`ErrorKind`] (for the "no clean completion" case).
+fn classify_http(code: u16) -> ErrorKind {
+    match code {
+        429 => ErrorKind::RateLimit,
+        401 | 403 => ErrorKind::Auth,
+        400..=499 => ErrorKind::BadRequest, // other 4xx: 400/404/413/422/…
+        500..=599 => ErrorKind::Http5xx,
+        // 1xx/3xx/≥600 shouldn't reach here (we only classify non-2xx final statuses; reqwest
+        // follows redirects) — distinct Unknown bucket rather than mislabelling as bad_request.
+        _ => ErrorKind::Unknown,
+    }
+}
 
 /// A ready-to-run forwarding proxy. Constructed per session by the router with the picked
 /// provider's credentials and passthrough hooks; the per-model target (`base_url`, `real_slug`)
@@ -61,15 +74,19 @@ impl ProxyBackend {
     }
 }
 
-/// Cumulative per-session usage, shared between the request handlers and the session handle.
-/// Provider-reported cost is accumulated in integer nano-dollars (float-atomic-free) and only
-/// surfaced when at least one response actually reported a cost.
+/// Cumulative per-session usage + failure signals, shared between the request handlers and the
+/// session handle. Cost is accumulated in integer nano-dollars (float-atomic-free) and surfaced
+/// only when a response reported one. Failure state feeds [`error_kind`](Cumulative::error_kind).
 #[derive(Default)]
 struct Cumulative {
     prompt: AtomicU64,
     completion: AtomicU64,
     cost_nano: AtomicU64,
     has_cost: AtomicBool,
+    any_success: AtomicBool,
+    http_error: AtomicU64,    // 0 = none, 1 = network (no response), else the HTTP status
+    content_issue: AtomicU64, // 0 = none, 1 = truncated (length), 2 = refused (content_filter)
+    body_error: AtomicBool,   // a 2xx response whose body carried an `error`
 }
 
 impl Cumulative {
@@ -97,6 +114,60 @@ impl Cumulative {
     fn totals(&self) -> (u64, u64) {
         (self.prompt.load(Ordering::Relaxed), self.completion.load(Ordering::Relaxed))
     }
+
+    fn note_network(&self) {
+        self.http_error.store(1, Ordering::Relaxed);
+    }
+    fn note_http_error(&self, code: u16) {
+        self.http_error.store(code as u64, Ordering::Relaxed);
+    }
+    fn note_success(&self) {
+        self.any_success.store(true, Ordering::Relaxed);
+    }
+    fn note_body_error(&self) {
+        self.body_error.store(true, Ordering::Relaxed);
+    }
+    fn note_finish_reason(&self, reason: &str) {
+        let v = match reason {
+            "length" => 1,
+            "content_filter" => 2,
+            _ => 0,
+        };
+        if v != 0 {
+            self.content_issue.store(v, Ordering::Relaxed);
+        }
+    }
+
+    /// Derive the session's failure tag: a transport-level failure when nothing completed cleanly,
+    /// otherwise a content-level degradation (truncated / refused) from the last completion.
+    fn error_kind(&self) -> Option<ErrorKind> {
+        if !self.any_success.load(Ordering::Relaxed) {
+            let http = self.http_error.load(Ordering::Relaxed);
+            if http == 1 {
+                return Some(ErrorKind::Network);
+            }
+            if http != 0 {
+                return Some(classify_http(http as u16));
+            }
+            if self.body_error.load(Ordering::Relaxed) {
+                return Some(ErrorKind::BadRequest);
+            }
+        }
+        match self.content_issue.load(Ordering::Relaxed) {
+            1 => Some(ErrorKind::Truncated),
+            2 => Some(ErrorKind::Refused),
+            _ => None,
+        }
+    }
+
+    /// The raw upstream HTTP status of a failure, if there was an HTTP one. `None` for a network
+    /// failure (sentinel `1`, no status) or no failure.
+    fn error_status(&self) -> Option<u16> {
+        match self.http_error.load(Ordering::Relaxed) {
+            0 | 1 => None,
+            code => Some(code as u16),
+        }
+    }
 }
 
 /// Everything a request handler needs to forward and account one call.
@@ -112,29 +183,56 @@ struct ProxyState {
     cumulative: Arc<Cumulative>,
 }
 
-/// Pull cumulative token usage out of a completed response body — either a plain JSON object or an
-/// SSE stream whose final `data:` frame carries `usage` (OpenAI streaming with `include_usage`).
-fn extract_usage(body: &[u8]) -> Option<UsageSnapshot> {
-    if let Ok(v) = serde_json::from_slice::<Value>(body) {
-        if let Some(u) = parse_usage(&v) {
-            return Some(u);
-        }
+/// Signals read from a completed response body in one pass: token usage, the last `finish_reason`,
+/// and whether an `error` object was present.
+#[derive(Default)]
+struct Signals {
+    usage: Option<UsageSnapshot>,
+    finish_reason: Option<String>,
+    has_error: bool,
+}
+
+/// Extract [`Signals`] from one OpenAI-wire JSON object.
+fn signals_from_value(v: &Value) -> Signals {
+    Signals {
+        usage: parse_usage(v),
+        finish_reason: v
+            .get("choices")
+            .and_then(|c| c.get(0))
+            .and_then(|c| c.get("finish_reason"))
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        has_error: v.get("error").is_some(),
     }
-    let text = std::str::from_utf8(body).ok()?;
-    let mut found = None;
-    for line in text.lines() {
-        let Some(rest) = line.trim_start().strip_prefix("data:") else { continue };
-        let rest = rest.trim();
-        if rest == "[DONE]" {
-            continue;
-        }
-        if let Ok(v) = serde_json::from_str::<Value>(rest) {
-            if let Some(u) = parse_usage(&v) {
-                found = Some(u); // keep the last one — streaming usage arrives in the final frame
+}
+
+/// Read failure/usage signals from a completed response body — a plain JSON object, or an SSE stream
+/// (usage + the final `finish_reason` arrive in the last `data:` frames).
+fn response_signals(body: &[u8]) -> Signals {
+    if let Ok(v) = serde_json::from_slice::<Value>(body) {
+        return signals_from_value(&v);
+    }
+    let mut out = Signals::default();
+    if let Ok(text) = std::str::from_utf8(body) {
+        for line in text.lines() {
+            let Some(rest) = line.trim_start().strip_prefix("data:") else { continue };
+            let rest = rest.trim();
+            if rest == "[DONE]" {
+                continue;
+            }
+            if let Ok(v) = serde_json::from_str::<Value>(rest) {
+                let s = signals_from_value(&v);
+                if s.usage.is_some() {
+                    out.usage = s.usage; // keep the last — streaming usage is in the final frame
+                }
+                if s.finish_reason.is_some() {
+                    out.finish_reason = s.finish_reason;
+                }
+                out.has_error |= s.has_error;
             }
         }
     }
-    found
+    out
 }
 
 /// Forward one request to the upstream provider and stream the response back, rewriting the model
@@ -197,10 +295,17 @@ async fn proxy_handler(
 
     let upstream = match req.send().await {
         Ok(r) => r,
-        Err(e) => return (StatusCode::BAD_GATEWAY, format!("upstream request failed: {e}")).into_response(),
+        Err(e) => {
+            st.cumulative.note_network();
+            return (StatusCode::BAD_GATEWAY, format!("upstream request failed: {e}")).into_response();
+        }
     };
 
     let status = upstream.status();
+    let succeeded = status.is_success();
+    if !succeeded {
+        st.cumulative.note_http_error(status.as_u16());
+    }
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let is_sse = content_type
         .as_ref()
@@ -250,7 +355,19 @@ async fn proxy_handler(
             acc = masked.clone();
             yield Ok(Bytes::from(masked));
         }
-        if let Some(u) = extract_usage(&acc) {
+        // Failure signals + usage from the (masked) body — masking never touches usage/error/finish.
+        let sig = response_signals(&acc);
+        if succeeded {
+            if sig.has_error {
+                st2.cumulative.note_body_error(); // HTTP 200 with an `error` payload
+            } else {
+                st2.cumulative.note_success();
+                if let Some(fr) = &sig.finish_reason {
+                    st2.cumulative.note_finish_reason(fr);
+                }
+            }
+        }
+        if let Some(u) = sig.usage {
             let snapshot = st2.cumulative.add(&u);
             let _ = st2.usage_tx.send(snapshot);
         }
@@ -357,7 +474,8 @@ impl Session for ProxySession {
             realized_cost: self.cumulative.cost(), // provider-reported when available, else None
             prompt_tokens: Some(prompt_tokens),
             completion_tokens: Some(completion_tokens),
-            error_kind: None,
+            error_kind: self.cumulative.error_kind(),
+            error_status: self.cumulative.error_status(),
             terminated_by: self.aborted,
         })
     }
@@ -454,6 +572,50 @@ mod tests {
         assert_eq!(outcome.completion_tokens, Some(5));
         assert_eq!(outcome.realized_cost, Some(0.0012));
         assert_eq!(outcome.terminated_by, None);
+    }
+
+    /// A session whose requests all fail upstream is tagged with the derived error_kind and the raw
+    /// HTTP status (never-guess ground truth).
+    #[tokio::test]
+    async fn failed_session_tags_error_kind_and_status() {
+        let up_app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                (
+                    axum::http::StatusCode::TOO_MANY_REQUESTS,
+                    axum::Json(json!({"error": {"message": "rate limited"}})),
+                )
+            }),
+        );
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(up_listener, up_app).await.unwrap(); });
+
+        let backend = ProxyBackend::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Some("k".into()),
+            vec![],
+            serde_json::Map::new(),
+        )
+        .unwrap();
+        let pick = Pick {
+            canonical_key: "m".into(),
+            real_slug: "prov/m".into(),
+            base_url: format!("http://{up_addr}/v1"),
+        };
+        let sess = backend.start(&pick, "al:al").await.unwrap();
+        let addr = sess.endpoint().unwrap();
+        let _ = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .header("content-type", "application/json")
+            .body(serde_json::to_vec(&json!({"model": "al:al", "messages": []})).unwrap())
+            .send()
+            .await
+            .unwrap();
+
+        let outcome = sess.finish().await.unwrap();
+        assert_eq!(outcome.error_kind, Some(ErrorKind::RateLimit));
+        assert_eq!(outcome.error_status, Some(429)); // raw status preserved
     }
 
     /// `GET /v1/models` is served locally as just the alias — the provider's real catalog is never

@@ -65,6 +65,46 @@ impl AbortReason {
     }
 }
 
+/// How a session failed, when it did. Derived live from the upstream status / finish-reason (the raw
+/// truth is in the WARC archive at `replay`); stored on `session_end.error_kind` so the selector has
+/// the failure signal even at the `metadata` floor. A closed set — the only values `error_kind` takes.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// 429 / provider rate or quota limit (e.g. tokens-per-minute).
+    RateLimit,
+    /// Upstream 5xx.
+    Http5xx,
+    /// 401 / 403 — bad or missing credentials.
+    Auth,
+    /// Other 4xx (malformed, too large, unknown model, …) or an HTTP-200 body carrying an `error`.
+    BadRequest,
+    /// No HTTP response at all (connection failure / timeout).
+    Network,
+    /// A completion cut off at the output-token limit (`finish_reason = "length"`).
+    Truncated,
+    /// The model declined (`finish_reason = "content_filter"`).
+    Refused,
+    /// A response we couldn't classify into the above — an unexpected status (1xx/3xx/≥600) or an
+    /// unrecognised failure. The raw status/body is in the WARC capture at `replay`.
+    Unknown,
+}
+
+impl ErrorKind {
+    /// Stable string form written to `session_end.error_kind`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ErrorKind::RateLimit => "rate_limit",
+            ErrorKind::Http5xx => "http_5xx",
+            ErrorKind::Auth => "auth",
+            ErrorKind::BadRequest => "bad_request",
+            ErrorKind::Network => "network",
+            ErrorKind::Truncated => "truncated",
+            ErrorKind::Refused => "refused",
+            ErrorKind::Unknown => "unknown",
+        }
+    }
+}
+
 /// What a finished session reports back — the `metadata`-floor signal the selector learns from.
 /// No prompt/code: just tokens, realized cost, an optional error tag, and how it ended.
 #[derive(Clone, Debug, Default)]
@@ -72,8 +112,11 @@ pub struct SessionOutcome {
     pub realized_cost: Option<f64>,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
-    /// Set when the session failed in a way worth tagging (transient, auth, rate-limit, ...).
-    pub error_kind: Option<String>,
+    /// Set when the session failed in a way worth tagging; `None` on clean success.
+    pub error_kind: Option<ErrorKind>,
+    /// The raw upstream HTTP status of an HTTP-level failure (the ground truth `error_kind` is
+    /// derived from). `None` for a network failure (no status), a content issue, or clean success.
+    pub error_status: Option<u16>,
     /// `Some` = aborted (by whom); `None` = natural completion.
     pub terminated_by: Option<AbortReason>,
 }
@@ -176,6 +219,7 @@ mod tests {
                 prompt_tokens: None,
                 completion_tokens: Some(self.completion_tokens.load(Ordering::Relaxed)),
                 error_kind: None,
+                error_status: None,
                 terminated_by: self.aborted,
             })
         }

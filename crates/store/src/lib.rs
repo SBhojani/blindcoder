@@ -28,6 +28,57 @@ fn migrations() -> Migrations<'static> {
             "ALTER TABLE session_end ADD COLUMN cost_source TEXT
                 CHECK (cost_source IS NULL OR cost_source IN ('provider','estimate'));",
         ),
+        // v3: SQLite has no ENUM and can't ALTER-in a CHECK, so give the enum-like TEXT columns
+        // their CHECK sets (the SQLite enum equivalent) via table rebuilds, and add error_status
+        // (raw HTTP status; error_kind is the derived projection). rusqlite_migration applies this
+        // atomically (in a transaction); `PRAGMA foreign_keys=ON` from the baseline is a no-op inside
+        // a transaction, so FK enforcement is off here and even the *referenced* `sessions` table can
+        // be rebuilt. The append-only triggers are recreated for both. Verified by the
+        // `v3_migration_preserves_triggers_checks_and_fks` test.
+        M::up(
+            "CREATE TABLE session_end_new (
+                 session_id        INTEGER PRIMARY KEY REFERENCES sessions(id),
+                 ended_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                 realized_cost     REAL,
+                 cost_source       TEXT CHECK (cost_source IS NULL OR cost_source IN ('provider','estimate')),
+                 prompt_tokens     INTEGER,
+                 completion_tokens INTEGER,
+                 error_kind        TEXT CHECK (error_kind IS NULL OR error_kind IN
+                     ('rate_limit','http_5xx','auth','bad_request','network','truncated','refused','unknown')),
+                 error_status      INTEGER,
+                 terminated_by     TEXT CHECK (terminated_by IS NULL OR terminated_by IN ('cost_cap','user'))
+             );
+             INSERT INTO session_end_new
+                 (session_id, ended_at, realized_cost, cost_source, prompt_tokens, completion_tokens, error_kind, terminated_by)
+               SELECT session_id, ended_at, realized_cost, cost_source, prompt_tokens, completion_tokens, error_kind, terminated_by
+               FROM session_end;
+             DROP TABLE session_end;
+             ALTER TABLE session_end_new RENAME TO session_end;
+             CREATE TRIGGER session_end_no_update BEFORE UPDATE ON session_end
+               BEGIN SELECT RAISE(ABORT, 'append-only: session_end is immutable'); END;
+             CREATE TRIGGER session_end_no_delete BEFORE DELETE ON session_end
+               BEGIN SELECT RAISE(ABORT, 'append-only: session_end is immutable'); END;
+
+             CREATE TABLE sessions_new (
+                 id               INTEGER PRIMARY KEY AUTOINCREMENT,
+                 alias            TEXT NOT NULL,
+                 cli              TEXT,
+                 capture_level    TEXT NOT NULL DEFAULT 'metadata'
+                     CHECK (capture_level IN ('metadata','contents','replay')),
+                 tuneables_json   TEXT,
+                 start_difficulty INTEGER,
+                 started_at       TEXT NOT NULL DEFAULT (datetime('now'))
+             );
+             INSERT INTO sessions_new (id, alias, cli, capture_level, tuneables_json, start_difficulty, started_at)
+               SELECT id, alias, cli, capture_level, tuneables_json, start_difficulty, started_at FROM sessions;
+             DROP TABLE sessions;
+             ALTER TABLE sessions_new RENAME TO sessions;
+             CREATE TRIGGER sessions_no_update BEFORE UPDATE ON sessions
+               BEGIN SELECT RAISE(ABORT, 'append-only: sessions are immutable'); END;
+             CREATE TRIGGER sessions_no_delete BEFORE DELETE ON sessions
+               BEGIN SELECT RAISE(ABORT, 'append-only: sessions are immutable'); END;
+             CREATE INDEX IF NOT EXISTS sessions_by_alias ON sessions(alias);",
+        ),
     ])
 }
 
@@ -86,20 +137,32 @@ pub struct Store {
 }
 
 impl Store {
-    /// Open (creating parent dirs and the file if needed) and apply the schema.
+    /// Migrate a fresh connection: foreign keys OFF while migrating (so a migration can rebuild a
+    /// referenced table — the SQLite 12-step ALTER — without a spurious constraint failure; toggling
+    /// FK must happen outside a transaction, which is here, before `to_latest`), then ON so the
+    /// `REFERENCES` are actually enforced at runtime. (The baseline's in-schema `PRAGMA foreign_keys`
+    /// is a no-op because it runs inside the migration transaction — this is where FK state is set.)
+    fn migrate(conn: &mut Connection) -> Result<()> {
+        conn.pragma_update(None, "foreign_keys", false)?;
+        migrations().to_latest(conn)?;
+        conn.pragma_update(None, "foreign_keys", true)?;
+        Ok(())
+    }
+
+    /// Open (creating parent dirs and the file if needed) and migrate to the current schema.
     pub fn open(path: &Path) -> Result<Self> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
         let mut conn = Connection::open(path)?;
-        migrations().to_latest(&mut conn)?;
+        Self::migrate(&mut conn)?;
         Ok(Self { conn })
     }
 
     /// An ephemeral in-memory store, migrated to the current version — used by tests.
     pub fn open_in_memory() -> Result<Self> {
         let mut conn = Connection::open_in_memory()?;
-        migrations().to_latest(&mut conn)?;
+        Self::migrate(&mut conn)?;
         Ok(Self { conn })
     }
 
@@ -392,12 +455,14 @@ impl Store {
         prompt_tokens: Option<i64>,
         completion_tokens: Option<i64>,
         error_kind: Option<&str>,
+        error_status: Option<u16>,
         terminated_by: Option<&str>,
     ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO session_end
-                 (session_id, realized_cost, cost_source, prompt_tokens, completion_tokens, error_kind, terminated_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                 (session_id, realized_cost, cost_source, prompt_tokens, completion_tokens,
+                  error_kind, error_status, terminated_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             rusqlite::params![
                 session_id,
                 realized_cost,
@@ -405,6 +470,7 @@ impl Store {
                 prompt_tokens,
                 completion_tokens,
                 error_kind,
+                error_status,
                 terminated_by
             ],
         )?;
@@ -431,6 +497,53 @@ mod tests {
     }
 
     #[test]
+    fn v3_migration_preserves_triggers_checks_and_fks() {
+        // Empirical check that the v3 table rebuilds are safe: append-only triggers survive on BOTH
+        // rebuilt tables, the new CHECKs reject bad values, FK integrity is clean, data is preserved.
+        let s = Store::open_in_memory().unwrap(); // runs all migrations, incl. the v3 rebuilds
+        s.conn.execute("INSERT INTO sessions (alias) VALUES ('a:b')", []).unwrap();
+        let sid = s.conn.last_insert_rowid();
+        s.conn
+            .execute(
+                "INSERT INTO session_end (session_id, error_kind, error_status, cost_source, terminated_by)
+                 VALUES (?1, 'rate_limit', 429, 'provider', 'user')",
+                [sid],
+            )
+            .unwrap();
+
+        // (a) append-only triggers still fire on both rebuilt tables.
+        assert!(s.conn.execute("UPDATE sessions SET alias='x' WHERE id=?1", [sid]).is_err());
+        assert!(s.conn.execute("DELETE FROM sessions WHERE id=?1", [sid]).is_err());
+        assert!(s.conn.execute("UPDATE session_end SET error_status=500 WHERE session_id=?1", [sid]).is_err());
+        assert!(s.conn.execute("DELETE FROM session_end WHERE session_id=?1", [sid]).is_err());
+
+        // (b) the new CHECKs accept valid and reject invalid values.
+        s.conn.execute("INSERT INTO sessions (alias, capture_level) VALUES ('c:d','replay')", []).unwrap();
+        assert!(s.conn.execute("INSERT INTO sessions (alias, capture_level) VALUES ('e:f','bogus')", []).is_err());
+        s.conn.execute("INSERT INTO sessions (alias) VALUES ('g:h')", []).unwrap();
+        let sid2 = s.conn.last_insert_rowid();
+        assert!(s.conn.execute("INSERT INTO session_end (session_id, error_kind) VALUES (?1,'nonsense')", [sid2]).is_err());
+        assert!(s.conn.execute("INSERT INTO session_end (session_id, terminated_by) VALUES (?1,'nope')", [sid2]).is_err());
+
+        // (c) data preserved incl. the new error_status column.
+        let (ek, es): (String, i64) = s
+            .conn
+            .query_row("SELECT error_kind, error_status FROM session_end WHERE session_id=?1", [sid], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(ek, "rate_limit");
+        assert_eq!(es, 429);
+
+        // (d) foreign-key integrity is clean after rebuilding the referenced `sessions` table.
+        let fk_issues: i64 = s
+            .conn
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(fk_issues, 0);
+    }
+
+    #[test]
     fn migrations_validate() {
         // Guards against editing/reordering a shipped migration (rusqlite_migration's own check).
         migrations().validate().unwrap();
@@ -449,7 +562,11 @@ mod tests {
             "cost_source should not exist on the baseline yet"
         );
 
+        // Migrate the way `Store::open` does: FK off while migrating (the v3 rebuild drops the
+        // referenced `sessions` table), on afterward.
+        conn.pragma_update(None, "foreign_keys", false).unwrap();
         migrations().to_latest(&mut conn).unwrap();
+        conn.pragma_update(None, "foreign_keys", true).unwrap();
 
         // Existing data preserved (cost_source defaulted NULL), the new column is usable, and the
         // CHECK constraint is enforced through the migration.
@@ -597,18 +714,22 @@ mod tests {
     fn session_lifecycle_records_start_and_terminated_end() {
         let s = Store::open_in_memory().unwrap();
         let sid = s.record_session_start("x7k2:q4m9", Some("opencode"), None).unwrap();
-        s.record_session_end(sid, Some(0.0), Some("provider"), Some(1200), Some(340), None, Some("cost_cap"))
-            .unwrap();
-        let (cost, src, term): (Option<f64>, Option<String>, Option<String>) = s
+        s.record_session_end(
+            sid, Some(0.0), Some("provider"), Some(1200), Some(340), Some("rate_limit"), Some(429), Some("cost_cap"),
+        )
+        .unwrap();
+        let (cost, src, ek, es, term): (Option<f64>, Option<String>, Option<String>, Option<i64>, Option<String>) = s
             .conn
             .query_row(
-                "SELECT realized_cost, cost_source, terminated_by FROM session_end WHERE session_id = ?1",
+                "SELECT realized_cost, cost_source, error_kind, error_status, terminated_by FROM session_end WHERE session_id = ?1",
                 [sid],
-                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?)),
             )
             .unwrap();
         assert_eq!(cost, Some(0.0));
         assert_eq!(src.as_deref(), Some("provider"));
+        assert_eq!(ek.as_deref(), Some("rate_limit"));
+        assert_eq!(es, Some(429));
         assert_eq!(term.as_deref(), Some("cost_cap"));
     }
 

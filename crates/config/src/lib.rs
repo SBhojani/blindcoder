@@ -27,6 +27,21 @@ impl Default for CostBasis {
     }
 }
 
+/// How much of each session blindcoder captures — monotonic supersets. Deserializes from the
+/// lowercase names; an unknown value is a config error (fails at load, not silently). `Ord` follows
+/// declaration order, so `level >= CaptureLevel::Replay` etc. express the "at least this level" gate.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum CaptureLevel {
+    /// Model↔rating↔cost↔time only — no prompts or code on disk. The default privacy floor.
+    #[default]
+    Metadata,
+    /// + parsed content projections stored in the DB.
+    Contents,
+    /// + the verbatim four-leg WARC archive on disk (full fidelity, re-runnable).
+    Replay,
+}
+
 /// One model offered by a provider. `canonical_key` is the provider-neutral identity the selector
 /// learns on (so the same model under two providers shares a track record); `real_slug` is what the
 /// provider's API actually expects in the request `model` field. Prices are optional — a free
@@ -103,6 +118,9 @@ pub struct Config {
     pub curated_policy_max_age_days: f64,
     /// Local address the `run` proxy listens on; point your agentic CLI at `http://<this>/v1`.
     pub proxy_addr: String,
+    /// How much of each session to capture (see [`CaptureLevel`]). Raising it above `metadata`
+    /// writes your prompts/code to disk (on-box, `0600`); leave at the default unless you want that.
+    pub capture_level: CaptureLevel,
     // --- backends ---
     pub providers: Vec<ProviderConfig>,
 }
@@ -123,6 +141,7 @@ impl Default for Config {
             max_session_cost_usd: 5.0,
             curated_policy_max_age_days: 90.0,
             proxy_addr: "127.0.0.1:8787".to_string(),
+            capture_level: CaptureLevel::Metadata,
             providers: Vec::new(),
         }
     }
