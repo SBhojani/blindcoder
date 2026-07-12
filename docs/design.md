@@ -59,9 +59,23 @@ value_score = quality_guess − cost_sensitivity × normalized_price
   letting difficulty rescue an outright failure.
 - **Belief is an event-sourced fold,** not a mutable score: replay the rating events with
   recency decay (a configurable half-life) at pick time.
+- **Failed sessions are learned against too.** A crash is never rated, so if only ratings fed the
+  belief a candidate that keeps failing would stay invisible. Each failed session instead folds in
+  as decayed **loss** evidence (no wins), so a candidate that keeps failing sinks in its posterior
+  and gets picked less — with recency decay letting it recover if the failures stop, so there is no
+  arbitrary strike threshold. How much a failure counts is a **policy weight by kind**: a
+  persistent, workload-fatal failure (the model+tier structurally cannot serve you — e.g. a
+  request-too-large) counts near a full lost session; a transient backend hiccup (rate limit, 5xx,
+  network) counts little (decay clears it); an our-fault error (auth, malformed request) counts
+  nothing, because the model is blameless. A single `failure_sensitivity` knob scales the whole
+  effect (0 disables it). Crucially the **selector never sees the error taxonomy** — it folds a
+  generic weighted loss; the error-kind→weight mapping lives in the router layer, keeping the
+  decision core pure.
 
 The selector is pure — no I/O, no clock, no ambient randomness — which is what makes it
-property-testable and what the `simulate` harness drives.
+property-testable and what the `simulate` harness drives. (The harness does not yet inject
+failures, so the per-kind weights are principled defaults awaiting the same sweep treatment as the
+other tuneables.)
 
 ## Providers, the pool, and the proxy
 
