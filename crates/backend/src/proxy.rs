@@ -392,6 +392,7 @@ async fn proxy_handler(
     // touches `model`/fingerprints, never `usage`/`cost`.
     let st2 = st.clone();
     let alias = st.alias.clone();
+    let real_slug = st.real_slug.clone(); // scrubbed from free text (error messages) too, not just `model`
     let target = url.clone();
     let stream = async_stream::stream! {
         let mut raw_acc: Vec<u8> = Vec::new(); // unmasked upstream bytes (provider_response leg + signals)
@@ -408,7 +409,7 @@ async fn proxy_handler(
                             let raw: Vec<u8> = linebuf.drain(..=pos).collect();
                             let text = String::from_utf8_lossy(&raw);
                             let core = text.trim_end_matches('\n').trim_end_matches('\r');
-                            let out = format!("{}\n", mask_sse_line(core, &alias));
+                            let out = format!("{}\n", mask_sse_line(core, &real_slug, &alias));
                             masked_acc.extend_from_slice(out.as_bytes());
                             yield Ok::<Bytes, std::io::Error>(Bytes::from(out.into_bytes()));
                         }
@@ -417,7 +418,7 @@ async fn proxy_handler(
                 }
             }
             if !linebuf.is_empty() {
-                let masked = mask_sse_line(&String::from_utf8_lossy(&linebuf), &alias);
+                let masked = mask_sse_line(&String::from_utf8_lossy(&linebuf), &real_slug, &alias);
                 masked_acc.extend_from_slice(masked.as_bytes());
                 yield Ok(Bytes::from(masked.into_bytes()));
             }
@@ -428,7 +429,7 @@ async fn proxy_handler(
                     Err(e) => { yield Err(std::io::Error::new(std::io::ErrorKind::Other, e)); break; }
                 }
             }
-            masked_acc = mask_json_body(&raw_acc, &alias);
+            masked_acc = mask_json_body(&raw_acc, &real_slug, &alias);
             yield Ok(Bytes::from(masked_acc.clone()));
         }
         // Failure signals + usage from the raw body (masking never touches usage/error/finish).

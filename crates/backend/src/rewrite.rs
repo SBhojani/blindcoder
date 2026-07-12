@@ -64,34 +64,68 @@ pub fn mask_response_obj(v: &mut Value, alias: &str) {
     }
 }
 
-/// Mask a whole non-streaming JSON response body. Returns the original bytes unchanged if it does
-/// not parse as JSON (we never corrupt a body we don't understand).
-pub fn mask_json_body(body: &[u8], alias: &str) -> Vec<u8> {
-    match serde_json::from_slice::<Value>(body) {
+/// Replace every occurrence of `needle` with `repl` in a byte stream. Used to scrub the real model
+/// slug out of *free text* the structured mask can't reach — e.g. a provider error message like
+/// ``Request too large for model `vendor/model-x` …``. Operating on raw bytes keeps a non-UTF-8 body
+/// intact; an empty needle is a no-op.
+fn replace_bytes(hay: &[u8], needle: &[u8], repl: &[u8]) -> Vec<u8> {
+    if needle.is_empty() {
+        return hay.to_vec();
+    }
+    let mut out = Vec::with_capacity(hay.len());
+    let mut i = 0;
+    while i < hay.len() {
+        if hay[i..].starts_with(needle) {
+            out.extend_from_slice(repl);
+            i += needle.len();
+        } else {
+            out.push(hay[i]);
+            i += 1;
+        }
+    }
+    out
+}
+
+/// Mask a whole non-streaming JSON response body: structured masking (rewrite `model`, strip
+/// fingerprints) **plus** a raw replace of the real slug with the alias across the entire body, so the
+/// slug is scrubbed even when it appears in free text the structured pass can't see (provider error
+/// messages, a model self-identifying in its output). Returns the original bytes unchanged only if it
+/// is neither JSON nor contains the slug — we never corrupt a body we don't understand. The slug is a
+/// specific string, so replacing it is safe; a coincidental appearance in content is itself a leak we
+/// *want* masked.
+pub fn mask_json_body(body: &[u8], real_slug: &str, alias: &str) -> Vec<u8> {
+    let structured = match serde_json::from_slice::<Value>(body) {
         Ok(mut v) => {
             mask_response_obj(&mut v, alias);
             serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec())
         }
         Err(_) => body.to_vec(),
-    }
+    };
+    replace_bytes(&structured, real_slug.as_bytes(), alias.as_bytes())
 }
 
 /// Mask one SSE line (no trailing newline). A `data: {json}` frame gets its `model`/fingerprints
-/// masked; `data: [DONE]`, empty payloads, and non-`data:` lines pass through verbatim.
-pub fn mask_sse_line(line: &str, alias: &str) -> String {
-    if let Some(rest) = line.trim_start().strip_prefix("data:") {
+/// masked; `data: [DONE]`, empty payloads, and non-`data:` lines pass through verbatim. In all cases
+/// the real slug is scrubbed from the line text (free-text leak defence, as in [`mask_json_body`]).
+pub fn mask_sse_line(line: &str, real_slug: &str, alias: &str) -> String {
+    let masked = if let Some(rest) = line.trim_start().strip_prefix("data:") {
         let payload = rest.trim();
         if payload.is_empty() || payload == "[DONE]" {
-            return line.to_string();
-        }
-        if let Ok(mut v) = serde_json::from_str::<Value>(payload) {
+            line.to_string()
+        } else if let Ok(mut v) = serde_json::from_str::<Value>(payload) {
             mask_response_obj(&mut v, alias);
-            if let Ok(s) = serde_json::to_string(&v) {
-                return format!("data: {s}");
-            }
+            serde_json::to_string(&v).map(|s| format!("data: {s}")).unwrap_or_else(|_| line.to_string())
+        } else {
+            line.to_string()
         }
+    } else {
+        line.to_string()
+    };
+    if real_slug.is_empty() {
+        masked
+    } else {
+        masked.replace(real_slug, alias)
     }
-    line.to_string()
 }
 
 #[cfg(test)]
@@ -160,7 +194,7 @@ mod tests {
             "system_fingerprint": "fp_x", "choices": [{"message": {"content": "hi"}}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 3}
         })).unwrap();
-        let out: Value = serde_json::from_slice(&mask_json_body(&body, "x7k2:q4m9")).unwrap();
+        let out: Value = serde_json::from_slice(&mask_json_body(&body, "openai/gpt-oss-120b", "x7k2:q4m9")).unwrap();
         assert_eq!(out["model"], "x7k2:q4m9");            // real slug masked to alias
         assert!(out.get("provider").is_none());            // fingerprint stripped
         assert!(out.get("system_fingerprint").is_none());
@@ -169,18 +203,37 @@ mod tests {
     }
 
     #[test]
-    fn mask_json_body_leaves_non_json_untouched() {
-        assert_eq!(mask_json_body(b"not json", "a"), b"not json");
+    fn mask_json_body_scrubs_the_slug_from_an_error_message() {
+        // The exact Groq deblind: no top-level `model` field, the real slug is inside error.message.
+        let body = serde_json::to_vec(&json!({
+            "error": {"message": "Request too large for model `openai/gpt-oss-120b` in organization `org_abc`",
+                      "code": "rate_limit_exceeded"}
+        })).unwrap();
+        let out = mask_json_body(&body, "openai/gpt-oss-120b", "x7k2:q4m9");
+        let text = String::from_utf8(out).unwrap();
+        assert!(!text.contains("openai/gpt-oss-120b"), "real slug must not survive in the error text");
+        assert!(text.contains("x7k2:q4m9"), "the alias replaces it");
+        assert!(text.contains("rate_limit_exceeded"), "the rest of the error is intact");
+    }
+
+    #[test]
+    fn mask_json_body_leaves_non_json_without_the_slug_untouched() {
+        assert_eq!(mask_json_body(b"not json", "real/slug", "a"), b"not json");
+        // but a real slug in a non-JSON body is still scrubbed
+        assert_eq!(mask_json_body(b"failed on real/slug", "real/slug", "al"), b"failed on al");
     }
 
     #[test]
     fn mask_sse_line_masks_data_frames_only() {
-        let masked = mask_sse_line(r#"data: {"model":"qwen/qwen3.6-35b-a3b","provider":"AkashML"}"#, "al:al");
+        let masked = mask_sse_line(
+            r#"data: {"model":"qwen/qwen3.6-35b-a3b","provider":"AkashML"}"#, "qwen/qwen3.6-35b-a3b", "al:al");
         let v: Value = serde_json::from_str(masked.strip_prefix("data: ").unwrap()).unwrap();
         assert_eq!(v["model"], "al:al");
         assert!(v.get("provider").is_none());
         // control frames + non-data lines pass through verbatim
-        assert_eq!(mask_sse_line("data: [DONE]", "al:al"), "data: [DONE]");
-        assert_eq!(mask_sse_line(": keep-alive", "al:al"), ": keep-alive");
+        assert_eq!(mask_sse_line("data: [DONE]", "real/slug", "al:al"), "data: [DONE]");
+        assert_eq!(mask_sse_line(": keep-alive", "real/slug", "al:al"), ": keep-alive");
+        // the slug is scrubbed even from a non-data SSE error line
+        assert_eq!(mask_sse_line("event: error real/slug", "real/slug", "al"), "event: error al");
     }
 }
