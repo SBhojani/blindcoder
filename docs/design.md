@@ -199,8 +199,13 @@ SQLite 12-step `ALTER` — which is how a `CHECK` constraint is added to an exis
 **on afterward** so the `REFERENCES` are enforced at runtime.
 
 A failed session is recorded, not silently dropped: the proxy derives an **`error_kind`** (rate
-limit / auth / 5xx / truncated / refused / …) from the upstream status and `finish_reason`, and
-stores it **with the raw HTTP `error_status`** — the tag is a *projection* over the stored ground
+limit / auth / too-large / 5xx / truncated / refused / …) from the upstream status and
+`finish_reason`, and stores it **with the raw HTTP `error_status`**. The categories are kept
+semantically distinct rather than lumped by status class — a 413 "request too large" (a context or
+per-minute-token limit) is `too_large`, not a *malformed* `bad_request` or a *transient* rate limit,
+because for a large-context workload it means the model+tier structurally cannot serve you. The
+derivation is status-based only; the raw status (and the wire archive at `replay`) preserve the finer
+cause without sniffing provider-specific error text. The tag is a *projection* over the stored ground
 truth, so a failure is diagnosable even at the `metadata` floor (where no wire archive exists) and
 the selector can learn to avoid a provider that keeps failing. Closed-set columns (`error_kind`,
 `cost_source`, `terminated_by`, `capture_level`) are Rust enums that serialize to `TEXT` and are

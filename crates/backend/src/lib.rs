@@ -70,13 +70,21 @@ impl AbortReason {
 /// the failure signal even at the `metadata` floor. A closed set — the only values `error_kind` takes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ErrorKind {
-    /// 429 / provider rate or quota limit (e.g. tokens-per-minute).
+    /// 429 — provider rate/quota throttle (requests-per-minute, daily quota). Transient by nature.
+    /// A tokens-per-minute *size* rejection arrives as 413, not 429 — see [`TooLarge`](Self::TooLarge).
     RateLimit,
     /// Upstream 5xx.
     Http5xx,
     /// 401 / 403 — bad or missing credentials.
     Auth,
-    /// Other 4xx (malformed, too large, unknown model, …) or an HTTP-200 body carrying an `error`.
+    /// 413 — the request was too large to serve: it exceeds the model's context window, or a
+    /// per-minute token budget (e.g. a free-tier TPM cap). Kept distinct from a *malformed* request
+    /// ([`BadRequest`](Self::BadRequest)) and a *transient* throttle ([`RateLimit`](Self::RateLimit)):
+    /// for an always-large-context agentic workload this means the candidate+tier structurally can't
+    /// serve you — a persistent avoid-signal, not noise. Status-derived; the raw 413 + the `replay`
+    /// WARC preserve which cause it was (we do not sniff the body).
+    TooLarge,
+    /// Other 4xx (malformed, unknown model, …) or an HTTP-200 body carrying an `error`.
     BadRequest,
     /// No HTTP response at all (connection failure / timeout).
     Network,
@@ -96,6 +104,7 @@ impl ErrorKind {
             ErrorKind::RateLimit => "rate_limit",
             ErrorKind::Http5xx => "http_5xx",
             ErrorKind::Auth => "auth",
+            ErrorKind::TooLarge => "too_large",
             ErrorKind::BadRequest => "bad_request",
             ErrorKind::Network => "network",
             ErrorKind::Truncated => "truncated",

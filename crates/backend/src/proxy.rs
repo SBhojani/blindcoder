@@ -39,7 +39,8 @@ fn classify_http(code: u16) -> ErrorKind {
     match code {
         429 => ErrorKind::RateLimit,
         401 | 403 => ErrorKind::Auth,
-        400..=499 => ErrorKind::BadRequest, // other 4xx: 400/404/413/422/…
+        413 => ErrorKind::TooLarge, // request too large: context window or a per-minute token cap
+        400..=499 => ErrorKind::BadRequest, // other 4xx: 400/404/422/…
         500..=599 => ErrorKind::Http5xx,
         // 1xx/3xx/≥600 shouldn't reach here (we only classify non-2xx final statuses; reqwest
         // follows redirects) — distinct Unknown bucket rather than mislabelling as bad_request.
@@ -674,6 +675,17 @@ mod tests {
         assert_eq!(outcome.completion_tokens, Some(5));
         assert_eq!(outcome.realized_cost, Some(0.0012));
         assert_eq!(outcome.terminated_by, None);
+    }
+
+    #[test]
+    fn classify_http_separates_too_large_from_bad_request_and_rate_limit() {
+        // 413 is its own signal (request too large / TPM cap), NOT a malformed 400 or a 429 throttle.
+        assert_eq!(classify_http(413), ErrorKind::TooLarge);
+        assert_eq!(classify_http(429), ErrorKind::RateLimit);
+        assert_eq!(classify_http(400), ErrorKind::BadRequest);
+        assert_eq!(classify_http(422), ErrorKind::BadRequest);
+        assert_eq!(classify_http(401), ErrorKind::Auth);
+        assert_eq!(classify_http(503), ErrorKind::Http5xx);
     }
 
     /// A session whose requests all fail upstream is tagged with the derived error_kind and the raw

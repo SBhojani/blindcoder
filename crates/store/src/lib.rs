@@ -79,6 +79,36 @@ fn migrations() -> Migrations<'static> {
                BEGIN SELECT RAISE(ABORT, 'append-only: sessions are immutable'); END;
              CREATE INDEX IF NOT EXISTS sessions_by_alias ON sessions(alias);",
         ),
+        // v4: widen the error_kind set with 'too_large' (413 — request exceeds the context window or
+        // a per-minute token cap; kept distinct from a malformed 'bad_request' and a transient
+        // 'rate_limit'). error_kind is the one enum-like column that grows as new failure categories
+        // are recognised, so each addition is a table rebuild — the cost of enforcing the closed set
+        // in the DB. (The Rust `ErrorKind` enum already guarantees writes are valid; the CHECK is the
+        // schema-level record of the valid set and the guard against a hand-written bad value.)
+        M::up(
+            "CREATE TABLE session_end_new (
+                 session_id        INTEGER PRIMARY KEY REFERENCES sessions(id),
+                 ended_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                 realized_cost     REAL,
+                 cost_source       TEXT CHECK (cost_source IS NULL OR cost_source IN ('provider','estimate')),
+                 prompt_tokens     INTEGER,
+                 completion_tokens INTEGER,
+                 error_kind        TEXT CHECK (error_kind IS NULL OR error_kind IN
+                     ('rate_limit','http_5xx','auth','too_large','bad_request','network','truncated','refused','unknown')),
+                 error_status      INTEGER,
+                 terminated_by     TEXT CHECK (terminated_by IS NULL OR terminated_by IN ('cost_cap','user'))
+             );
+             INSERT INTO session_end_new
+                 (session_id, ended_at, realized_cost, cost_source, prompt_tokens, completion_tokens, error_kind, error_status, terminated_by)
+               SELECT session_id, ended_at, realized_cost, cost_source, prompt_tokens, completion_tokens, error_kind, error_status, terminated_by
+               FROM session_end;
+             DROP TABLE session_end;
+             ALTER TABLE session_end_new RENAME TO session_end;
+             CREATE TRIGGER session_end_no_update BEFORE UPDATE ON session_end
+               BEGIN SELECT RAISE(ABORT, 'append-only: session_end is immutable'); END;
+             CREATE TRIGGER session_end_no_delete BEFORE DELETE ON session_end
+               BEGIN SELECT RAISE(ABORT, 'append-only: session_end is immutable'); END;",
+        ),
     ])
 }
 
@@ -528,6 +558,10 @@ mod tests {
         let sid2 = s.conn.last_insert_rowid();
         assert!(s.conn.execute("INSERT INTO session_end (session_id, error_kind) VALUES (?1,'nonsense')", [sid2]).is_err());
         assert!(s.conn.execute("INSERT INTO session_end (session_id, terminated_by) VALUES (?1,'nope')", [sid2]).is_err());
+        // v4 widened the error_kind set: 'too_large' (413) is now accepted.
+        s.conn.execute("INSERT INTO sessions (alias) VALUES ('i:j')", []).unwrap();
+        let sid3 = s.conn.last_insert_rowid();
+        s.conn.execute("INSERT INTO session_end (session_id, error_kind, error_status) VALUES (?1,'too_large',413)", [sid3]).unwrap();
 
         // (c) data preserved incl. the new error_status column.
         let (ek, es): (String, i64) = s
