@@ -184,7 +184,18 @@ ever enabled, are disposable files outside the database, referenced only by conv
 
 The schema evolves through **versioned migrations** (`rusqlite_migration`, tracked by SQLite's
 `PRAGMA user_version`): a frozen baseline plus append-only `M::up` steps, applied atomically on
-open so a database holding real ratings upgrades **in place** rather than being dropped.
+open so a database holding real ratings upgrades **in place** rather than being dropped. Foreign
+keys are toggled **off during migration** (so a migration can rebuild a *referenced* table — the
+SQLite 12-step `ALTER` — which is how a `CHECK` constraint is added to an existing column) and
+**on afterward** so the `REFERENCES` are enforced at runtime.
+
+A failed session is recorded, not silently dropped: the proxy derives an **`error_kind`** (rate
+limit / auth / 5xx / truncated / refused / …) from the upstream status and `finish_reason`, and
+stores it **with the raw HTTP `error_status`** — the tag is a *projection* over the stored ground
+truth, so a failure is diagnosable even at the `metadata` floor (where no wire archive exists) and
+the selector can learn to avoid a provider that keeps failing. Closed-set columns (`error_kind`,
+`cost_source`, `terminated_by`, `capture_level`) are Rust enums that serialize to `TEXT` and are
+`CHECK`-constrained in the DB — SQLite's enum equivalent, enforced on both sides.
 
 ## Privacy
 
