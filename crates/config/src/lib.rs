@@ -42,6 +42,18 @@ pub enum CaptureLevel {
     Replay,
 }
 
+impl CaptureLevel {
+    /// The wire/DB form (matches the serde `rename_all = "lowercase"` names and the DB `CHECK`
+    /// set). Used at the persistence seam so the enum stays the in-memory type.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            CaptureLevel::Metadata => "metadata",
+            CaptureLevel::Contents => "contents",
+            CaptureLevel::Replay => "replay",
+        }
+    }
+}
+
 /// One model offered by a provider. `canonical_key` is the provider-neutral identity the selector
 /// learns on (so the same model under two providers shares a track record); `real_slug` is what the
 /// provider's API actually expects in the request `model` field. Prices are optional — a free
@@ -205,6 +217,12 @@ pub fn default_config_path() -> Option<PathBuf> {
 /// lives here.
 pub fn default_data_dir() -> Option<PathBuf> {
     xdg_dir("XDG_DATA_HOME", ".local/share").map(|d| d.join("blindcoder"))
+}
+
+/// `$XDG_STATE_HOME/blindcoder/`, falling back to `$HOME/.local/state/...`. Disposable wire
+/// archives (the `replay` capture level) live under `wire/` here — state, not portable data.
+pub fn default_state_dir() -> Option<PathBuf> {
+    xdg_dir("XDG_STATE_HOME", ".local/state").map(|d| d.join("blindcoder"))
 }
 
 fn xdg_dir(env_key: &str, home_suffix: &str) -> Option<PathBuf> {

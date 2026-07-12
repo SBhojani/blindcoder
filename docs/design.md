@@ -177,10 +177,19 @@ scorer). The sparsity axis is what makes the go/no-go non-circular. **Conclusion
 
 ## Storage
 
-An append-only, event-sourced SQLite log. The default capture level records only the
-model↔rating↔cost↔time signal the selector needs — **no prompts or code**. Corrections
-supersede (a new row), never edit; database triggers enforce append-only. Raw wire archives, if
-ever enabled, are disposable files outside the database, referenced only by convention.
+An append-only, event-sourced SQLite log. The **capture level** (`metadata` | `contents` |
+`replay`, a config enum recorded on each session row) sets how much is kept. The default,
+`metadata`, records only the model↔rating↔cost↔time signal the selector needs — **no prompts or
+code**. Corrections supersede (a new row), never edit; database triggers enforce append-only.
+
+At `replay`, blindcoder additionally archives the **verbatim four-leg wire exchange** —
+`cli_request`, `provider_request`, `provider_response`, `cli_response` — byte-exact to a disposable
+WARC file per session, outside the database (`$XDG_STATE_HOME/blindcoder/wire/<session_id>.warc`,
+mode `0600`, referenced only by convention). The provider legs are kept **raw** (the real model
+identity and provider fingerprints intact) while the CLI legs are the **masked** copy the CLI
+actually saw, so the archive captures both sides of the blind↔real rewrite and a session is fully
+replayable and auditable. These files hold prompts and model output verbatim, so `replay` is a
+deliberate opt-in above the default privacy floor.
 
 The schema evolves through **versioned migrations** (`rusqlite_migration`, tracked by SQLite's
 `PRAGMA user_version`): a frozen baseline plus append-only `M::up` steps, applied atomically on

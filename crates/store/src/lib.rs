@@ -431,15 +431,19 @@ impl Store {
     // --- session lifecycle events ---
 
     /// Open a session row; returns its id. Start facts are immutable (append-only table).
+    /// `capture_level` is the wire form of the config `CaptureLevel` enum (CHECK-constrained to
+    /// `metadata`/`contents`/`replay`) — recorded so each session's rows carry the fidelity they
+    /// were captured at.
     pub fn record_session_start(
         &self,
         alias_display: &str,
         cli: Option<&str>,
         tuneables_json: Option<&str>,
+        capture_level: &str,
     ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO sessions (alias, cli, tuneables_json) VALUES (?1, ?2, ?3)",
-            rusqlite::params![alias_display, cli, tuneables_json],
+            "INSERT INTO sessions (alias, cli, tuneables_json, capture_level) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![alias_display, cli, tuneables_json, capture_level],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -713,7 +717,13 @@ mod tests {
     #[test]
     fn session_lifecycle_records_start_and_terminated_end() {
         let s = Store::open_in_memory().unwrap();
-        let sid = s.record_session_start("x7k2:q4m9", Some("opencode"), None).unwrap();
+        let sid = s.record_session_start("x7k2:q4m9", Some("opencode"), None, "replay").unwrap();
+        // The capture level the session was recorded at is persisted on the sessions row.
+        let cap: String = s
+            .conn
+            .query_row("SELECT capture_level FROM sessions WHERE id = ?1", [sid], |r| r.get(0))
+            .unwrap();
+        assert_eq!(cap, "replay");
         s.record_session_end(
             sid, Some(0.0), Some("provider"), Some(1200), Some(340), Some("rate_limit"), Some(429), Some("cost_cap"),
         )

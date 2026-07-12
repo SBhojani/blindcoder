@@ -14,7 +14,7 @@ use std::net::SocketAddr;
 
 use alias::{mint_token, Alias, RevealGate, RevealReason, TOKEN_LEN};
 use backend::{AbortReason, Backend, Pick, ProxyBackend, SessionEvent, UsageSnapshot};
-use config::{Config, CostBasis, ModelConfig, ProviderConfig};
+use config::{CaptureLevel, Config, CostBasis, ModelConfig, ProviderConfig};
 use selector::{
     fold_track_record, normalize_prices, pick, prune_dominated, Candidate, Rating, TrackRecord,
     Tuneables,
@@ -207,7 +207,8 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     // inside the reveal gate (the single audited crossing point) and is journaled, so the crossing
     // stays auditable and the real identity never leaks to stdout.
     let cli_label = args.command.first().map(String::as_str).unwrap_or("proxy");
-    let sid = store.record_session_start(&alias_display, Some(cli_label), None)?;
+    let sid =
+        store.record_session_start(&alias_display, Some(cli_label), None, cfg.capture_level.as_str())?;
     let route = RevealGate
         .reveal(&entry.alias, RevealReason::Routing, |a| {
             store.resolve_route(&a.display()).ok().flatten()
@@ -234,7 +235,21 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     let out_price = entry.output_per_mtok.unwrap_or(0.0);
     let cap = cfg.max_session_cost_usd;
 
-    let backend = ProxyBackend::new(bind_addr, api_key, extra_headers, extra_body)?;
+    // At the `replay` capture level, archive the raw four-leg wire exchange to a disposable WARC
+    // file outside the DB (referenced by convention, per the storage design). Gated so the default
+    // `metadata` level writes nothing — no prompts or code ever leave the process.
+    let capture_path = if cfg.capture_level >= CaptureLevel::Replay {
+        let dir = config::default_state_dir()
+            .context("cannot determine state dir (set XDG_STATE_HOME or HOME)")?
+            .join("wire");
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating wire archive dir {}", dir.display()))?;
+        Some(dir.join(format!("{sid}.warc")))
+    } else {
+        None
+    };
+
+    let backend = ProxyBackend::new(bind_addr, api_key, extra_headers, extra_body, capture_path)?;
     let pick = Pick {
         canonical_key: route.canonical_key,
         real_slug: route.real_slug,
@@ -643,7 +658,7 @@ mod tests {
         // the session with the real alias so the ratings→aliases fold join resolves (sessions are
         // append-only, so the alias is set at creation, never updated).
         let free_alias = store.alias_for("model-x", "free-prov").unwrap().unwrap().display();
-        let sid = store.record_session_start(&free_alias, None, None).unwrap();
+        let sid = store.record_session_start(&free_alias, None, None, "metadata").unwrap();
         store.record_rating(sid, 2, 0, None).unwrap();
 
         let (cands, entries) = build_pool(&store, &cfg).unwrap();

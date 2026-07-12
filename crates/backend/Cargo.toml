@@ -15,6 +15,9 @@ reqwest = { version = "0.12", default-features = false, features = ["stream", "r
 futures-util = "0.3"
 bytes = "1"
 async-stream = "0.3"
+warc = "0.4"
+chrono = "0.4"
 
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
+tempfile = "3"

@@ -55,6 +55,16 @@ max_session_cost_usd = 5.0
 # assertion is treated as stale and its models are excluded (fail-closed).
 curated_policy_max_age_days = 90
 
+# How much of each session is recorded. The default keeps only the signal the selector needs and
+# never touches your prompts or code:
+#   * "metadata" (default) — model ↔ rating ↔ cost ↔ time only, in the SQLite log. No wire data.
+#   * "contents"           — reserved for a future level.
+#   * "replay"             — additionally archive the raw four-leg wire exchange (cli/provider
+#                            request + response) byte-exact to a disposable WARC file under
+#                            $XDG_STATE_HOME/blindcoder/wire/<session_id>.warc (0600). These files
+#                            hold your prompts and the model's output verbatim — opt in knowingly.
+# capture_level = "metadata"
+
 # --- providers ------------------------------------------------------------------------------
 # Declare each backend and the models it offers. Provide the API key one of two ways:
 #   * key_env = "GROQ_API_KEY"  — name an env var holding the key (preferred; keep secrets out of
