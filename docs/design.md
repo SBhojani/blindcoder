@@ -33,6 +33,14 @@ is honest to say where it can leak:
 - **A small pool is low-entropy.** With two or three candidates, a confident guess is sometimes
   right by chance. The tokens stop *deterministic* de-anonymization (a hash wouldn't), not
   informed inference.
+- **Error messages can name the model (known gap).** Response masking rewrites the structured
+  `model` field and strips provider fingerprint keys, but a provider's *error message* is free text
+  that can embed the real slug — e.g. `Request too large for model \`vendor/model-x\` in organization
+  \`org_…\``, printed verbatim by the CLI. A failed session is never rated, so this does not bias a
+  rating directly, but it defeats blinding for the user and *would* bias a rating if an error
+  surfaced mid-session in a session they then rate. The fix (not yet shipped) is to string-replace
+  every occurrence of the real slug with the alias across the whole body — error text included — not
+  just the `model` field, and optionally redact org IDs.
 
 The design goal is therefore "don't hand you the label," not "make identification impossible."
 Peeking is always available through the reveal gate — it is just made deliberate and logged,
