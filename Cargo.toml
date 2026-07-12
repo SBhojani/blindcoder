@@ -25,7 +25,7 @@ anyhow = "1"
 rand = "0.8"
 rand_distr = "0.4"
 serde_json = "1"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process"] }
 
 [profile.release]
 lto = true

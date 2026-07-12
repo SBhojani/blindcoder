@@ -32,8 +32,8 @@ enum Cmd {
     Simulate(simulate::SimulateArgs),
     /// Grid form of `simulate`: sweep pool × exploration, CSV to stdout.
     Sweep(simulate::SweepArgs),
-    /// Pick a blinded model and record a session. (Forwarding transport lands next milestone.)
-    Run,
+    /// Launch an agentic CLI (e.g. `opencode`) on a blinded model, or run a standing proxy.
+    Run(run::RunArgs),
     /// Rate a past session after the fact (difficulty captured post-hoc; corrections supersede).
     Rate(run::RateArgs),
     /// Unmask a session's model — gated and logged. (Later milestone.)
@@ -49,7 +49,7 @@ fn main() -> anyhow::Result<()> {
     match cli.cmd {
         Cmd::Simulate(args) => simulate::run(&args, &cfg),
         Cmd::Sweep(args) => simulate::run_sweep(&args, &cfg),
-        Cmd::Run => run::run(&cfg),
+        Cmd::Run(args) => run::run(&cfg, &args),
         Cmd::Rate(args) => run::rate(&args),
         Cmd::Reveal | Cmd::Stats => {
             eprintln!(

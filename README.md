@@ -75,27 +75,35 @@ baseline, and a time-to-converge estimate, ending in a plain GO / MARGINAL / NO-
 
 ## run and rate
 
-Once you have declared a pool in your config (see [Configuration](#configuration)), `run` makes
-a blind pick and stands up a local forwarding proxy; point your OpenAI-compatible CLI at it,
-work, then end the session and `rate` how it went:
+Once you have declared a pool in your config (see [Configuration](#configuration)), the easiest
+way is **launcher mode** — hand `run` your agentic CLI and it does the rest:
+
+```sh
+blindcoder run opencode          # or: blindcoder run -- aider --some-flag
+```
+
+It makes a blind pick, stands up the pinned proxy, launches the CLI against it, and — when the CLI
+exits — records the session and asks you the two rating questions inline. **No manual CLI config:**
+it injects the endpoint via `OPENAI_BASE_URL`/`OPENAI_API_KEY`, and for OpenCode it injects a
+`blindcoder` provider (default model = the session alias) through `OPENCODE_CONFIG_CONTENT`, which
+merges into your config for that run only — nothing is written to disk. The CLI shows the blinded
+alias (e.g. `blindcoder/x7k2:q4m9`), never the real name.
+
+Prefer to drive the CLI yourself? Omit the command for **standing-proxy mode** — point any
+OpenAI-compatible client at the printed endpoint and end with Ctrl-C, then rate separately:
 
 ```sh
 blindcoder run
-#   blindcoder: routing a blinded session (picked from a pool of 4).
 #     point your OpenAI-compatible CLI at:  http://127.0.0.1:8787/v1
-#     model to request:  x7k2:q4m9   (any value works; the proxy rewrites it)
-#     cost cap:  $5.00 ...
 #     press Ctrl-C to end the session and record it.
-
 blindcoder rate --session <id> --performance 1 --difficulty 3
 ```
 
-The proxy rewrites the model on the wire to the real one, forwards to the provider, streams the
-response straight back, and tallies token usage — halting the session if the estimated spend
-reaches your `max_session_cost_usd`. It prints the blinded alias (never the real name) and the
-session id. `performance` is `-2..=2` and `difficulty` is `0..=4`; difficulty is asked *after*
-the session, against the finished work, so the rating is not anchored on an up-front guess. Made
-a mistake? Rate again with `--supersedes <old-rating-id>` — corrections supersede, never overwrite.
+Either way the proxy rewrites the model on the wire, forwards to the provider, streams the response
+back, and tallies usage — halting if spend reaches your `max_session_cost_usd`. `performance` is
+`-2..=2` and `difficulty` is `0..=4`; difficulty is asked *after* the session, against the finished
+work, so the rating is not anchored on an up-front guess. Made a mistake? Rate again with
+`--supersedes <old-rating-id>` — corrections supersede, never overwrite.
 
 > **Blinding is end-to-end:** the request `model` is rewritten to the real slug, the response
 > `model` is masked back to the alias (fingerprint fields stripped), and `GET /v1/models` returns

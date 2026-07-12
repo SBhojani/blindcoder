@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use alias::{mint_token, Alias, RevealGate, RevealReason, TOKEN_LEN};
-use backend::{AbortReason, Backend, Pick, ProxyBackend, SessionEvent};
+use backend::{AbortReason, Backend, Pick, ProxyBackend, SessionEvent, UsageSnapshot};
 use config::{Config, CostBasis, ModelConfig, ProviderConfig};
 use selector::{
     fold_track_record, normalize_prices, pick, prune_dominated, Candidate, Rating, TrackRecord,
@@ -178,9 +178,10 @@ fn choose<R: Rng + ?Sized>(cands: &[Candidate], t: &Tuneables, rng: &mut R) -> u
     active[pick(&sub, t, rng)]
 }
 
-/// `blindcoder run`: pick a blinded model, stand up the forwarding proxy, drive the session (cost
-/// cap + Ctrl-C), and record it. Point your OpenAI-compatible CLI at the printed endpoint.
-pub fn run(cfg: &Config) -> Result<()> {
+/// `blindcoder run [cli args…]`: pick a blinded model and stand up the forwarding proxy. With a
+/// command, launch it against the proxy (session ends when it exits, then rate inline); without
+/// one, run a standing proxy you point a CLI at yourself (end with Ctrl-C).
+pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     let store = open_store()?;
     let mut rng = rand::thread_rng();
 
@@ -205,7 +206,8 @@ pub fn run(cfg: &Config) -> Result<()> {
     // The one place blind→real happens: routing needs the real routing target. The lookup runs
     // inside the reveal gate (the single audited crossing point) and is journaled, so the crossing
     // stays auditable and the real identity never leaks to stdout.
-    let sid = store.record_session_start(&alias_display, Some("proxy"), None)?;
+    let cli_label = args.command.first().map(String::as_str).unwrap_or("proxy");
+    let sid = store.record_session_start(&alias_display, Some(cli_label), None)?;
     let route = RevealGate
         .reveal(&entry.alias, RevealReason::Routing, |a| {
             store.resolve_route(&a.display()).ok().flatten()
@@ -244,7 +246,7 @@ pub fn run(cfg: &Config) -> Result<()> {
         .build()
         .context("building the async runtime")?;
     let outcome = runtime.block_on(drive_session(
-        &backend, &pick, &alias_display, entries.len(), cap, in_price, out_price,
+        &backend, &pick, &alias_display, entries.len(), cap, in_price, out_price, &args.command,
     ))?;
 
     // Record the terminal event: how it ended, and the realized cost — the provider-reported figure
@@ -273,8 +275,71 @@ pub fn run(cfg: &Config) -> Result<()> {
     println!(
         "\nsession #{sid} {ended}: {prompt_tokens} in + {completion_tokens} out tokens, ${realized_cost:.4} ({cost_source})."
     );
-    println!("  rate it:  blindcoder rate --session {sid} --performance <-2..2> --difficulty <0..4>");
+
+    // Launcher mode ends when the CLI exits → rate inline (still blind). Standing mode leaves it to
+    // the `rate` subcommand.
+    if !args.command.is_empty() && !args.no_rate {
+        if let Err(e) = prompt_and_rate(&store, sid) {
+            eprintln!("  (rating skipped: {e})");
+            println!("  rate later:  blindcoder rate --session {sid} --performance <-2..2> --difficulty <0..4>");
+        }
+    } else {
+        println!("  rate it:  blindcoder rate --session {sid} --performance <-2..2> --difficulty <0..4>");
+    }
     Ok(())
+}
+
+/// Prompt the two blind ratings on stdin after a launched session and record them. Enter on the
+/// first question skips rating entirely.
+fn prompt_and_rate(store: &Store, sid: i64) -> Result<()> {
+    let Some(performance) = prompt_int("  how did it perform?  [-2..2, Enter to skip]: ", -2, 2)? else {
+        println!("  rating skipped.");
+        return Ok(());
+    };
+    let difficulty = prompt_int("  how hard was the task?  [0..4]: ", 0, 4)?.unwrap_or(0);
+    let id = store.record_rating(sid, performance, difficulty, None)?;
+    println!("  recorded rating #{id}.");
+    Ok(())
+}
+
+/// Read an integer in `[lo, hi]` from stdin, re-prompting on bad input. `None` = empty line / EOF.
+fn prompt_int(msg: &str, lo: i64, hi: i64) -> Result<Option<i64>> {
+    use std::io::Write;
+    loop {
+        print!("{msg}");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line)? == 0 {
+            return Ok(None); // EOF
+        }
+        let s = line.trim();
+        if s.is_empty() {
+            return Ok(None);
+        }
+        match s.parse::<i64>() {
+            Ok(v) if (lo..=hi).contains(&v) => return Ok(Some(v)),
+            _ => println!("  please enter a whole number in [{lo}..{hi}]."),
+        }
+    }
+}
+
+/// The OpenCode provider config injected via `OPENCODE_CONFIG_CONTENT` (merged into the user's
+/// config for this child only — nothing is written to disk). A `blindcoder` provider points at the
+/// proxy, and the model is keyed by the session **alias** so OpenCode displays the blinded identity
+/// (e.g. `blindcoder/x7k2:q4m9`) and uses it by default — no manual config needed.
+fn opencode_config_content(base_url: &str, alias: &str) -> String {
+    serde_json::json!({
+        "provider": {
+            "blindcoder": {
+                "npm": "@ai-sdk/openai-compatible",
+                "name": "blindcoder (blind router)",
+                "options": { "baseURL": base_url, "apiKey": "blindcoder" },
+                "models": { alias: { "name": alias } }
+            }
+        },
+        "model": format!("blindcoder/{alias}")
+    })
+    .to_string()
 }
 
 /// Estimate USD cost from token counts and per-Mtok shelf prices.
@@ -283,8 +348,15 @@ fn cost_usd(prompt_tokens: u64, completion_tokens: u64, in_price: f64, out_price
         + (completion_tokens as f64 / 1_000_000.0) * out_price
 }
 
-/// Stand up the proxy, print how to point a CLI at it, then run the driver loop until the session
-/// ends naturally, the cost cap fires, or the user hits Ctrl-C. Returns the terminal outcome.
+/// Spend so far for the cap: provider-reported cost when the transport captured one, else estimate.
+fn spent_of(u: &UsageSnapshot, in_price: f64, out_price: f64) -> f64 {
+    u.cost_so_far
+        .unwrap_or_else(|| cost_usd(u.prompt_tokens, u.completion_tokens, in_price, out_price))
+}
+
+/// Stand up the proxy and drive the session. With a `command`, launch it against the proxy and end
+/// when it exits; otherwise run a standing proxy the user points a CLI at (end with Ctrl-C). The
+/// cost cap fires in either mode. Returns the terminal outcome.
 async fn drive_session(
     backend: &ProxyBackend,
     pick: &Pick,
@@ -293,55 +365,110 @@ async fn drive_session(
     cap: f64,
     in_price: f64,
     out_price: f64,
+    command: &[String],
 ) -> Result<backend::SessionOutcome> {
     let mut sess = backend.start(pick, alias_display).await?;
     let endpoint = sess
         .endpoint()
         .map(|a| a.to_string())
         .unwrap_or_else(|| "the configured proxy_addr".to_string());
+    let base_url = format!("http://{endpoint}/v1");
 
-    println!("blindcoder: routing a blinded session (picked from a pool of {pool_size}).");
-    println!("  point your OpenAI-compatible CLI at:  http://{endpoint}/v1");
-    println!("  model to request:  {alias_display}   (any value works; the proxy rewrites it)");
-    if cap > 0.0 {
-        println!("  cost cap:  ${cap:.2} (session is halted if the estimate reaches it)");
-    }
-    println!("  press Ctrl-C to end the session and record it.");
+    if command.is_empty() {
+        // Standing-proxy mode: the user points a CLI at us and ends with Ctrl-C.
+        println!("blindcoder: routing a blinded session (picked from a pool of {pool_size}).");
+        println!("  point your OpenAI-compatible CLI at:  {base_url}");
+        println!("  model to request:  {alias_display}   (any value works; the proxy rewrites it)");
+        if cap > 0.0 {
+            println!("  cost cap:  ${cap:.2} (session is halted if the estimate reaches it)");
+        }
+        println!("  press Ctrl-C to end the session and record it.");
 
-    let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
-    let mut aborting = false;
-    loop {
-        let mut abort_reason = None;
-        tokio::select! {
-            event = sess.next_event() => match event? {
-                SessionEvent::Usage(u) => {
-                    if !aborting && cap > 0.0 {
-                        // Provider-reported cost when the transport captured one; else estimate.
-                        let spent = u
-                            .cost_so_far
-                            .unwrap_or_else(|| cost_usd(u.prompt_tokens, u.completion_tokens, in_price, out_price));
-                        if spent >= cap {
+        let mut ctrl_c = std::pin::pin!(tokio::signal::ctrl_c());
+        let mut aborting = false;
+        loop {
+            let mut abort_reason = None;
+            tokio::select! {
+                event = sess.next_event() => match event? {
+                    SessionEvent::Usage(u) => {
+                        if !aborting && cap > 0.0 && spent_of(&u, in_price, out_price) >= cap {
                             abort_reason = Some(AbortReason::CostCap);
                         }
                     }
+                    SessionEvent::Ended => break,
+                },
+                _ = &mut ctrl_c, if !aborting => { abort_reason = Some(AbortReason::User); }
+            }
+            if let Some(reason) = abort_reason {
+                aborting = true;
+                match reason {
+                    AbortReason::CostCap => eprintln!("cost cap ${cap:.2} reached — stopping session."),
+                    AbortReason::User => eprintln!("\nstopping session…"),
                 }
-                SessionEvent::Ended => break,
-            },
-            _ = &mut ctrl_c, if !aborting => {
-                abort_reason = Some(AbortReason::User);
+                sess.abort(reason).await;
             }
         }
-        if let Some(reason) = abort_reason {
-            aborting = true;
-            match reason {
-                AbortReason::CostCap => eprintln!("cost cap ${cap:.2} reached — stopping session."),
-                AbortReason::User => eprintln!("\nstopping session…"),
-            }
-            sess.abort(reason).await;
+    } else {
+        // Launcher mode: spawn the CLI against the proxy (env injects the endpoint + an OpenCode
+        // provider so no manual config is needed); the session ends when the CLI exits.
+        let mut cmd = tokio::process::Command::new(&command[0]);
+        cmd.args(&command[1..])
+            .env("OPENAI_BASE_URL", &base_url)
+            .env("OPENAI_API_KEY", "blindcoder")
+            .env("OPENCODE_CONFIG_CONTENT", opencode_config_content(&base_url, alias_display));
+        let mut child = cmd
+            .spawn()
+            .with_context(|| format!("failed to launch `{}`", command[0]))?;
+        println!(
+            "blindcoder: launched `{}` on a blinded session (pool of {pool_size}); ends when it exits.",
+            command[0]
+        );
+        println!("  model shown in the CLI:  blindcoder/{alias_display}");
+        if cap > 0.0 {
+            println!("  cost cap:  ${cap:.2}");
         }
+
+        let mut aborting = false;
+        loop {
+            let mut ended = false;
+            let mut abort_reason = None;
+            tokio::select! {
+                _ = child.wait() => { ended = true; }
+                event = sess.next_event() => match event? {
+                    SessionEvent::Usage(u) => {
+                        if !aborting && cap > 0.0 && spent_of(&u, in_price, out_price) >= cap {
+                            abort_reason = Some(AbortReason::CostCap);
+                        }
+                    }
+                    SessionEvent::Ended => { ended = true; }
+                },
+            }
+            if let Some(reason) = abort_reason {
+                aborting = true;
+                eprintln!("\nblindcoder: cost cap ${cap:.2} reached — terminating `{}`.", command[0]);
+                sess.abort(reason).await;
+                let _ = child.start_kill();
+            }
+            if ended {
+                break;
+            }
+        }
+        let _ = child.kill().await; // reap if still running
     }
 
     sess.finish().await
+}
+
+/// `blindcoder run [cli args…]` arguments.
+#[derive(Args)]
+pub struct RunArgs {
+    /// Agentic CLI to launch on the blinded model (e.g. `opencode`), with its args. The session
+    /// ends when the CLI exits and you rate it inline. Omit to run a standing proxy instead.
+    #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+    pub command: Vec<String>,
+    /// In launcher mode, skip the end-of-session rating prompt.
+    #[arg(long)]
+    pub no_rate: bool,
 }
 
 /// `blindcoder rate`: append a performance/difficulty rating for a past session (difficulty is
