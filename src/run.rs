@@ -13,11 +13,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use alias::{mint_token, Alias, RevealGate, RevealReason, TOKEN_LEN};
-use backend::{AbortReason, Backend, Pick, ProxyBackend, SessionEvent, UsageSnapshot};
+use backend::{AbortReason, Backend, ErrorKind, Pick, ProxyBackend, SessionEvent, UsageSnapshot};
 use config::{CaptureLevel, Config, CostBasis, ModelConfig, ProviderConfig};
 use selector::{
-    fold_track_record, normalize_prices, pick, prune_dominated, Candidate, Rating, TrackRecord,
-    Tuneables,
+    fold_track_record_with_failures, normalize_prices, pick, prune_dominated, Candidate, Failure,
+    Rating, TrackRecord, Tuneables,
 };
 use store::Store;
 
@@ -138,6 +138,22 @@ fn build_pool(store: &Store, cfg: &Config) -> Result<(Vec<Candidate>, Vec<PoolEn
         });
     }
 
+    // Failed sessions also inform the belief (a crash is never rated). Map each error_kind to its
+    // loss weight here — the policy layer — so the selector stays free of error semantics. An
+    // unrecognised tag falls back to the `unknown` weight rather than being dropped.
+    let mut fails_by_key: HashMap<String, Vec<Failure>> = HashMap::new();
+    for f in store.effective_failures_aged()? {
+        let loss_weight = ErrorKind::from_wire(&f.error_kind)
+            .unwrap_or(ErrorKind::Unknown)
+            .loss_weight();
+        fails_by_key.entry(f.canonical_key).or_default().push(Failure {
+            loss_weight,
+            age_days: f.age_days,
+        });
+    }
+    let no_ratings: Vec<Rating> = Vec::new();
+    let no_fails: Vec<Failure> = Vec::new();
+
     let mut entries = Vec::new();
     for p in &cfg.providers {
         for m in &p.models {
@@ -160,10 +176,13 @@ fn build_pool(store: &Store, cfg: &Config) -> Result<(Vec<Candidate>, Vec<PoolEn
         .iter()
         .enumerate()
         .map(|(i, e)| {
-            let track = by_key
-                .get(&e.canonical_key)
-                .map(|rs| fold_track_record(rs, &t))
-                .unwrap_or_else(TrackRecord::blank);
+            let ratings = by_key.get(&e.canonical_key).unwrap_or(&no_ratings);
+            let failures = fails_by_key.get(&e.canonical_key).unwrap_or(&no_fails);
+            let track = if ratings.is_empty() && failures.is_empty() {
+                TrackRecord::blank()
+            } else {
+                fold_track_record_with_failures(ratings, failures, &t)
+            };
             Candidate { id: i, track, normalized_price: norm[i] }
         })
         .collect();
@@ -670,5 +689,38 @@ mod tests {
             cands[paid_i].track.mean(),
             "the track record is shared across providers for one canonical_key"
         );
+    }
+
+    #[test]
+    fn a_failed_session_drags_the_shared_track_record_down() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = mixed_pool_config();
+        let mut rng = StdRng::seed_from_u64(4);
+        seed_pool(&store, &cfg, &mut rng).unwrap();
+
+        // A too_large failure on the free provider's alias — never rated, but it must still be learned
+        // against, keyed on canonical_key so both providers' entries for the model see it.
+        let free_alias = store.alias_for("model-x", "free-prov").unwrap().unwrap().display();
+        let sid = store.record_session_start(&free_alias, None, None, "metadata").unwrap();
+        store
+            .record_session_end(sid, Some(0.0), Some("estimate"), Some(0), Some(0),
+                                Some(ErrorKind::TooLarge.as_str()), Some(413), None)
+            .unwrap();
+
+        let (cands, entries) = build_pool(&store, &cfg).unwrap();
+        let free_i = entries.iter().position(|e| e.provider_slug == "free-prov").unwrap();
+        let paid_i = entries.iter().position(|e| e.provider_slug == "paid-prov").unwrap();
+        assert!(cands[free_i].track.mean() < 0.5, "a failure drags the track record below the prior");
+        assert_eq!(
+            cands[free_i].track.mean(),
+            cands[paid_i].track.mean(),
+            "the failure is shared across providers for one canonical_key"
+        );
+
+        // failure_sensitivity = 0 makes it inert: the candidate is back at the blank prior.
+        let mut cfg0 = cfg.clone();
+        cfg0.failure_sensitivity = 0.0;
+        let (cands0, _) = build_pool(&store, &cfg0).unwrap();
+        assert!((cands0[free_i].track.mean() - 0.5).abs() < 1e-12, "sensitivity 0 ignores failures");
     }
 }

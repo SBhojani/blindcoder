@@ -40,6 +40,11 @@ pub struct Tuneables {
     /// conservative (prunes less); a candidate is dropped only if its optimistic value still
     /// trails the strongest candidate's pessimistic value at this width.
     pub prune_confidence: f64,
+    /// Global scale on failure evidence. Each failed session adds `loss_weight * failure_sensitivity`
+    /// (decayed) to the candidate's losses. 0 = ignore failures entirely; 1 = a full-weight failure
+    /// counts like a lost session. The per-failure `loss_weight` (transient vs structural) is the
+    /// caller's policy — the selector stays free of `error_kind` semantics.
+    pub failure_sensitivity: f64,
 }
 
 impl Default for Tuneables {
@@ -53,6 +58,7 @@ impl Default for Tuneables {
             exploration: 0.4,
             score_spread: 2.0,
             prune_confidence: 2.0,
+            failure_sensitivity: 1.0,
         }
     }
 }
@@ -66,6 +72,18 @@ pub struct Rating {
     /// How hard the task was, in `0..=4`.
     pub difficulty_points: f64,
     /// Age of this rating in days, at the moment of the fold.
+    pub age_days: f64,
+}
+
+/// A failed session, folded into a track record as loss evidence. Unlike a [`Rating`] it carries no
+/// user judgement — a crash is never rated — so it contributes pure losses. `loss_weight` encodes how
+/// much this *kind* of failure should count (the caller's policy: a persistent `too_large` ~1.0, a
+/// transient rate-limit ~0.15, an our-fault auth error ~0.0); the selector never sees `error_kind`.
+#[derive(Clone, Copy, Debug)]
+pub struct Failure {
+    /// How strongly this failure counts against the candidate, in `0..=1` before `failure_sensitivity`.
+    pub loss_weight: f64,
+    /// Age of this failure in days, at the moment of the fold (recency-decayed like ratings).
     pub age_days: f64,
 }
 
@@ -115,12 +133,29 @@ impl TrackRecord {
 /// half-life of `rating_half_life_days`. This is the event-sourced belief: no mutable state, a
 /// pure function of the events.
 pub fn fold_track_record(ratings: &[Rating], t: &Tuneables) -> TrackRecord {
+    fold_track_record_with_failures(ratings, &[], t)
+}
+
+/// Fold rating events **and failed-session events** into a track record. Ratings contribute
+/// wins/losses as in [`fold_track_record`]; each [`Failure`] adds decayed losses of
+/// `loss_weight * failure_sensitivity` and no wins — so a candidate that keeps failing sinks in its
+/// Beta posterior and Thompson picks it less, while recency decay lets it climb back if the failures
+/// stop. No arbitrary strike threshold; `failure_sensitivity = 0` disables the whole effect.
+pub fn fold_track_record_with_failures(
+    ratings: &[Rating],
+    failures: &[Failure],
+    t: &Tuneables,
+) -> TrackRecord {
     let mut tr = TrackRecord::blank();
     for r in ratings {
         let decay = 0.5_f64.powf(r.age_days / t.rating_half_life_days);
         let s = session_score(r, t);
         tr.wins += s * decay;
         tr.losses += (1.0 - s) * decay;
+    }
+    for f in failures {
+        let decay = 0.5_f64.powf(f.age_days / t.rating_half_life_days);
+        tr.losses += f.loss_weight * t.failure_sensitivity * decay;
     }
     tr
 }
@@ -247,6 +282,34 @@ mod tests {
         let fresh_gain = fresh.wins - PRIOR;
         let old_gain = old.wins - PRIOR;
         assert!((old_gain - fresh_gain * 0.5).abs() < 1e-9);
+    }
+
+    #[test]
+    fn failures_lower_quality_and_sensitivity_disables_them() {
+        let t = Tuneables::default();
+        let rating = Rating { performance_points: 2.0, difficulty_points: 0.0, age_days: 0.0 };
+        let clean = fold_track_record(&[rating], &t);
+        // Same rating, but the candidate also failed hard three times → lower posterior mean.
+        let fails = [Failure { loss_weight: 1.0, age_days: 0.0 }; 3];
+        let with_fails = fold_track_record_with_failures(&[rating], &fails, &t);
+        assert!(with_fails.mean() < clean.mean(), "failures must drag the quality belief down");
+        assert!(with_fails.losses > clean.losses);
+        // failure_sensitivity = 0 makes failures inert (back to the clean record).
+        let t0 = Tuneables { failure_sensitivity: 0.0, ..t };
+        let disabled = fold_track_record_with_failures(&[rating], &fails, &t0);
+        assert_eq!(disabled.losses, clean.losses);
+        assert_eq!(disabled.wins, clean.wins);
+    }
+
+    #[test]
+    fn failures_decay_with_age() {
+        let t = Tuneables::default();
+        let fresh = fold_track_record_with_failures(
+            &[], &[Failure { loss_weight: 1.0, age_days: 0.0 }], &t);
+        let old = fold_track_record_with_failures(
+            &[], &[Failure { loss_weight: 1.0, age_days: t.rating_half_life_days }], &t);
+        // An aged failure adds half the loss mass (above the prior) of a fresh one.
+        assert!(((old.losses - PRIOR) - (fresh.losses - PRIOR) * 0.5).abs() < 1e-9);
     }
 
     #[test]

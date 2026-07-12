@@ -124,6 +124,16 @@ pub struct AgedRating {
     pub age_days: f64,
 }
 
+/// A failed session resolved to the model it ran on, with age in days — the loss-evidence
+/// counterpart of [`AgedRating`]. `error_kind` is the raw wire tag; the caller maps it to a
+/// loss weight (the selector never sees the string).
+#[derive(Clone, Debug, PartialEq)]
+pub struct AgedFailure {
+    pub canonical_key: String,
+    pub error_kind: String,
+    pub age_days: f64,
+}
+
 /// A resolved routing target for an alias: everything the transport needs to forward one request.
 /// The proxy reaches this only through the reveal gate (reason: routing) — it is the single place
 /// an alias becomes a real identity.
@@ -290,6 +300,33 @@ impl Store {
                     performance_points: r.get::<_, i64>(1)? as f64,
                     difficulty_points: r.get::<_, i64>(2)? as f64,
                     age_days: r.get::<_, f64>(3)?.max(0.0),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    /// Failed sessions (a non-null `error_kind`) resolved to the model they ran on, with age in days
+    /// — the loss-evidence counterpart of [`effective_ratings_aged`](Self::effective_ratings_aged).
+    /// Feeds the selector's failure fold so a candidate that keeps failing is learned-against even
+    /// though a crash is never rated.
+    pub fn effective_failures_aged(&self) -> Result<Vec<AgedFailure>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.canonical_key,
+                    e.error_kind,
+                    julianday('now') - julianday(e.ended_at) AS age_days
+             FROM session_end e
+             JOIN sessions s ON s.id = e.session_id
+             JOIN aliases  a ON a.alias = s.alias
+             WHERE e.error_kind IS NOT NULL
+             ORDER BY e.ended_at ASC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(AgedFailure {
+                    canonical_key: r.get(0)?,
+                    error_kind: r.get(1)?,
+                    age_days: r.get::<_, f64>(2)?.max(0.0),
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;

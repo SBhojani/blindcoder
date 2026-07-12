@@ -112,6 +112,44 @@ impl ErrorKind {
             ErrorKind::Unknown => "unknown",
         }
     }
+
+    /// Parse the wire/DB form back into the enum (inverse of [`as_str`](Self::as_str)); `None` for an
+    /// unrecognised value (e.g. a category from a newer version).
+    pub fn from_wire(s: &str) -> Option<ErrorKind> {
+        Some(match s {
+            "rate_limit" => ErrorKind::RateLimit,
+            "http_5xx" => ErrorKind::Http5xx,
+            "auth" => ErrorKind::Auth,
+            "too_large" => ErrorKind::TooLarge,
+            "bad_request" => ErrorKind::BadRequest,
+            "network" => ErrorKind::Network,
+            "truncated" => ErrorKind::Truncated,
+            "refused" => ErrorKind::Refused,
+            "unknown" => ErrorKind::Unknown,
+            _ => return None,
+        })
+    }
+
+    /// How strongly a failure of this kind should count against a candidate in the selector's fold,
+    /// in `0..=1`. This is the transient-vs-structural policy: a persistent, workload-fatal failure
+    /// (the candidate+tier genuinely cannot serve you) counts near a full lost session; a transient
+    /// backend hiccup counts little (recency decay clears it); an our-fault error counts nothing
+    /// (the model is blameless). The selector applies its own `failure_sensitivity` on top.
+    pub fn loss_weight(&self) -> f64 {
+        match self {
+            // Structural / persistent for this workload — a real "avoid this candidate" signal.
+            ErrorKind::TooLarge => 1.0,
+            ErrorKind::Refused => 0.75,
+            // Partial / config-adjacent.
+            ErrorKind::Truncated => 0.4,
+            // Unclassified anomaly — mild.
+            ErrorKind::Unknown => 0.25,
+            // Transient backend conditions — lean on decay, don't tank a good model.
+            ErrorKind::RateLimit | ErrorKind::Http5xx | ErrorKind::Network => 0.15,
+            // Our fault, not the model's — no penalty.
+            ErrorKind::Auth | ErrorKind::BadRequest => 0.0,
+        }
+    }
 }
 
 /// What a finished session reports back — the `metadata`-floor signal the selector learns from.
