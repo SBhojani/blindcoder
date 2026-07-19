@@ -183,6 +183,10 @@ impl Store {
     /// `REFERENCES` are actually enforced at runtime. (The baseline's in-schema `PRAGMA foreign_keys`
     /// is a no-op because it runs inside the migration transaction — this is where FK state is set.)
     fn migrate(conn: &mut Connection) -> Result<()> {
+        // WAL is a connection/db-level setting, not schema, and `PRAGMA journal_mode = WAL` cannot
+        // run inside a transaction — so it must be here, not in the baseline schema (which runs as
+        // migration 1 inside `to_latest`'s transaction). A no-op for `:memory:` connections.
+        conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "foreign_keys", false)?;
         migrations().to_latest(conn)?;
         conn.pragma_update(None, "foreign_keys", true)?;

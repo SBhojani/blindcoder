@@ -12,8 +12,10 @@
 --     model <-> rating <-> cost <-> time signal the selector needs. Raw bytes (at `replay`) live
 --     in disposable WARC files outside the DB, located by convention, never referenced by a row.
 
-PRAGMA journal_mode = WAL;
-PRAGMA foreign_keys = ON;
+-- Connection-level PRAGMAs (journal_mode = WAL, foreign_keys) are NOT set here: this schema runs
+-- as migration 1 inside a transaction, and `PRAGMA journal_mode = WAL` cannot run inside one
+-- ("cannot change into wal mode from within a transaction"). They are applied outside the
+-- transaction in `Store::migrate`.
 
 -- Backends. `policy_source` records where the data-policy verdict came from ('api' | 'curated');
 -- `verified_at` timestamps a hand-maintained (curated) assertion so it can expire (fail-closed).
