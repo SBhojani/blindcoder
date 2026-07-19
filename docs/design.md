@@ -235,18 +235,36 @@ the selector can learn to avoid a provider that keeps failing. Closed-set column
 
 ## Privacy
 
-Route only to endpoints that do not retain or train on your prompts, and make that structural:
+Route only to endpoints that do not retain or train on your prompts, and make that structural.
 
-- **Fail-closed eligibility** — unknown data policy means excluded, as a hard filter.
-- **Type-enforced forwarding** — the transport accepts only a vetted endpoint value, so sending
-  to an un-vetted endpoint does not compile. The wire log *witnesses* enforcement; the types
-  *guarantee* it.
+**Privacy is the one place blindcoder is provider-aware — deliberately.** Everywhere else, providers
+differ only in *data* (base URL, slug, key, price), so the code stays generic and branch-free. But
+the mechanism for *guaranteeing* Zero-Data-Retention genuinely differs per vendor — OpenRouter takes
+a per-request body flag, Groq is an account-level console setting, others use headers — and it is a
+security boundary where a wrong setting must fail **closed**, not open. So each provider's protocol is
+an explicit, exhaustively-matched `Privacy` variant (adding a provider won't compile until its
+protocol is written and reviewed). Provider *names* appear here, and only here.
+
+- **Fail-closed eligibility** — the whole configured pool is validated before any pick. A provider
+  with no `privacy` declaration, a declaration whose `base_url` host isn't that provider's real
+  endpoint (an account-level attestation is only meaningful for the endpoint it was verified on), a
+  foreign or unknown attestation key, or an un-attested manual-setup protocol → the run aborts.
+- **Type-enforced forwarding** — the only way to obtain the `VettedRequest` the transport sends is
+  the gate (`VettedEndpoint::prepare`) that applies the protocol's per-request injection; the send
+  path accepts only a `VettedRequest`. So a body cannot reach the wire without the injection — it does
+  not compile otherwise. The wire log *witnesses* enforcement; the types *guarantee* it.
+- **Attested manual setup** — where a protocol depends on setup blindcoder can't see on the wire
+  (e.g. enabling ZDR in the Groq console), it fails closed until the operator sets a **provider-named,
+  undocumented** attestation key (e.g. `groq_manual_steps_done`). The key is revealed *only* by the
+  fail-closed error, so it can't be a copied default — it must be a deliberate act after reading the
+  steps, and one provider's key set on another is a detectable error.
 
 ## Milestones
 
 - **M0** — the permanent core (selector · store · config · alias), `simulate`, and `run`/`rate`
   over a streaming forwarding proxy (real blind pick, live proxying, cost cap, session logging).
-- **M1** — the production proxy: raw-capture tee, fail-closed per-request privacy.
+- **M1** — the production proxy: fail-closed, type-enforced per-request privacy (shipped); raw-capture
+  tee for mid-stream usage accounting (remaining).
 - **M2** — capture levels, byte-exact wire archives, a standing serve mode.
 - **M3** — many providers, subscription cap-safety, optional whole-market price tracking.
 

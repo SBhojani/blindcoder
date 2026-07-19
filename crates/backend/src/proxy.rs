@@ -1,12 +1,13 @@
 //! The M0 forwarding transport: a small streaming reverse proxy behind the `Backend`/`Session`
 //! seam. It binds a localhost listener, and for each request rewrites the blind `model` to the
-//! resolved real slug (via [`rewrite_request`]), forwards to the provider endpoint with the API
-//! key and any `extra_headers`, streams the response straight back to the caller, and — after each
-//! response completes — parses the `usage` block to accumulate token counts. Those counts surface
-//! as `Usage` events so the router's cost cap can act on them.
+//! resolved real slug and applies the per-request privacy injection — both via the privacy gate
+//! `VettedEndpoint::prepare`, the sole way to obtain the `VettedRequest` this transport forwards.
+//! It sends to the provider endpoint with the API key and any `extra_headers`, streams the response
+//! straight back to the caller, and — after each response completes — parses the `usage` block to
+//! accumulate token counts. Those counts surface as `Usage` events so the router's cost cap can act.
 //!
 //! It is provider-blind: nothing here branches on which backend it talks to. The M1 tee grows from
-//! this same shape (raw capture + fail-closed privacy) behind the unchanged trait.
+//! this same shape (raw capture + type-enforced privacy) behind the unchanged trait.
 
 use std::net::SocketAddr;
 use std::os::unix::fs::PermissionsExt;
@@ -31,9 +32,12 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use warc::{RecordBuilder, RecordType, WarcHeader, WarcWriter};
 
-use crate::rewrite::{mask_json_body, mask_sse_line, parse_usage, rewrite_request};
+use config::Privacy;
+
+use crate::rewrite::{mask_json_body, mask_sse_line, parse_usage};
 use crate::{
     AbortReason, Backend, ErrorKind, Pick, Session, SessionEvent, SessionOutcome, UsageSnapshot,
+    VettedRequest,
 };
 
 /// Map an upstream HTTP status to an [`ErrorKind`] (for the "no clean completion" case).
@@ -58,6 +62,9 @@ pub struct ProxyBackend {
     api_key: Option<String>,
     extra_headers: Vec<(String, String)>,
     extra_body: serde_json::Map<String, Value>,
+    /// The provider's privacy protocol, applied to every forwarded request (the pool build
+    /// guarantees only an eligible, host-matched provider reaches here).
+    privacy: Privacy,
     capture_path: Option<PathBuf>,
     client: reqwest::Client,
 }
@@ -71,6 +78,7 @@ impl ProxyBackend {
         api_key: Option<String>,
         extra_headers: Vec<(String, String)>,
         extra_body: serde_json::Map<String, Value>,
+        privacy: Privacy,
         capture_path: Option<PathBuf>,
     ) -> Result<Self> {
         Ok(Self {
@@ -78,12 +86,22 @@ impl ProxyBackend {
             api_key,
             extra_headers,
             extra_body,
+            privacy,
             capture_path,
             client: reqwest::Client::builder()
                 .build()
                 .context("building HTTP client")?,
         })
     }
+}
+
+/// The one and only outbound send. It takes a [`VettedRequest`], so no code path can forward a body
+/// that skipped [`crate::VettedEndpoint::prepare`]'s privacy injection — the type is the guarantee.
+async fn forward(
+    req: reqwest::RequestBuilder,
+    vetted: VettedRequest,
+) -> reqwest::Result<reqwest::Response> {
+    req.body(vetted.into_body()).send().await
 }
 
 /// One captured leg of an exchange, sent to the WARC writer task. The four legs of the spec's raw
@@ -244,7 +262,10 @@ impl Cumulative {
 
 /// Everything a request handler needs to forward and account one call.
 struct ProxyState {
-    base_url: String,
+    /// The forwarding target and the sole factory for the [`VettedRequest`] the handler sends.
+    endpoint: crate::VettedEndpoint,
+    /// The provider's privacy basis, applied by `endpoint.prepare` to every request.
+    privacy: Privacy,
     real_slug: String,
     alias: String,
     api_key: Option<String>,
@@ -345,16 +366,14 @@ async fn proxy_handler(
         None => path,
     };
     let query = uri.query().map(|q| format!("?{q}")).unwrap_or_default();
-    let url = format!("{}{}{}", st.base_url, suffix, query);
+    let url = format!("{}{}{}", st.endpoint.url(), suffix, query);
 
-    // Rewrite only a JSON body that carries a model field; forward anything else untouched.
-    let out_body: Vec<u8> = match serde_json::from_slice::<Value>(&body) {
-        Ok(mut v) if v.get("model").is_some() => {
-            let _ = rewrite_request(&mut v, &st.real_slug, &st.extra_body);
-            serde_json::to_vec(&v).unwrap_or_else(|_| body.to_vec())
-        }
-        _ => body.to_vec(),
-    };
+    // The privacy gate: rewrite the model, merge `extra_body`, and apply the per-request privacy
+    // injection. This is the *only* way to obtain a `VettedRequest`, and the send below accepts only
+    // one — so a body cannot reach the wire without the injection. (Non-model bodies pass through.)
+    let vetted = st
+        .endpoint
+        .prepare(&body, &st.real_slug, &st.extra_body, st.privacy);
 
     // Capture legs 1–2 (request side) at the `replay` level, before sending.
     let exchange = st.exchange_seq.fetch_add(1, Ordering::Relaxed);
@@ -371,11 +390,11 @@ async fn proxy_handler(
             leg: "provider_request",
             warc_type: RecordType::Request,
             target_uri: url.clone(),
-            body: out_body.clone(),
+            body: vetted.body().to_vec(),
         });
     }
 
-    let mut req = st.client.request(method, &url).body(out_body);
+    let mut req = st.client.request(method, &url);
     req = match headers.get(header::CONTENT_TYPE) {
         Some(ct) => req.header(header::CONTENT_TYPE, ct),
         None => req.header(header::CONTENT_TYPE, "application/json"),
@@ -390,7 +409,7 @@ async fn proxy_handler(
         req = req.header(k, v);
     }
 
-    let upstream = match req.send().await {
+    let upstream = match forward(req, vetted).await {
         Ok(r) => r,
         Err(e) => {
             st.cumulative.note_network();
@@ -526,7 +545,8 @@ impl Backend for ProxyBackend {
         };
 
         let state = Arc::new(ProxyState {
-            base_url: pick.base_url.trim_end_matches('/').to_string(),
+            endpoint: crate::VettedEndpoint::new(pick.endpoint.url().trim_end_matches('/')),
+            privacy: self.privacy,
             real_slug: pick.real_slug.clone(),
             alias: alias.to_string(),
             api_key: self.api_key.clone(),
@@ -659,13 +679,14 @@ mod tests {
             Some("test-key".into()),
             vec![],
             serde_json::Map::new(),
+            Privacy::OpenRouter,
             None,
         )
         .unwrap();
         let pick = Pick {
             canonical_key: "model-x".into(),
             real_slug: "prov/model-x".into(),
-            base_url: format!("http://{up_addr}/v1"),
+            endpoint: crate::VettedEndpoint::new(format!("http://{up_addr}/v1")),
         };
         let mut sess = backend.start(&pick, "al:al").await.unwrap();
         let proxy_addr = sess.endpoint().unwrap();
@@ -748,13 +769,14 @@ mod tests {
             Some("k".into()),
             vec![],
             serde_json::Map::new(),
+            Privacy::OpenRouter,
             None,
         )
         .unwrap();
         let pick = Pick {
             canonical_key: "m".into(),
             real_slug: "prov/m".into(),
-            base_url: format!("http://{up_addr}/v1"),
+            endpoint: crate::VettedEndpoint::new(format!("http://{up_addr}/v1")),
         };
         let sess = backend.start(&pick, "al:al").await.unwrap();
         let addr = sess.endpoint().unwrap();
@@ -780,6 +802,7 @@ mod tests {
             Some("test-key".into()),
             vec![],
             serde_json::Map::new(),
+            Privacy::OpenRouter,
             None,
         )
         .unwrap();
@@ -787,7 +810,7 @@ mod tests {
         let pick = Pick {
             canonical_key: "model-x".into(),
             real_slug: "prov/model-x".into(),
-            base_url: "http://127.0.0.1:1/v1".into(),
+            endpoint: crate::VettedEndpoint::new("http://127.0.0.1:1/v1"),
         };
         let sess = backend.start(&pick, "al:al").await.unwrap();
         let addr = sess.endpoint().unwrap();
@@ -837,13 +860,14 @@ mod tests {
             Some("test-key".into()),
             vec![],
             serde_json::Map::new(),
+            Privacy::OpenRouter,
             Some(warc_path.clone()),
         )
         .unwrap();
         let pick = Pick {
             canonical_key: "model-x".into(),
             real_slug: "prov/model-x".into(),
-            base_url: format!("http://{up_addr}/v1"),
+            endpoint: crate::VettedEndpoint::new(format!("http://{up_addr}/v1")),
         };
         let mut sess = backend.start(&pick, "al:al").await.unwrap();
         let proxy_addr = sess.endpoint().unwrap();

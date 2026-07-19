@@ -7,6 +7,43 @@ use anyhow::{bail, Result};
 use serde_json::{Map, Value};
 
 use crate::UsageSnapshot;
+use config::Privacy;
+
+/// Apply a provider's ZDR privacy protocol to an outbound chat-completions body, in place. This is
+/// the injection the `VettedRequest` typestate proves happened: `prepare` calls it, and the
+/// transport's send path accepts only a `VettedRequest`, so no forward can skip it.
+///
+/// The `match` is exhaustive on purpose — a new provider added to [`Privacy`] will not compile
+/// until its privacy protocol is written and reviewed here (fail-closed by construction).
+pub fn apply_request_privacy(body: &mut Value, privacy: Privacy) {
+    match privacy {
+        // OpenRouter: request-time ZDR. Set `provider.zdr = true` + `provider.data_collection =
+        // "deny"`, *merging* into any existing `provider` object so routing knobs already placed by
+        // `extra_body` (e.g. `sort`, `max_price`) survive.
+        Privacy::OpenRouter => {
+            let Some(obj) = body.as_object_mut() else {
+                return;
+            };
+            let provider = obj
+                .entry("provider")
+                .or_insert_with(|| Value::Object(Map::new()));
+            match provider.as_object_mut() {
+                Some(p) => {
+                    p.insert("zdr".to_string(), Value::Bool(true));
+                    p.insert(
+                        "data_collection".to_string(),
+                        Value::String("deny".to_string()),
+                    );
+                }
+                // `provider` present but not an object (a misconfig) — replace it rather than
+                // forward a request whose privacy flags didn't land.
+                None => *provider = serde_json::json!({ "zdr": true, "data_collection": "deny" }),
+            }
+        }
+        // Groq: ZDR is an account-level setting; there is nothing to send per request.
+        Privacy::Groq => {}
+    }
+}
 
 /// Rewrite an outbound chat-completions request in place:
 ///

@@ -2,8 +2,8 @@
 //!
 //! Everything *above* this trait (selector, store, config, aliasing, the CLI) is real from day
 //! one and never touched again. Everything *below* it grows inside this one crate: at M0 the
-//! transport is a trivial model-rewrite proxy; M1 adds the raw-capture tee and the fail-closed
-//! per-request privacy flags behind the *same* session lifecycle — no rewrite.
+//! transport is a trivial model-rewrite proxy; M1 adds the raw-capture tee and makes the
+//! per-request ZDR privacy injection a *typestate* behind the *same* session lifecycle — no rewrite.
 //!
 //! The seam is a **session lifecycle**, not a single blocking call: the router starts a session,
 //! blocks on its events, and can abort it mid-flight. That is what makes `max_session_cost_usd`
@@ -17,15 +17,86 @@ use async_trait::async_trait;
 pub mod proxy;
 pub mod rewrite;
 
+pub use config::Privacy;
 pub use proxy::ProxyBackend;
+pub use rewrite::apply_request_privacy;
+
+/// A forwarding target the router chose. The **only** way to obtain a [`VettedRequest`] — the value
+/// the transport is allowed to send — is [`VettedEndpoint::prepare`], which applies the per-request
+/// privacy injection. So a body cannot reach the wire without having been through that injection:
+/// forwarding an un-vetted request does not compile (design.md §Privacy: "type-enforced forwarding —
+/// the transport accepts only a vetted value; the wire log witnesses enforcement, the types
+/// guarantee it").
+#[derive(Clone, Debug)]
+pub struct VettedEndpoint {
+    base_url: String,
+}
+
+impl VettedEndpoint {
+    /// Wrap a config-sourced forwarding target (URL from the curated provider pool via the route).
+    pub fn new(base_url: impl Into<String>) -> Self {
+        Self {
+            base_url: base_url.into(),
+        }
+    }
+
+    /// The base URL. Reachable only through the newtype.
+    pub fn url(&self) -> &str {
+        &self.base_url
+    }
+
+    /// The privacy gate — the sole constructor of a [`VettedRequest`]. Resolves the model and merges
+    /// `extra_body`, then applies `privacy`, yielding a request the transport may forward. A body
+    /// that is not JSON-with-a-`model` carries no prompt to protect (e.g. `GET …/models`) and is
+    /// passed through verbatim — still only via this gate.
+    pub fn prepare(
+        &self,
+        cli_body: &[u8],
+        real_slug: &str,
+        extra_body: &serde_json::Map<String, serde_json::Value>,
+        privacy: Privacy,
+    ) -> VettedRequest {
+        let body = match serde_json::from_slice::<serde_json::Value>(cli_body) {
+            Ok(mut v) if v.get("model").is_some() => {
+                // rewrite only fails on a non-object body, excluded by the `model` guard above
+                let _ = rewrite::rewrite_request(&mut v, real_slug, extra_body);
+                rewrite::apply_request_privacy(&mut v, privacy);
+                serde_json::to_vec(&v).unwrap_or_else(|_| cli_body.to_vec())
+            }
+            _ => cli_body.to_vec(),
+        };
+        VettedRequest { body }
+    }
+}
+
+/// A request that has passed the privacy gate. Private field + no public constructor other than
+/// [`VettedEndpoint::prepare`], so the transport's send path (which takes a `VettedRequest`) can
+/// never be handed a body that skipped the injection.
+#[derive(Clone, Debug)]
+pub struct VettedRequest {
+    body: Vec<u8>,
+}
+
+impl VettedRequest {
+    /// The vetted bytes, for capture. `pub(crate)` so only the transport reads them.
+    pub(crate) fn body(&self) -> &[u8] {
+        &self.body
+    }
+
+    /// Consume into the vetted bytes for the outbound request body.
+    pub(crate) fn into_body(self) -> Vec<u8> {
+        self.body
+    }
+}
 
 /// The chosen candidate for a session. The real slug is present here because the transport needs
-/// it to route; it reaches this struct only via the alias reveal gate (reason: routing).
+/// it to route; it reaches this struct only via the alias reveal gate (reason: routing). The
+/// forwarding target is a [`VettedEndpoint`] — the transport can only ever be pointed at a vetted URL.
 #[derive(Clone, Debug)]
 pub struct Pick {
     pub canonical_key: String,
     pub real_slug: String,
-    pub base_url: String,
+    pub endpoint: VettedEndpoint,
 }
 
 /// Cumulative usage so far — cheap to read, updated as the transport streams.
@@ -352,5 +423,47 @@ mod tests {
         assert_eq!(sess.next_event().await.unwrap(), SessionEvent::Ended);
         let outcome = Box::new(sess).finish().await.unwrap();
         assert_eq!(outcome.terminated_by, Some(AbortReason::User));
+    }
+
+    /// The forwarding URL is reachable only through the newtype (the wire path takes a
+    /// `VettedEndpoint`, never a bare `String`).
+    #[test]
+    fn vetted_endpoint_exposes_url() {
+        let ep = VettedEndpoint::new("https://api.example/v1");
+        assert_eq!(ep.url(), "https://api.example/v1");
+    }
+
+    /// `prepare` with `InjectZdr` is the privacy gate: the vetted body carries the ZDR flags, merged
+    /// into any existing `provider` object (so `extra_body` routing knobs survive).
+    #[test]
+    fn prepare_injects_zdr_and_preserves_provider_knobs() {
+        let ep = VettedEndpoint::new("https://api.example/v1");
+        let mut extra = serde_json::Map::new();
+        extra.insert("provider".into(), serde_json::json!({ "sort": "price" }));
+        let vr = ep.prepare(
+            br#"{"model":"alias","messages":[]}"#,
+            "real/slug",
+            &extra,
+            Privacy::OpenRouter,
+        );
+        let v: serde_json::Value = serde_json::from_slice(vr.body()).unwrap();
+        assert_eq!(v["provider"]["zdr"], serde_json::json!(true));
+        assert_eq!(v["provider"]["data_collection"], serde_json::json!("deny"));
+        assert_eq!(v["provider"]["sort"], serde_json::json!("price")); // knob preserved
+        assert_eq!(v["model"], serde_json::json!("real/slug")); // model resolved
+    }
+
+    /// `Attested` injects nothing; a non-model body is passed through verbatim (no prompt to guard).
+    #[test]
+    fn prepare_attested_and_passthrough() {
+        let ep = VettedEndpoint::new("https://api.example/v1");
+        let extra = serde_json::Map::new();
+        let vr = ep.prepare(br#"{"model":"alias"}"#, "real/slug", &extra, Privacy::Groq);
+        let v: serde_json::Value = serde_json::from_slice(vr.body()).unwrap();
+        assert!(v.get("provider").is_none());
+
+        let raw = b"not json at all";
+        let vr = ep.prepare(raw, "real/slug", &extra, Privacy::OpenRouter);
+        assert_eq!(vr.body(), raw); // verbatim
     }
 }

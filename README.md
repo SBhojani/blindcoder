@@ -11,14 +11,20 @@ OpenAI-compatible agentic tool.
 The point is to judge models on results, not reputation: you rate the work without knowing
 who did it, and over time the router sends more of your work to whatever quietly performs.
 
-> **Status: early (milestone M0).** The permanent decision core — the selector, the
+> **Status: milestone M1 (in progress).** The permanent decision core — the selector, the
 > append-only store schema, the config surface, and the aliasing — is real and tested, and
-> [`simulate`](#simulate) (the offline convergence harness) validates the selector. `run` now
-> stands up a **streaming forwarding proxy**: it makes a blind pick, proxies your session to the
-> chosen model (rewriting the model on the wire, streaming responses straight back, enforcing a
-> cost cap), and records it; `rate` records your feedback afterward. `stats` reads the event log
-> back as a blind per-model leaderboard. The hardening — a raw-capture tee and fail-closed
-> per-request privacy — is M1 (see [Roadmap](#roadmap)).
+> [`simulate`](#simulate) (the offline convergence harness) validates the selector. `run` stands
+> up a **streaming forwarding proxy**: it makes a blind pick, proxies your session to the chosen
+> model (rewriting the model on the wire, streaming responses straight back, enforcing a cost
+> cap), and records it; `rate` records your feedback afterward. `stats` reads the event log back
+> as a blind per-model leaderboard. **Privacy is type-enforced:** each provider declares a ZDR
+> `privacy` protocol, and the only way to build the request the transport sends (`VettedRequest`) is
+> through the gate that applies that protocol's per-request injection — so a body can't reach the
+> wire without it (it doesn't compile otherwise). The whole pool is checked fail-closed before any
+> pick: a provider with no declaration, a declaration whose host isn't that provider's real endpoint,
+> or a protocol whose unverifiable manual setup you haven't attested, aborts the run. The remaining
+> M1 piece — a raw-capture tee for token-by-token usage accounting — is still to come (see
+> [Roadmap](#roadmap)).
 
 ## Why blind?
 
@@ -155,8 +161,10 @@ to prove it structurally rather than by hope:
 
 - **M0** — the persistent core (selector · store · config · alias), `simulate` (validation),
   `run`/`rate` over a streaming forwarding proxy, and a `stats` leaderboard over the event log.
-  ← *here*
-- **M1** — the production proxy: raw-capture tee and fail-closed per-request privacy.
+  *shipped*
+- **M1** — the production proxy: the fail-closed, type-enforced per-request privacy gate
+  (`VettedRequest` typestate + host-bound, attested pool validation) is shipped; still to come is a
+  raw-capture tee for mid-stream usage accounting. ← *here*
 - **M2** — capture levels and byte-exact wire archives; a standing serve mode.
 - **M3** — many providers, subscription cap-safety, optional market price tracking.
 

@@ -14,8 +14,11 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 
 use alias::{mint_token, Alias, RevealGate, RevealReason, TOKEN_LEN};
-use backend::{AbortReason, Backend, ErrorKind, Pick, ProxyBackend, SessionEvent, UsageSnapshot};
-use config::{CaptureLevel, Config, CostBasis, ModelConfig, ProviderConfig};
+use backend::{
+    AbortReason, Backend, ErrorKind, Pick, ProxyBackend, SessionEvent, UsageSnapshot,
+    VettedEndpoint,
+};
+use config::{CaptureLevel, Config, CostBasis, ModelConfig, Privacy, ProviderConfig};
 use selector::{
     fold_track_record_with_failures, normalize_prices, pick, prune_dominated, Candidate, Failure,
     Rating, TrackRecord, Tuneables,
@@ -126,6 +129,78 @@ fn seed_pool<R: Rng + ?Sized>(store: &Store, cfg: &Config, rng: &mut R) -> Resul
     Ok(())
 }
 
+/// The fail-closed privacy gate over the whole configured pool, run before any pick. Every provider
+/// must (1) declare a `privacy` protocol, (2) point at that protocol's real endpoint host, (3) carry
+/// only its *own* attestation keys (a Groq key on an OpenRouter provider is an error), and (4) for a
+/// protocol that relies on unverifiable manual account setup, carry that provider's attestation set
+/// to `true`. Any violation fails the run rather than silently forwarding.
+fn validate_pool_privacy(cfg: &Config) -> Result<()> {
+    for p in &cfg.providers {
+        let Some(pv) = p.privacy else {
+            anyhow::bail!(
+                "provider {:?} has no `privacy` declaration — refusing to route to an \
+                 unknown-data-policy endpoint (fail-closed). Declare its ZDR protocol.",
+                p.slug
+            );
+        };
+
+        // (2) The declaration is only valid for that provider's real endpoint. For an account-level
+        // protocol (which does nothing on the wire) this host match *is* the enforcement.
+        if !pv.matches_endpoint(&p.base_url) {
+            anyhow::bail!(
+                "provider {:?}: base_url {:?} is not the {} endpoint that privacy = {:?} attests — \
+                 an attestation is only valid for that provider's real endpoint.",
+                p.slug,
+                p.base_url,
+                pv.endpoint_host(),
+                pv
+            );
+        }
+
+        // (3) Reject foreign or unknown attestation keys — each key must belong to *this* provider's
+        // protocol. Catches `groq_manual_steps_done` set on an OpenRouter provider (and typos).
+        for key in p.attestations.keys() {
+            match Privacy::for_attestation_key(key) {
+                Some(owner) if owner == pv => {}
+                Some(owner) => anyhow::bail!(
+                    "provider {:?}: attestation key `{}` belongs to the {:?} privacy protocol, not \
+                     this provider's {:?} — remove it.",
+                    p.slug,
+                    key,
+                    owner,
+                    pv
+                ),
+                None => anyhow::bail!(
+                    "provider {:?}: unknown attestation key `{}`.",
+                    p.slug,
+                    key
+                ),
+            }
+        }
+
+        // (4) A protocol that depends on manual setup blindcoder can't see requires an explicit,
+        // provider-named attestation. The required key is revealed *only* here.
+        if let Some(k) = pv.attestation_key() {
+            if p.attestations.get(k) != Some(&true) {
+                let steps = pv.manual_steps().unwrap_or("(see the provider's data-controls docs)");
+                anyhow::bail!(
+                    "provider {:?} uses privacy = {:?}, whose Zero-Data-Retention blindcoder cannot \
+                     verify on the wire — it depends on a manual account setup you must perform:\n\n\
+                     \x20   {}\n\n\
+                     Once done, confirm by adding `{} = true` to this provider in your config. (This \
+                     key is intentionally not in the example config: it must be a deliberate act, \
+                     not a copied default.)",
+                    p.slug,
+                    pv,
+                    steps,
+                    k
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Build the candidate pool: fold each model's effective ratings (by `canonical_key`, decayed) into
 /// a track record, pair it with the entry's normalized price. Returns candidates aligned with the
 /// entries by index.
@@ -178,6 +253,10 @@ fn build_pool(store: &Store, cfg: &Config) -> Result<(Vec<Candidate>, Vec<PoolEn
         }
     }
 
+    if entries.is_empty() {
+        anyhow::bail!("no candidates in the pool — no models are configured");
+    }
+
     let norm = normalize_prices(&entries.iter().map(|e| e.raw_price).collect::<Vec<_>>());
     let cands = entries
         .iter()
@@ -212,6 +291,10 @@ fn choose<R: Rng + ?Sized>(cands: &[Candidate], t: &Tuneables, rng: &mut R) -> u
 /// command, launch it against the proxy (session ends when it exits, then rate inline); without
 /// one, run a standing proxy you point a CLI at yourself (end with Ctrl-C).
 pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
+    // The privacy gate runs first, over the whole configured pool, and fails the run on any
+    // violation (fail-closed) — before any network, store write, or pick.
+    validate_pool_privacy(cfg)?;
+
     let store = open_store()?;
     let mut rng = rand::thread_rng();
 
@@ -286,11 +369,30 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
         None
     };
 
-    let backend = ProxyBackend::new(bind_addr, api_key, extra_headers, extra_body, capture_path)?;
+    // The pool build already excluded any provider without a declaration (and any whose endpoint
+    // host doesn't match it), so `None` here is unreachable — fail closed if it somehow occurs
+    // rather than forward with an unknown policy.
+    let privacy = provider.privacy.ok_or_else(|| {
+        anyhow::anyhow!(
+            "picked provider {:?} has no `privacy` declaration (should have been excluded)",
+            provider.slug
+        )
+    })?;
+    let backend = ProxyBackend::new(
+        bind_addr,
+        api_key,
+        extra_headers,
+        extra_body,
+        privacy,
+        capture_path,
+    )?;
+    // The forwarding target: the wire path takes a `VettedEndpoint`, and the only way to obtain the
+    // `VettedRequest` it sends is `prepare`, which applies the privacy injection above.
+    let endpoint = VettedEndpoint::new(route.base_url);
     let pick = Pick {
         canonical_key: route.canonical_key,
         real_slug: route.real_slug,
-        base_url: route.base_url,
+        endpoint,
     };
 
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -667,7 +769,7 @@ pub fn rate(args: &RateArgs) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use config::ProviderConfig;
+    use config::{Privacy, ProviderConfig};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
 
@@ -724,6 +826,109 @@ mod tests {
             providers: vec![free, paid],
             ..Default::default()
         }
+    }
+
+    fn provider_with(
+        slug: &str,
+        base_url: &str,
+        privacy: Option<Privacy>,
+        attest: &[(&str, bool)],
+    ) -> ProviderConfig {
+        ProviderConfig {
+            slug: slug.into(),
+            base_url: base_url.into(),
+            privacy,
+            attestations: attest.iter().map(|(k, v)| (k.to_string(), *v)).collect(),
+            ..Default::default()
+        }
+    }
+    fn cfg_of(p: ProviderConfig) -> Config {
+        Config {
+            providers: vec![p],
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn privacy_gate_openrouter_self_enforcing_ok() {
+        let c = cfg_of(provider_with(
+            "or",
+            "https://openrouter.ai/api/v1",
+            Some(Privacy::OpenRouter),
+            &[],
+        ));
+        assert!(validate_pool_privacy(&c).is_ok());
+    }
+
+    #[test]
+    fn privacy_gate_groq_requires_attestation_and_error_reveals_the_key() {
+        // Real Groq endpoint but no attestation → refused, and the error reveals the exact key.
+        let c = cfg_of(provider_with(
+            "groq",
+            "https://api.groq.com/openai/v1",
+            Some(Privacy::Groq),
+            &[],
+        ));
+        let err = validate_pool_privacy(&c).unwrap_err().to_string();
+        assert!(
+            err.contains("groq_manual_steps_done"),
+            "error must reveal the key: {err}"
+        );
+        // With the attestation set → ok.
+        let c = cfg_of(provider_with(
+            "groq",
+            "https://api.groq.com/openai/v1",
+            Some(Privacy::Groq),
+            &[("groq_manual_steps_done", true)],
+        ));
+        assert!(validate_pool_privacy(&c).is_ok());
+    }
+
+    #[test]
+    fn privacy_gate_rejects_missing_declaration() {
+        let c = cfg_of(provider_with(
+            "x",
+            "https://api.groq.com/openai/v1",
+            None,
+            &[],
+        ));
+        assert!(validate_pool_privacy(&c).is_err());
+    }
+
+    #[test]
+    fn privacy_gate_rejects_host_mismatch() {
+        // A Groq attestation for something that isn't the Groq endpoint → refused.
+        let c = cfg_of(provider_with(
+            "groq",
+            "https://not-groq.example/v1",
+            Some(Privacy::Groq),
+            &[("groq_manual_steps_done", true)],
+        ));
+        assert!(validate_pool_privacy(&c).is_err());
+    }
+
+    #[test]
+    fn privacy_gate_rejects_foreign_attestation_key() {
+        // Groq's key set on an OpenRouter provider → error naming the owning protocol.
+        let c = cfg_of(provider_with(
+            "or",
+            "https://openrouter.ai/api/v1",
+            Some(Privacy::OpenRouter),
+            &[("groq_manual_steps_done", true)],
+        ));
+        let err = validate_pool_privacy(&c).unwrap_err().to_string();
+        assert!(err.contains("belongs to"), "{err}");
+    }
+
+    #[test]
+    fn privacy_gate_rejects_unknown_attestation_key() {
+        let c = cfg_of(provider_with(
+            "groq",
+            "https://api.groq.com/openai/v1",
+            Some(Privacy::Groq),
+            &[("groq_manual_steps_done", true), ("bogus", true)],
+        ));
+        assert!(validate_pool_privacy(&c).is_err());
     }
 
     #[test]

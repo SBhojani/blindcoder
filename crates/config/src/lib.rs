@@ -99,9 +99,110 @@ pub struct ProviderConfig {
     /// JSON object merged (shallow, top-level) into every request body to this provider.
     #[serde(default)]
     pub extra_body: BTreeMap<String, toml::Value>,
+    /// The provider's ZDR privacy basis. **Absent ⇒ the provider is ineligible** and the run is
+    /// refused before any pick (fail-closed, design.md §Privacy). Present values decide how the
+    /// transport shapes each request — see [`Privacy`].
+    #[serde(default)]
+    pub privacy: Option<Privacy>,
+    /// Attestations that the operator completed the unverifiable, out-of-band manual setup a
+    /// [`Privacy`] protocol depends on (e.g. enabling ZDR in the Groq console). Captured as
+    /// *flattened extra keys* so each provider's attestation is a distinct, provider-named flag —
+    /// e.g. `groq_manual_steps_done = true` — rather than one generic boolean. blindcoder cannot see
+    /// the setup on the wire, so for such protocols it fails closed until the provider's key is set.
+    ///
+    /// **Intentionally omitted from `config.example.toml` and the docs.** The exact key name is
+    /// revealed *only* by the fail-closed error, so setting it must be a deliberate act after
+    /// reading the manual steps — never a value copied from a template.
+    #[serde(flatten)]
+    pub attestations: BTreeMap<String, bool>,
     /// The models this provider offers in the pool.
     #[serde(default)]
     pub models: Vec<ModelConfig>,
+}
+
+/// Which provider's ZDR privacy protocol applies. Privacy is the one place blindcoder names
+/// providers in code (everywhere else providers are just data): the mechanism for guaranteeing a
+/// provider won't retain or train on prompts genuinely differs per vendor, and it is the
+/// fail-closed security boundary — so each provider is an explicit, reviewed variant here rather
+/// than a config blob that could fail *open*. Declaring one is what makes a provider *eligible*;
+/// omitting it excludes the provider (fail-closed). A new provider cannot enter the pool without a
+/// variant added here and a matching arm in the injector — forcing its privacy to be code-reviewed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Privacy {
+    /// OpenRouter — request-time ZDR: blindcoder injects
+    /// `provider = { zdr = true, data_collection = "deny" }` into every request body, and OpenRouter
+    /// itself fails closed (404) if no ZDR-compliant serving endpoint matches. Config value:
+    /// `"open-router"`.
+    OpenRouter,
+    /// Groq — ZDR enabled at the account level (console data-controls); nothing is sent per request.
+    /// Config value: `"groq"`.
+    Groq,
+}
+
+impl Privacy {
+    /// The endpoint host this privacy protocol is verified against. An account-level attestation
+    /// (e.g. Groq) does *nothing* on the wire, so it is only meaningful for that provider's real
+    /// endpoint — the pool build refuses a provider whose `base_url` host doesn't match, rather than
+    /// silently trusting an arbitrary endpoint that merely *claims* the protocol. For request-time
+    /// protocols (OpenRouter) the check is defence-in-depth on top of the self-enforcing injection.
+    pub fn endpoint_host(self) -> &'static str {
+        match self {
+            Privacy::OpenRouter => "openrouter.ai",
+            Privacy::Groq => "api.groq.com",
+        }
+    }
+
+    /// Whether `base_url`'s host is this protocol's verified endpoint host (or a subdomain of it).
+    pub fn matches_endpoint(self, base_url: &str) -> bool {
+        let host = host_of(base_url);
+        let want = self.endpoint_host();
+        host == want || host.strip_suffix(want).is_some_and(|p| p.ends_with('.'))
+    }
+
+    /// The out-of-band manual setup this protocol depends on but blindcoder cannot verify on the
+    /// wire, if any. `Some` for account-level protocols whose ZDR is a console/account setting — the
+    /// operator must attest completion via this protocol's [`attestation_key`](Self::attestation_key).
+    /// `None` for self-enforcing request-time protocols (the injection + the provider's own
+    /// fail-closed routing suffice).
+    pub fn manual_steps(self) -> Option<&'static str> {
+        match self {
+            Privacy::OpenRouter => None,
+            Privacy::Groq => Some(
+                "In the Groq console (console.groq.com), open Settings → Data Controls and enable \
+                 Zero-Data-Retention for the account/API key you use here.",
+            ),
+        }
+    }
+
+    /// The **provider-specific** config key that attests this protocol's manual setup was done, if it
+    /// needs one. Distinct per provider (includes the provider's name) so the attestation cannot be
+    /// generic or copied — and so setting one provider's key on another is detectably wrong (see
+    /// [`for_attestation_key`](Self::for_attestation_key)).
+    pub fn attestation_key(self) -> Option<&'static str> {
+        match self {
+            Privacy::OpenRouter => None,
+            Privacy::Groq => Some("groq_manual_steps_done"),
+        }
+    }
+
+    /// Which protocol, if any, owns `key`. Lets validation reject a key that belongs to a *different*
+    /// provider's protocol (e.g. `groq_manual_steps_done` on an OpenRouter provider) or is unknown.
+    pub fn for_attestation_key(key: &str) -> Option<Privacy> {
+        [Privacy::OpenRouter, Privacy::Groq]
+            .into_iter()
+            .find(|p| p.attestation_key() == Some(key))
+    }
+}
+
+/// The host of a `scheme://host[:port]/path` URL, without pulling in a URL-parsing dependency.
+fn host_of(url: &str) -> &str {
+    let after_scheme = url.split_once("://").map_or(url, |(_, rest)| rest);
+    let host_port = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or(after_scheme);
+    host_port.split(':').next().unwrap_or(host_port)
 }
 
 fn default_wire() -> String {
@@ -266,6 +367,59 @@ mod tests {
         // untouched fields keep their pinned defaults
         assert_eq!(c.score_spread, 2.0);
         assert_eq!(c.curated_policy_max_age_days, 90.0);
+    }
+
+    #[test]
+    fn privacy_and_flattened_attestation_parse_from_toml() {
+        // The whole point of the undocumented key hinges on `#[serde(flatten)]` actually working
+        // with the `toml` crate — verify the provider-named key lands in `attestations`.
+        let toml_src = r#"
+[[providers]]
+slug = "groq"
+base_url = "https://api.groq.com/openai/v1"
+privacy = "groq"
+groq_manual_steps_done = true
+
+[[providers.models]]
+canonical_key = "m"
+real_slug = "groq/m"
+"#;
+        let c: Config = toml::from_str(toml_src).unwrap();
+        let p = &c.providers[0];
+        assert_eq!(p.privacy, Some(Privacy::Groq));
+        assert_eq!(p.attestations.get("groq_manual_steps_done"), Some(&true));
+    }
+
+    #[test]
+    fn privacy_kebab_value_parses() {
+        let c: Config = toml::from_str(
+            "[[providers]]\nslug=\"o\"\nbase_url=\"https://openrouter.ai/api/v1\"\nprivacy=\"open-router\"\n",
+        )
+        .unwrap();
+        assert_eq!(c.providers[0].privacy, Some(Privacy::OpenRouter));
+    }
+
+    #[test]
+    fn matches_endpoint_rejects_lookalike_hosts() {
+        assert!(Privacy::Groq.matches_endpoint("https://api.groq.com/openai/v1"));
+        assert!(Privacy::OpenRouter.matches_endpoint("https://openrouter.ai/api/v1"));
+        // a real subdomain is fine
+        assert!(Privacy::OpenRouter.matches_endpoint("https://gateway.openrouter.ai/v1"));
+        // suffix / look-alike / infix attacks are rejected
+        assert!(!Privacy::OpenRouter.matches_endpoint("https://openrouter.ai.evil.com/v1"));
+        assert!(!Privacy::OpenRouter.matches_endpoint("https://evilopenrouter.ai/v1"));
+        assert!(!Privacy::Groq.matches_endpoint("https://api.groq.com.attacker.net/v1"));
+    }
+
+    #[test]
+    fn attestation_key_ownership() {
+        assert_eq!(Privacy::Groq.attestation_key(), Some("groq_manual_steps_done"));
+        assert_eq!(Privacy::OpenRouter.attestation_key(), None);
+        assert_eq!(
+            Privacy::for_attestation_key("groq_manual_steps_done"),
+            Some(Privacy::Groq)
+        );
+        assert_eq!(Privacy::for_attestation_key("nope"), None);
     }
 
     #[test]

@@ -76,10 +76,23 @@ curated_policy_max_age_days = 90
 # Any OpenAI-compatible /chat/completions endpoint works — blindcoder never branches on which
 # provider it is; everything provider-specific below is data, not code.
 #
-# Two knobs keep it provider-blind:
+# Two passthrough knobs keep the wire provider-blind:
 #   * extra_headers — extra HTTP headers sent on every request (e.g. attribution).
-#   * extra_body    — a JSON object merged into every request body (e.g. provider-routing or
-#                     data-policy/ZDR preferences).
+#   * extra_body    — a JSON object merged into every request body: provider-routing knobs like
+#                     `sort`, `order`, `only`, `max_price` (see the gateway example below).
+#
+# `privacy` (REQUIRED — fail-closed) declares the provider's Zero-Data-Retention protocol; a provider
+# without it is refused before any pick. This is the ONE place blindcoder is provider-aware: the ZDR
+# mechanism genuinely differs per vendor, and at a security boundary a wrong setting must fail closed,
+# not open. Accepted values:
+#   * "open-router" — request-time ZDR. blindcoder injects `provider = { zdr = true,
+#                     data_collection = "deny" }` into every request; OpenRouter itself 404s if no
+#                     compliant endpoint matches. (Don't put zdr/data_collection in extra_body — the
+#                     protocol owns them.)
+#   * "groq"        — ZDR is an account-level console setting; nothing goes on the wire.
+# Each value is verified against that provider's real endpoint host, so a declaration only counts for
+# that provider's actual API (a mismatch is refused). Some protocols also require a one-time
+# attestation that you completed their manual setup — if so, the run tells you exactly what to add.
 #
 # `canonical_key` is the provider-neutral identity the selector learns on: the SAME model
 # offered by two providers should share one canonical_key, so its quality belief pools across
@@ -97,16 +110,17 @@ curated_policy_max_age_days = 90
 # base_url = "https://api.groq.com/openai/v1"
 # wire = "openai"
 # key_env = "GROQ_API_KEY"
+# privacy = "groq"
 #
 #   [[providers.models]]
 #   canonical_key = "kimi-k2"
 #   real_slug = "moonshotai/kimi-k2-instruct"
 
-# A priced gateway provider (same model, priced; attribution header + routing/privacy body flags).
+# A priced gateway provider (same model, priced; attribution header + routing body knobs).
 # On a gateway like OpenRouter a model is served by several providers at DIFFERENT prices; the
-# `provider` object in extra_body controls routing and data policy (all forwarded verbatim):
-#   zdr = true                      -> only zero-data-retention endpoints
-#   data_collection = "deny"        -> exclude providers that store/train on prompts
+# `provider` object in extra_body controls routing (all forwarded verbatim). The ZDR data-policy
+# flags (`zdr`, `data_collection`) are NOT set here — `privacy = "open-router"` injects them, so the
+# privacy protocol is the single source of truth. The remaining routing knobs still go in extra_body:
 #   sort = "price"                  -> route to the cheapest ELIGIBLE provider (also "throughput"/"latency")
 #   order = ["prov-a","prov-b"]     -> try these providers in this order
 #   only = ["prov-a"] / ignore=[..] -> restrict to / exclude specific providers
@@ -127,8 +141,9 @@ curated_policy_max_age_days = 90
 # base_url = "https://openrouter.ai/api/v1"
 # wire = "openai"
 # key_env = "OPENROUTER_API_KEY"
+# privacy = "open-router"
 # extra_headers = { "X-Title" = "blindcoder" }
-# extra_body = { "provider" = { "zdr" = true, "data_collection" = "deny", "sort" = "price" } }
+# extra_body = { "provider" = { "sort" = "price" } }
 #
 #   [[providers.models]]
 #   canonical_key = "kimi-k2"            # same model as above → shared quality belief
