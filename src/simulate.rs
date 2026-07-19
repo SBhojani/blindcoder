@@ -244,11 +244,11 @@ fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
 
         // evolve the world: quality random-walk drift + occasional regime jumps (level resets).
         if s > 0 {
-            for i in 0..h.pool {
+            for q in quality.iter_mut().take(h.pool) {
                 if h.jump_rate > 0.0 && rng.gen::<f64>() < h.jump_rate * dt {
-                    quality[i] = rng.gen_range(0.20..0.95);
+                    *q = rng.gen_range(0.20..0.95);
                 } else if let Some(step) = &drift_step {
-                    quality[i] = (quality[i] + step.sample(rng)).clamp(0.05, 0.98);
+                    *q = (*q + step.sample(rng)).clamp(0.05, 0.98);
                 }
             }
         }

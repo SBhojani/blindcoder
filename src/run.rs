@@ -297,16 +297,16 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
         .enable_all()
         .build()
         .context("building the async runtime")?;
-    let outcome = runtime.block_on(drive_session(
-        &backend,
-        &pick,
-        &alias_display,
-        entries.len(),
+    let outcome = runtime.block_on(drive_session(DriveParams {
+        backend: &backend,
+        pick: &pick,
+        alias_display: &alias_display,
+        pool_size: entries.len(),
         cap,
         in_price,
         out_price,
-        &args.command,
-    ))?;
+        command: &args.command,
+    }))?;
 
     // Record the terminal event: how it ended, and the realized cost — the provider-reported figure
     // when the transport captured one (authoritative), otherwise our tokens × shelf-price estimate.
@@ -456,19 +456,33 @@ fn spent_of(u: &UsageSnapshot, in_price: f64, out_price: f64) -> f64 {
         .unwrap_or_else(|| cost_usd(u.prompt_tokens, u.completion_tokens, in_price, out_price))
 }
 
-/// Stand up the proxy and drive the session. With a `command`, launch it against the proxy and end
-/// when it exits; otherwise run a standing proxy the user points a CLI at (end with Ctrl-C). The
-/// cost cap fires in either mode. Returns the terminal outcome.
-async fn drive_session(
-    backend: &ProxyBackend,
-    pick: &Pick,
-    alias_display: &str,
+/// Parameters for [`drive_session`], grouped to keep the call site readable (and under clippy's
+/// argument-count lint) since they are all distinct session-drive inputs.
+struct DriveParams<'a> {
+    backend: &'a ProxyBackend,
+    pick: &'a Pick,
+    alias_display: &'a str,
     pool_size: usize,
     cap: f64,
     in_price: f64,
     out_price: f64,
-    command: &[String],
-) -> Result<backend::SessionOutcome> {
+    command: &'a [String],
+}
+
+/// Stand up the proxy and drive the session. With a `command`, launch it against the proxy and end
+/// when it exits; otherwise run a standing proxy the user points a CLI at (end with Ctrl-C). The
+/// cost cap fires in either mode. Returns the terminal outcome.
+async fn drive_session(params: DriveParams<'_>) -> Result<backend::SessionOutcome> {
+    let DriveParams {
+        backend,
+        pick,
+        alias_display,
+        pool_size,
+        cap,
+        in_price,
+        out_price,
+        command,
+    } = params;
     let mut sess = backend.start(pick, alias_display).await?;
     let endpoint = sess
         .endpoint()

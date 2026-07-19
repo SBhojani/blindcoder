@@ -439,10 +439,10 @@ async fn proxy_handler(
                             let core = text.trim_end_matches('\n').trim_end_matches('\r');
                             let out = format!("{}\n", mask_sse_line(core, &real_slug, &alias));
                             masked_acc.extend_from_slice(out.as_bytes());
-                            yield Ok::<Bytes, std::io::Error>(Bytes::from(out.into_bytes()));
+                            yield Ok::<Bytes, reqwest::Error>(Bytes::from(out.into_bytes()));
                         }
                     }
-                    Err(e) => { yield Err(std::io::Error::new(std::io::ErrorKind::Other, e)); break; }
+                    Err(e) => { yield Err(e); break; }
                 }
             }
             if !linebuf.is_empty() {
@@ -454,7 +454,7 @@ async fn proxy_handler(
             while let Some(item) = bytes_stream.next().await {
                 match item {
                     Ok(chunk) => raw_acc.extend_from_slice(&chunk),
-                    Err(e) => { yield Err(std::io::Error::new(std::io::ErrorKind::Other, e)); break; }
+                    Err(e) => { yield Err(e); break; }
                 }
             }
             masked_acc = mask_json_body(&raw_acc, &real_slug, &alias);
