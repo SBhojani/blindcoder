@@ -1,6 +1,6 @@
 # Spec: show rating-scale guidance at the point of rating
 
-**Status:** proposed
+**Status:** merged
 **Scope:** small, self-contained UX change to the interactive rating prompt in `run`.
 
 ## Problem

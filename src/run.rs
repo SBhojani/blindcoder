@@ -360,14 +360,27 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
+/// Legend for the interactive performance scale shown to users after a session.
+const PERF_LEGEND: &str = "-2 terrible · -1 poor · 0 neutral · +1 good · +2 excellent";
+
+/// Legend for the interactive difficulty scale shown to users after a session.
+const DIFFICULTY_LEGEND: &str = "0 trivial · 1 easy · 2 moderate · 3 hard · 4 very hard";
+
 /// Prompt the two blind ratings on stdin after a launched session and record them. Enter on the
 /// first question skips rating entirely.
 fn prompt_and_rate(store: &Store, sid: i64) -> Result<()> {
+    println!("  performance?  {PERF_LEGEND}");
+    println!("    (Enter to skip)\n");
+
     let Some(performance) = prompt_int("  how did it perform?  [-2..2, Enter to skip]: ", -2, 2)?
     else {
         println!("  rating skipped.");
         return Ok(());
     };
+
+    println!("  difficulty?  {DIFFICULTY_LEGEND}");
+    println!("    (rates the task, not the model; credits a good result on a hard task)\n");
+
     let difficulty = prompt_int("  how hard was the task?  [0..4]: ", 0, 4)?.unwrap_or(0);
     let id = store.record_rating(sid, performance, difficulty, None)?;
     println!("  recorded rating #{id}.");
@@ -575,10 +588,10 @@ pub struct RateArgs {
     /// The session id to rate (see the id printed by `run`).
     #[arg(long)]
     pub session: i64,
-    /// How well it performed, -2..=2.
+    /// How well it performed, -2..=2 (-2 terrible · -1 poor · 0 neutral · +1 good · +2 excellent).
     #[arg(long, allow_hyphen_values = true)]
     pub performance: i64,
-    /// How hard the task turned out to be, 0..=4.
+    /// How hard the task turned out to be, 0..=4 (0 trivial · 1 easy · 2 moderate · 3 hard · 4 very hard).
     #[arg(long)]
     pub difficulty: i64,
     /// If this corrects an earlier rating, its id (the old one is superseded, not deleted).
