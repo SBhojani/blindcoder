@@ -362,35 +362,45 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Legend for the interactive performance scale shown to users after a session.
-const PERF_LEGEND: &str = "-2 terrible · -1 poor · 0 neutral · +1 good · +2 excellent";
-
-/// Legend for the interactive difficulty scale shown to users after a session.
-const DIFFICULTY_LEGEND: &str = "0 trivial · 1 easy · 2 moderate · 3 hard · 4 very hard";
+/// Single-letter shortcuts per rating scale (case-insensitive), shown inline in the legend. The
+/// letters are per-scale, so `t`/`e` mean different things on each (terrible vs trivial, excellent
+/// vs easy) — the legend spells that out so it isn't a hidden collision.
+const PERF_SHORTCUTS: &[(char, i64)] = &[('t', -2), ('p', -1), ('n', 0), ('g', 1), ('e', 2)];
+const DIFF_SHORTCUTS: &[(char, i64)] = &[('t', 0), ('e', 1), ('m', 2), ('h', 3), ('v', 4)];
 
 /// Prompt the two blind ratings on stdin after a launched session and record them. Enter on the
-/// first question skips rating entirely.
+/// first question skips rating entirely. Each scale accepts a number or its single-letter shortcut.
 fn prompt_and_rate(store: &Store, sid: i64) -> Result<()> {
-    println!("  performance?  {PERF_LEGEND}");
-    println!("    (Enter to skip)\n");
-
-    let Some(performance) = prompt_int("  how did it perform?  [-2..2, Enter to skip]: ", -2, 2)?
+    println!("  how did it perform?  -2 terrible(t) · -1 poor(p) · 0 neutral(n) · +1 good(g) · +2 excellent(e)");
+    let Some(performance) = prompt_int_with_shortcuts(
+        "  [-2..2, a letter, or Enter to skip]: ",
+        -2,
+        2,
+        PERF_SHORTCUTS,
+    )?
     else {
         println!("  rating skipped.");
         return Ok(());
     };
 
-    println!("  difficulty?  {DIFFICULTY_LEGEND}");
-    println!("    (rates the task, not the model; credits a good result on a hard task)\n");
-
-    let difficulty = prompt_int("  how hard was the task?  [0..4]: ", 0, 4)?.unwrap_or(0);
+    println!("  how hard was the task?  0 trivial(t) · 1 easy(e) · 2 moderate(m) · 3 hard(h) · 4 very hard(v)");
+    println!("    (rates the task, not the model; credits a good result on a hard task)");
+    let difficulty =
+        prompt_int_with_shortcuts("  [0..4 or a letter]: ", 0, 4, DIFF_SHORTCUTS)?.unwrap_or(0);
     let id = store.record_rating(sid, performance, difficulty, None)?;
     println!("  recorded rating #{id}.");
     Ok(())
 }
 
-/// Read an integer in `[lo, hi]` from stdin, re-prompting on bad input. `None` = empty line / EOF.
-fn prompt_int(msg: &str, lo: i64, hi: i64) -> Result<Option<i64>> {
+/// Read an integer in `[lo, hi]` from stdin, with optional single-letter shortcuts.
+/// Re-prompts on bad input. `None` = empty line / EOF.
+/// Supports both numeric input and single-letter shortcuts when provided.
+fn prompt_int_with_shortcuts(
+    msg: &str,
+    lo: i64,
+    hi: i64,
+    shortcuts: &[(char, i64)],
+) -> Result<Option<i64>> {
     use std::io::Write;
     loop {
         print!("{msg}");
@@ -403,11 +413,28 @@ fn prompt_int(msg: &str, lo: i64, hi: i64) -> Result<Option<i64>> {
         if s.is_empty() {
             return Ok(None);
         }
-        match s.parse::<i64>() {
-            Ok(v) if (lo..=hi).contains(&v) => return Ok(Some(v)),
-            _ => println!("  please enter a whole number in [{lo}..{hi}]."),
+        if let Some(v) = parse_rating(s, lo, hi, shortcuts) {
+            return Ok(Some(v));
+        }
+        println!("  please enter a number in [{lo}..{hi}] or a shortcut letter.");
+    }
+}
+
+/// Interpret one non-empty rating line: a whole number in `[lo, hi]`, or a single case-insensitive
+/// letter mapped by `shortcuts`. Returns the value, or `None` if it matches neither (re-prompt).
+/// Pure (no I/O) so the parse rules are unit-testable.
+fn parse_rating(s: &str, lo: i64, hi: i64, shortcuts: &[(char, i64)]) -> Option<i64> {
+    if let Ok(v) = s.parse::<i64>() {
+        if (lo..=hi).contains(&v) {
+            return Some(v);
         }
     }
+    let mut chars = s.chars();
+    if let (Some(c), None) = (chars.next(), chars.next()) {
+        let c = c.to_ascii_lowercase();
+        return shortcuts.iter().find(|(k, _)| *k == c).map(|&(_, v)| v);
+    }
+    None
 }
 
 /// The OpenCode provider config injected via `OPENCODE_CONFIG_CONTENT` (merged into the user's
@@ -643,6 +670,26 @@ mod tests {
     use config::ProviderConfig;
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+
+    #[test]
+    fn parse_rating_accepts_numbers_and_letter_shortcuts() {
+        // numbers within range
+        assert_eq!(parse_rating("1", -2, 2, PERF_SHORTCUTS), Some(1));
+        assert_eq!(parse_rating("-2", -2, 2, PERF_SHORTCUTS), Some(-2));
+        // out-of-range numbers re-prompt (None)
+        assert_eq!(parse_rating("5", -2, 2, PERF_SHORTCUTS), None);
+        assert_eq!(parse_rating("10", 0, 4, DIFF_SHORTCUTS), None);
+        // letter shortcuts, case-insensitive
+        assert_eq!(parse_rating("t", -2, 2, PERF_SHORTCUTS), Some(-2));
+        assert_eq!(parse_rating("E", -2, 2, PERF_SHORTCUTS), Some(2));
+        // the same letter maps differently per scale (terrible vs trivial, excellent vs easy)
+        assert_eq!(parse_rating("t", 0, 4, DIFF_SHORTCUTS), Some(0));
+        assert_eq!(parse_rating("e", 0, 4, DIFF_SHORTCUTS), Some(1));
+        // unknown letter / multi-char / no shortcuts → None
+        assert_eq!(parse_rating("z", -2, 2, PERF_SHORTCUTS), None);
+        assert_eq!(parse_rating("ab", -2, 2, PERF_SHORTCUTS), None);
+        assert_eq!(parse_rating("t", -2, 2, &[]), None);
+    }
 
     /// A pool with one model offered by two providers: a free one (no prices) and a priced one.
     /// Placeholder names only — the code never branches on them, and neither should a reader.
