@@ -7,3 +7,6 @@ description = "blindcoder aliasing: random stored tokens that mask model identit
 
 [dependencies]
 rand = "0.8"
+
+[lints]
+workspace = true

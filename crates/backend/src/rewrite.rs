@@ -124,9 +124,7 @@ pub fn mask_sse_line(line: &str, real_slug: &str, alias: &str) -> String {
             line.to_string()
         } else if let Ok(mut v) = serde_json::from_str::<Value>(payload) {
             mask_response_obj(&mut v, alias);
-            serde_json::to_string(&v)
-                .map(|s| format!("data: {s}"))
-                .unwrap_or_else(|_| line.to_string())
+            serde_json::to_string(&v).map_or_else(|_| line.to_string(), |s| format!("data: {s}"))
         } else {
             line.to_string()
         }

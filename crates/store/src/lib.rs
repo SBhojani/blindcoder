@@ -206,6 +206,19 @@ pub struct ModelFailureCount {
     pub count: i64,
 }
 
+/// Terminal-state params for a session end event. Bundled so [`Store::record_session_end`] stays
+/// under clippy's argument-count lint (mirrors the `DriveParams` struct in `src/run.rs`).
+#[derive(Clone, Debug, Default)]
+pub struct SessionEnd<'a> {
+    pub realized_cost: Option<f64>,
+    pub cost_source: Option<&'a str>,
+    pub prompt_tokens: Option<i64>,
+    pub completion_tokens: Option<i64>,
+    pub error_kind: Option<&'a str>,
+    pub error_status: Option<u16>,
+    pub terminated_by: Option<&'a str>,
+}
+
 /// A handle to the authoritative event log.
 pub struct Store {
     pub conn: Connection,
@@ -660,18 +673,16 @@ impl Store {
 
     /// Record the terminal metadata event for a session (one per session, append-only).
     /// `terminated_by` mirrors the backend-crate `AbortReason::as_str()` (`None` = natural end).
-    #[allow(clippy::too_many_arguments)]
-    pub fn record_session_end(
-        &self,
-        session_id: i64,
-        realized_cost: Option<f64>,
-        cost_source: Option<&str>,
-        prompt_tokens: Option<i64>,
-        completion_tokens: Option<i64>,
-        error_kind: Option<&str>,
-        error_status: Option<u16>,
-        terminated_by: Option<&str>,
-    ) -> Result<()> {
+    pub fn record_session_end(&self, session_id: i64, end: &SessionEnd<'_>) -> Result<()> {
+        let SessionEnd {
+            realized_cost,
+            cost_source,
+            prompt_tokens,
+            completion_tokens,
+            error_kind,
+            error_status,
+            terminated_by,
+        } = end;
         self.conn.execute(
             "INSERT INTO session_end
                  (session_id, realized_cost, cost_source, prompt_tokens, completion_tokens,
@@ -684,7 +695,7 @@ impl Store {
                 prompt_tokens,
                 completion_tokens,
                 error_kind,
-                error_status,
+                error_status.map(|v| v as i64),
                 terminated_by
             ],
         )?;
@@ -1025,13 +1036,15 @@ mod tests {
         assert_eq!(cap, "replay");
         s.record_session_end(
             sid,
-            Some(0.0),
-            Some("provider"),
-            Some(1200),
-            Some(340),
-            Some("rate_limit"),
-            Some(429),
-            Some("cost_cap"),
+            &SessionEnd {
+                realized_cost: Some(0.0),
+                cost_source: Some("provider"),
+                prompt_tokens: Some(1200),
+                completion_tokens: Some(340),
+                error_kind: Some("rate_limit"),
+                error_status: Some(429),
+                terminated_by: Some("cost_cap"),
+            },
         )
         .unwrap();
         let (cost, src, ek, es, term): (Option<f64>, Option<String>, Option<String>, Option<i64>, Option<String>) = s
@@ -1096,37 +1109,43 @@ mod tests {
 
         s.record_session_end(
             sid_x1,
-            Some(0.5),
-            Some("provider"),
-            Some(100),
-            Some(50),
-            None,
-            None,
-            None,
+            &SessionEnd {
+                realized_cost: Some(0.5),
+                cost_source: Some("provider"),
+                prompt_tokens: Some(100),
+                completion_tokens: Some(50),
+                error_kind: None,
+                error_status: None,
+                terminated_by: None,
+            },
         )
         .unwrap();
         s.record_session_end(
             sid_x2,
-            Some(1.5),
-            Some("provider"),
-            Some(200),
-            Some(100),
-            None,
-            None,
-            None,
+            &SessionEnd {
+                realized_cost: Some(1.5),
+                cost_source: Some("provider"),
+                prompt_tokens: Some(200),
+                completion_tokens: Some(100),
+                error_kind: None,
+                error_status: None,
+                terminated_by: None,
+            },
         )
         .unwrap();
 
         // model-y: no ratings, one too_large failure.
         s.record_session_end(
             sid_y,
-            Some(3.0),
-            Some("estimate"),
-            Some(1000),
-            Some(500),
-            Some("too_large"),
-            Some(413),
-            None,
+            &SessionEnd {
+                realized_cost: Some(3.0),
+                cost_source: Some("estimate"),
+                prompt_tokens: Some(1000),
+                completion_tokens: Some(500),
+                error_kind: Some("too_large"),
+                error_status: Some(413),
+                terminated_by: None,
+            },
         )
         .unwrap();
 

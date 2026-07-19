@@ -32,3 +32,23 @@ tempfile = "3"
 
 [profile.release]
 lto = true
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+correctness = { level = "deny", priority = -1 }
+suspicious = { level = "deny", priority = -1 }
+complexity = { level = "deny", priority = -1 }
+perf = { level = "deny", priority = -1 }
+style = { level = "deny", priority = -1 }
+uninlined_format_args = "warn"
+map_unwrap_or = "warn"
+explicit_iter_loop = "warn"
+semicolon_if_nothing_returned = "warn"
+manual_let_else = "warn"
+redundant_closure_for_method_calls = "warn"
+needless_pass_by_value = "warn"
+
+[lints]
+workspace = true

@@ -21,3 +21,6 @@ chrono = "0.4"
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 tempfile = "3"
+
+[lints]
+workspace = true

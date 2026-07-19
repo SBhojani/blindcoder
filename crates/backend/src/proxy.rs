@@ -108,10 +108,9 @@ fn spawn_warc_writer(
 ) {
     let (tx, mut rx) = mpsc::unbounded_channel::<CaptureLeg>();
     let handle = tokio::task::spawn_blocking(move || {
-        let mut writer = match WarcWriter::from_path(&path) {
-            Ok(w) => w,
-            Err(_) => return, // capture is best-effort: a write failure never breaks a session
-        };
+        let Ok(mut writer) = WarcWriter::from_path(&path) else {
+            return;
+        }; // capture is best-effort
         let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
         while let Some(leg) = rx.blocking_recv() {
             let record = RecordBuilder::default()
@@ -411,9 +410,7 @@ async fn proxy_handler(
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let is_sse = content_type
         .as_ref()
-        .and_then(|c| c.to_str().ok())
-        .map(|s| s.contains("event-stream"))
-        .unwrap_or(false);
+        .is_some_and(|c| c.to_str().ok().is_some_and(|s| s.contains("event-stream")));
 
     // Stream the response back with the model masked to the alias (SSE: per-frame, preserving
     // streaming; JSON: buffered once). We account usage from the *masked* bytes — masking only

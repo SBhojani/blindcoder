@@ -61,7 +61,7 @@ impl StatsRow {
         }
         self.failures
             .iter()
-            .map(|(k, n)| format!("{}:{}", k, n))
+            .map(|(k, n)| format!("{k}:{n}"))
             .collect::<Vec<_>>()
             .join(" ")
     }
@@ -291,7 +291,12 @@ fn print_table(rows: &[StatsRow], reveal: bool) {
         println!("{}", padded.join(" "));
     };
 
-    print_row(&headers.iter().map(|h| h.to_string()).collect::<Vec<_>>());
+    print_row(
+        &headers
+            .iter()
+            .map(std::string::ToString::to_string)
+            .collect::<Vec<_>>(),
+    );
     println!("{sep}");
     for cols in &col_strings {
         print_row(cols);
@@ -405,13 +410,15 @@ mod tests {
         store
             .record_session_end(
                 sid_p,
-                Some(5.0),
-                Some("provider"),
-                Some(1000),
-                Some(500),
-                Some("too_large"),
-                Some(413),
-                None,
+                &store::SessionEnd {
+                    realized_cost: Some(5.0),
+                    cost_source: Some("provider"),
+                    prompt_tokens: Some(1000),
+                    completion_tokens: Some(500),
+                    error_kind: Some("too_large"),
+                    error_status: Some(413),
+                    terminated_by: None,
+                },
             )
             .unwrap();
         // cheap sessions end cheaply.
@@ -419,13 +426,15 @@ mod tests {
             store
                 .record_session_end(
                     sid,
-                    Some(0.1),
-                    Some("provider"),
-                    Some(100),
-                    Some(50),
-                    None,
-                    None,
-                    None,
+                    &store::SessionEnd {
+                        realized_cost: Some(0.1),
+                        cost_source: Some("provider"),
+                        prompt_tokens: Some(100),
+                        completion_tokens: Some(50),
+                        error_kind: None,
+                        error_status: None,
+                        terminated_by: None,
+                    },
                 )
                 .unwrap();
         }

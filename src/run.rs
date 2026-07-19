@@ -236,7 +236,7 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     // The one place blind→real happens: routing needs the real routing target. The lookup runs
     // inside the reveal gate (the single audited crossing point) and is journaled, so the crossing
     // stays auditable and the real identity never leaks to stdout.
-    let cli_label = args.command.first().map(String::as_str).unwrap_or("proxy");
+    let cli_label = args.command.first().map_or("proxy", String::as_str);
     let sid = store.record_session_start(
         &alias_display,
         Some(cli_label),
@@ -321,13 +321,15 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     };
     store.record_session_end(
         sid,
-        Some(realized_cost),
-        Some(cost_source.as_str()),
-        Some(prompt_tokens as i64),
-        Some(completion_tokens as i64),
-        outcome.error_kind.map(|e| e.as_str()),
-        outcome.error_status,
-        outcome.terminated_by.map(|r| r.as_str()),
+        &store::SessionEnd {
+            realized_cost: Some(realized_cost),
+            cost_source: Some(cost_source.as_str()),
+            prompt_tokens: Some(prompt_tokens as i64),
+            completion_tokens: Some(completion_tokens as i64),
+            error_kind: outcome.error_kind.map(|e| e.as_str()),
+            error_status: outcome.error_status,
+            terminated_by: outcome.terminated_by.map(|r| r.as_str()),
+        },
     )?;
 
     let ended = match outcome.terminated_by {
@@ -484,10 +486,10 @@ async fn drive_session(params: DriveParams<'_>) -> Result<backend::SessionOutcom
         command,
     } = params;
     let mut sess = backend.start(pick, alias_display).await?;
-    let endpoint = sess
-        .endpoint()
-        .map(|a| a.to_string())
-        .unwrap_or_else(|| "the configured proxy_addr".to_string());
+    let endpoint = sess.endpoint().map_or_else(
+        || "the configured proxy_addr".to_string(),
+        |a| a.to_string(),
+    );
     let base_url = format!("http://{endpoint}/v1");
 
     if command.is_empty() {
@@ -519,7 +521,7 @@ async fn drive_session(params: DriveParams<'_>) -> Result<backend::SessionOutcom
                 aborting = true;
                 match reason {
                     AbortReason::CostCap => {
-                        eprintln!("cost cap ${cap:.2} reached — stopping session.")
+                        eprintln!("cost cap ${cap:.2} reached — stopping session.");
                     }
                     AbortReason::User => eprintln!("\nstopping session…"),
                 }
@@ -817,13 +819,15 @@ mod tests {
         store
             .record_session_end(
                 sid,
-                Some(0.0),
-                Some("estimate"),
-                Some(0),
-                Some(0),
-                Some(ErrorKind::TooLarge.as_str()),
-                Some(413),
-                None,
+                &store::SessionEnd {
+                    realized_cost: Some(0.0),
+                    cost_source: Some("estimate"),
+                    prompt_tokens: Some(0),
+                    completion_tokens: Some(0),
+                    error_kind: Some(ErrorKind::TooLarge.as_str()),
+                    error_status: Some(413),
+                    terminated_by: None,
+                },
             )
             .unwrap();
 

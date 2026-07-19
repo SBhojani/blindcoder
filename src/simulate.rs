@@ -481,7 +481,7 @@ pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
         "   over training  25%: {:.2}   50%: {:.2}   75%: {:.2}   100%: {:.2}",
         a.cp_best[0], a.cp_best[1], a.cp_best[2], a.cp_best[3]
     );
-    println!("   random-choice baseline: {:.2}", random_rate);
+    println!("   random-choice baseline: {random_rate:.2}");
     println!();
     println!(
         "convergence (good-rate ≥ {:.2} sustained over {} sessions):",
@@ -550,8 +550,7 @@ pub fn run_sweep(args: &SweepArgs, cfg: &Config) -> anyhow::Result<()> {
             let tag = verdict(&a).split(' ').next().unwrap_or("?");
             let ttc = a
                 .median_ttc
-                .map(|m| m.to_string())
-                .unwrap_or_else(|| "-".to_string());
+                .map_or_else(|| "-".to_string(), |m| m.to_string());
             println!(
                 "{},{:.2},{:.3},{:.3},{:.3},{:.3},{:.2},{},{}",
                 pool,
