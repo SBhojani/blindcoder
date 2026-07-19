@@ -1,0 +1,11 @@
+// opencode config for contributors developing THIS repo with opencode.
+//
+// It loads a personal, gitignored `AGENTS.local.md` (if you keep one) into every session via
+// the `instructions` field. This is needed because opencode does NOT auto-read `.local.md`
+// variants, and it does NOT resolve the `@AGENTS.local.md` reference inside `AGENTS.md` (that
+// reference is only a best-effort hint for other tools). A missing `AGENTS.local.md` is fine:
+// opencode globs the entry and silently skips it when absent, so this is safe for everyone.
+{
+  "$schema": "https://opencode.ai/config.json",
+  "instructions": ["AGENTS.local.md"]
+}
