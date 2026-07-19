@@ -4,6 +4,9 @@ Canonical guidance for AI coding agents (and humans) working in this repository.
 one instructions file; if your tool reads a differently-named file, symlink it to this one
 locally rather than committing another copy.
 
+If a gitignored `AGENTS.local.md` is present, follow it too — it holds personal, machine-local
+setup (local toolchain access, VCS workflow) that isn't a project requirement: @AGENTS.local.md
+
 ## What this project is
 
 blindcoder is a blind, cost/quality-aware **router** for agentic coding CLIs: it secretly picks
@@ -20,8 +23,9 @@ cargo fmt --all                  # rustfmt is the formatter
 cargo clippy --workspace         # clippy is the linter
 ```
 
-A Nix flake provides a reproducible dev shell (`nix develop`). Nix is for development/build
-only — never a runtime requirement.
+Requires a Rust stable toolchain (edition 2021). The repo ships a Nix flake providing a
+reproducible dev shell (`nix develop`) — recommended for a matching toolchain, but not required:
+plain rustup works too. Either way, Nix is dev/build only, never a runtime requirement.
 
 ## Architecture — split by durability, not by feature
 
