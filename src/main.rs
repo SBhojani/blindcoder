@@ -1,9 +1,9 @@
 //! blindcoder CLI entry point.
 //!
-//! One binary, several subcommands. At M0 the real, runnable one is [`simulate`] — the offline
-//! convergence harness that validates the selector before any proxy work. The daily-driver
-//! subcommands (`run`/`rate`/`reveal`/`stats`) are wired to the persistent core but land in
-//! later milestones.
+//! One binary, several subcommands. [`simulate`] is the offline convergence harness that validates
+//! the selector with synthetic raters. [`run`] launches a blinded proxy that routes to a picked
+//! model and streams responses back; [`rate`] records (or corrects) a past session's quality.
+//! [`reveal`] and [`stats`] land in later milestones.
 
 mod run;
 mod simulate;

@@ -1,10 +1,11 @@
 //! `run` and `rate` — the daily-driver subcommands, wired to the real selector and store.
 //!
-//! `run` at M0 does everything *except* the actual byte-forwarding: it seeds the pool from config,
-//! folds the effective ratings into candidates, makes a real blind pick, resolves the route through
-//! the reveal gate, and records the session. The forwarding transport (the network piece) lands in
-//! the next milestone behind the `Backend`/`Session` trait; until then `run` closes the session with
-//! an honest `transport_unimplemented` tag rather than pretending a request was proxied.
+//! `run` at M0 seeds the pool from config, folds effective ratings into candidates, makes a real
+//! blind pick, resolves the route through the reveal gate, launches a streaming reverse proxy that
+//! rewrites the blinded model to the real slug, streams responses back to the caller, and records
+//! the session with cost / token usage. The proxy enforces a per-session cost cap and archives raw
+//! wire data at the `replay` capture level. `rate` records (or corrects) a session's quality rating
+//! post-hoc; corrections supersede earlier entries.
 
 use anyhow::{Context, Result};
 use clap::Args;
