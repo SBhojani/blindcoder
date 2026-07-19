@@ -16,8 +16,9 @@ who did it, and over time the router sends more of your work to whatever quietly
 > [`simulate`](#simulate) (the offline convergence harness) validates the selector. `run` now
 > stands up a **streaming forwarding proxy**: it makes a blind pick, proxies your session to the
 > chosen model (rewriting the model on the wire, streaming responses straight back, enforcing a
-> cost cap), and records it; `rate` records your feedback afterward. The hardening — a
-> raw-capture tee and fail-closed per-request privacy — is M1 (see [Roadmap](#roadmap)).
+> cost cap), and records it; `rate` records your feedback afterward. `stats` reads the event log
+> back as a blind per-model leaderboard. The hardening — a raw-capture tee and fail-closed
+> per-request privacy — is M1 (see [Roadmap](#roadmap)).
 
 ## Why blind?
 
@@ -109,6 +110,21 @@ work, so the rating is not anchored on an up-front guess. Made a mistake? Rate a
 > `model` is masked back to the alias (fingerprint fields stripped), and `GET /v1/models` returns
 > just the aliased model — so neither the chat path nor a CLI's model list reveals the real name.
 
+## stats
+
+After a few sessions, `blindcoder stats` prints a per-model leaderboard from the event store:
+sessions, ratings, total cost, failures, and the selector's learned quality and value — all keyed
+by the blind `model_token` so you can compare without being biased by identity.
+
+```sh
+blindcoder stats                  # best value first
+blindcoder stats --sort cost      # sort by total spend
+blindcoder stats --reveal         # unmask real slugs (journaled)
+```
+
+Use `--reveal` only when you are willing to bias future ratings: each unmask is routed through the
+reveal gate and written to the append-only `reveals` table.
+
 ## Configuration
 
 blindcoder is config-file-first. Copy [`config.example.toml`](config.example.toml) to your
@@ -137,8 +153,8 @@ to prove it structurally rather than by hope:
 
 ## Roadmap
 
-- **M0** — the persistent core (selector · store · config · alias), `simulate` (validation), and
-  `run`/`rate` over a streaming forwarding proxy (blind pick, real proxying, cost cap, logging).
+- **M0** — the persistent core (selector · store · config · alias), `simulate` (validation),
+  `run`/`rate` over a streaming forwarding proxy, and a `stats` leaderboard over the event log.
   ← *here*
 - **M1** — the production proxy: raw-capture tee and fail-closed per-request privacy.
 - **M2** — capture levels and byte-exact wire archives; a standing serve mode.

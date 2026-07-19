@@ -251,6 +251,7 @@ dependencies = [
  "selector",
  "serde_json",
  "store",
+ "tempfile",
  "tokio",
 ]
 

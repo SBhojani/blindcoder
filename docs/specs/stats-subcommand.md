@@ -1,6 +1,6 @@
 # Spec: `stats` subcommand — per-model leaderboard from the event store
 
-**Status:** proposed
+**Status:** implemented
 **Scope:** implement the currently-stubbed `stats` CLI subcommand. Read-only over the event store,
 reusing the existing selector math. Respects the blind by default.
 

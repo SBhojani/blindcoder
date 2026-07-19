@@ -48,6 +48,8 @@ pub enum RevealReason {
     UserRequested,
     /// Internal routing needs the real slug to forward the request (not user-visible).
     Routing,
+    /// The user unmasked an identity via the stats leaderboard.
+    Stats,
 }
 
 impl RevealGate {

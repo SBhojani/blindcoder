@@ -3,10 +3,12 @@
 //! One binary, several subcommands. [`simulate`] is the offline convergence harness that validates
 //! the selector with synthetic raters. [`run`] launches a blinded proxy that routes to a picked
 //! model and streams responses back; [`rate`] records (or corrects) a past session's quality.
-//! [`reveal`] and [`stats`] land in later milestones.
+//! [`stats`] prints a per-model leaderboard from the event store. [`reveal`] lands in a later
+//! milestone.
 
 mod run;
 mod simulate;
+mod stats;
 
 use clap::{Parser, Subcommand};
 use std::path::PathBuf;
@@ -38,8 +40,8 @@ enum Cmd {
     Rate(run::RateArgs),
     /// Unmask a session's model — gated and logged. (Later milestone.)
     Reveal,
-    /// Show per-alias quality/cost/value leaderboards. (Later milestone.)
-    Stats,
+    /// Show per-alias quality/cost/value leaderboards.
+    Stats(stats::StatsArgs),
 }
 
 fn main() -> anyhow::Result<()> {
@@ -51,11 +53,12 @@ fn main() -> anyhow::Result<()> {
         Cmd::Sweep(args) => simulate::run_sweep(&args, &cfg),
         Cmd::Run(args) => run::run(&cfg, &args),
         Cmd::Rate(args) => run::rate(&args),
-        Cmd::Reveal | Cmd::Stats => {
+        Cmd::Stats(args) => stats::run(&args, &cfg),
+        Cmd::Reveal => {
             eprintln!(
-                "This subcommand lands in a later milestone. Available now: `simulate`, `sweep`, \
-                 `run`, `rate`.\n\
-                 Try:  blindcoder run --help"
+                "`reveal` lands in a later milestone. Available now: `simulate`, `sweep`, \
+                 `run`, `rate`, `stats`.\n\
+                 Try:  blindcoder stats --help"
             );
             std::process::exit(2);
         }

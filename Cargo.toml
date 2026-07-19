@@ -27,5 +27,8 @@ rand_distr = "0.4"
 serde_json = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal", "process"] }
 
+[dev-dependencies]
+tempfile = "3"
+
 [profile.release]
 lto = true

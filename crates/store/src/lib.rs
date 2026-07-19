@@ -8,6 +8,7 @@ use alias::Alias;
 use anyhow::Result;
 use rusqlite::{Connection, OptionalExtension};
 use rusqlite_migration::{Migrations, M};
+use std::collections::HashMap;
 use std::path::Path;
 
 /// The frozen v1 baseline schema (idempotent). Never edited after shipping — see [`migrations`].
@@ -171,12 +172,135 @@ pub struct EffectiveRating {
     pub rated_at: String,
 }
 
+/// Per-model aggregate facts from the event store. `canonical_key` is the row identity; the blind
+/// `model_token` and full `alias` are what the user normally sees. Cost/token/rating columns come
+/// from `session_end` and `ratings`; quality/value are computed outside the store so the selector
+/// stays clock-free and pure.
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelAggregate {
+    pub canonical_key: String,
+    pub model_token: String,
+    /// One canonical_key may map to several provider catalog rows; this is an arbitrary
+    /// representative real slug used only when the user explicitly reveals.
+    pub real_slug: Option<String>,
+    /// One representative alias display string (provider_token:model_token).
+    pub alias: String,
+    pub sessions: i64,
+    pub rated: i64,
+    /// Average raw performance points (integer semantics, may be None if no ratings).
+    pub avg_performance: Option<f64>,
+    /// Average raw difficulty points.
+    pub avg_difficulty: Option<f64>,
+    /// Total realized cost (summing `session_end.realized_cost`).
+    pub total_cost: f64,
+    /// Average realized cost per session with a known cost; None if no costs recorded.
+    pub avg_cost: Option<f64>,
+    pub total_prompt_tokens: i64,
+    pub total_completion_tokens: i64,
+    pub failures: Vec<ModelFailureCount>,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ModelFailureCount {
+    pub error_kind: String,
+    pub count: i64,
+}
+
 /// A handle to the authoritative event log.
 pub struct Store {
     pub conn: Connection,
 }
 
 impl Store {
+    /// Per-model aggregate leaderboard inputs. Groups sessions by the alias they ran on, then by
+    /// `canonical_key`. Rating/cost columns are aggregates of `ratings` and `session_end`.
+    pub fn model_aggregates(&self) -> Result<Vec<ModelAggregate>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT a.canonical_key,
+                    a.model_token,
+                    (SELECT c.real_slug
+                     FROM catalog c
+                     WHERE c.canonical_key = a.canonical_key
+                     LIMIT 1) AS real_slug,
+                    MIN(a.alias) AS alias,
+                    COUNT(DISTINCT s.id) AS sessions,
+                    COUNT(DISTINCT r.id) AS rated_count,
+                    AVG(r.performance_points) AS avg_perf,
+                    AVG(r.difficulty_points) AS avg_diff,
+                    SUM(e.realized_cost) AS total_cost,
+                    AVG(e.realized_cost) AS avg_cost,
+                    SUM(e.prompt_tokens) AS prompt_tokens,
+                    SUM(e.completion_tokens) AS completion_tokens
+             FROM sessions s
+             JOIN aliases a ON a.alias = s.alias
+             LEFT JOIN session_end e ON e.session_id = s.id
+             LEFT JOIN ratings r ON r.session_id = s.id
+                  AND r.id NOT IN (
+                      SELECT supersedes_rating_id
+                      FROM ratings
+                      WHERE supersedes_rating_id IS NOT NULL
+                  )
+             GROUP BY a.canonical_key, a.model_token
+             ORDER BY sessions DESC",
+        )?;
+
+        let mut rows: Vec<ModelAggregate> = stmt
+            .query_map([], |row| {
+                let total_cost: Option<f64> = row.get("total_cost")?;
+                let avg_cost: Option<f64> = row.get("avg_cost")?;
+                let avg_perf: Option<f64> = row.get("avg_perf")?;
+                let avg_difficulty: Option<f64> = row.get("avg_diff")?;
+                Ok(ModelAggregate {
+                    canonical_key: row.get("canonical_key")?,
+                    model_token: row.get("model_token")?,
+                    real_slug: row.get("real_slug")?,
+                    alias: row.get("alias")?,
+                    sessions: row.get("sessions")?,
+                    rated: row.get("rated_count")?,
+                    avg_performance: avg_perf,
+                    avg_difficulty,
+                    total_cost: total_cost.unwrap_or(0.0),
+                    avg_cost,
+                    total_prompt_tokens: row.get::<_, Option<i64>>("prompt_tokens")?.unwrap_or(0),
+                    total_completion_tokens: row
+                        .get::<_, Option<i64>>("completion_tokens")?
+                        .unwrap_or(0),
+                    failures: Vec::new(),
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        // Failure breakdown is fetched separately so the store returns clean typed counts.
+        let mut failure_stmt = self.conn.prepare(
+            "SELECT a.canonical_key, e.error_kind, COUNT(*) AS n
+             FROM sessions s
+             JOIN aliases a ON a.alias = s.alias
+             JOIN session_end e ON e.session_id = s.id
+             WHERE e.error_kind IS NOT NULL
+             GROUP BY a.canonical_key, e.error_kind",
+        )?;
+        let failure_rows: Vec<(String, String, i64)> = failure_stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+
+        let mut by_key: HashMap<String, usize> = HashMap::with_capacity(rows.len());
+        for (i, row) in rows.iter().enumerate() {
+            by_key.insert(row.canonical_key.clone(), i);
+        }
+        for (key, kind, n) in failure_rows {
+            if let Some(&i) = by_key.get(&key) {
+                rows[i].failures.push(ModelFailureCount {
+                    error_kind: kind,
+                    count: n,
+                });
+            }
+        }
+
+        Ok(rows)
+    }
+
+    // --- the rest of Store impl follows ---
+
     /// Migrate a fresh connection: foreign keys OFF while migrating (so a migration can rebuild a
     /// referenced table — the SQLite 12-step ALTER — without a spurious constraint failure; toggling
     /// FK must happen outside a transaction, which is here, before `to_latest`), then ON so the
@@ -947,5 +1071,95 @@ mod tests {
             .query_row("SELECT count(*) FROM reveals", [], |r| r.get(0))
             .unwrap();
         assert_eq!(n, 2);
+    }
+
+    #[test]
+    fn model_aggregates_counts_sessions_ratings_costs_and_failures() {
+        let s = Store::open_in_memory().unwrap();
+        // Two models: one well-rated cheap model, one unrated expensive failure.
+        let sid_x1 = seed_session(&s, "aaaa:q4m9", "acme/model-x");
+        let sid_x2 = seed_session(&s, "bbbb:q4m9", "acme/model-x"); // same canonical key
+        let sid_y = seed_session(&s, "cccc:z9z9", "acme/model-y");
+
+        // Catalog rows so real_slug can be resolved when revealed.
+        s.upsert_provider("prov", "http://prov.test/v1", "openai")
+            .unwrap();
+        s.upsert_model("acme/model-x", "prov", "prov/model-x")
+            .unwrap();
+        s.upsert_model("acme/model-y", "prov", "prov/model-y")
+            .unwrap();
+
+        // model-x: two ratings, x2 supersedes x1's rating.
+        let r1 = s.record_rating(sid_x1, 1, 2, None).unwrap();
+        s.record_rating(sid_x1, 2, 3, Some(r1)).unwrap();
+        s.record_rating(sid_x2, 0, 1, None).unwrap();
+
+        s.record_session_end(
+            sid_x1,
+            Some(0.5),
+            Some("provider"),
+            Some(100),
+            Some(50),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        s.record_session_end(
+            sid_x2,
+            Some(1.5),
+            Some("provider"),
+            Some(200),
+            Some(100),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+
+        // model-y: no ratings, one too_large failure.
+        s.record_session_end(
+            sid_y,
+            Some(3.0),
+            Some("estimate"),
+            Some(1000),
+            Some(500),
+            Some("too_large"),
+            Some(413),
+            None,
+        )
+        .unwrap();
+
+        let agg = s.model_aggregates().unwrap();
+        assert_eq!(agg.len(), 2);
+        let x = agg
+            .iter()
+            .find(|r| r.canonical_key == "acme/model-x")
+            .unwrap();
+        let y = agg
+            .iter()
+            .find(|r| r.canonical_key == "acme/model-y")
+            .unwrap();
+
+        assert_eq!(x.sessions, 2);
+        assert_eq!(x.rated, 2, "superseded rating must not count");
+        assert!((x.avg_performance.unwrap() - 1.0) < 1e-9);
+        assert!((x.avg_difficulty.unwrap() - 2.0) < 1e-9);
+        assert!((x.total_cost - 2.0).abs() < 1e-9);
+        assert!((x.avg_cost.unwrap() - 1.0).abs() < 1e-9);
+        assert_eq!(x.total_prompt_tokens, 300);
+        assert_eq!(x.total_completion_tokens, 150);
+        assert!(x.failures.is_empty());
+        assert_eq!(x.real_slug.as_deref(), Some("prov/model-x"));
+
+        assert_eq!(y.sessions, 1);
+        assert_eq!(y.rated, 0);
+        assert!(y.avg_performance.is_none());
+        assert!(y.avg_difficulty.is_none());
+        assert!((y.total_cost - 3.0).abs() < 1e-9);
+        assert_eq!(y.failures.len(), 1);
+        assert_eq!(y.failures[0].error_kind, "too_large");
+        assert_eq!(y.failures[0].count, 1);
+        assert_eq!(y.real_slug.as_deref(), Some("prov/model-y"));
     }
 }
