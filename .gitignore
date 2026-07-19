@@ -15,3 +15,7 @@
 /config.toml
 .env
 *.key
+
+# Personal, machine-local agent instructions (referenced by AGENTS.md). Each contributor keeps
+# their own local setup here (Nix/jj/editor/etc.); it is never shared. See AGENTS.md.
+AGENTS.local.md
