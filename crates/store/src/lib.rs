@@ -224,7 +224,12 @@ impl Store {
             "INSERT INTO ratings
                  (session_id, performance_points, difficulty_points, supersedes_rating_id)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params![session_id, performance_points, difficulty_points, supersedes],
+            rusqlite::params![
+                session_id,
+                performance_points,
+                difficulty_points,
+                supersedes
+            ],
         )?;
         Ok(self.conn.last_insert_rowid())
     }
@@ -232,12 +237,7 @@ impl Store {
     /// Journal an alias unmask (append-only). Keeps a peek at a model's identity visible in
     /// history, since seeing it biases later ratings. `reason` should mirror the alias-crate
     /// `RevealReason` (`"user_requested"` | `"routing"`).
-    pub fn record_reveal(
-        &self,
-        alias: &str,
-        session_id: Option<i64>,
-        reason: &str,
-    ) -> Result<i64> {
+    pub fn record_reveal(&self, alias: &str, session_id: Option<i64>, reason: &str) -> Result<i64> {
         self.conn.execute(
             "INSERT INTO reveals (alias, session_id, reason) VALUES (?1, ?2, ?3)",
             rusqlite::params![alias, session_id, reason],
@@ -350,7 +350,12 @@ impl Store {
     }
 
     /// Insert or refresh a model's provider-native slug in the catalog.
-    pub fn upsert_model(&self, canonical_key: &str, provider_slug: &str, real_slug: &str) -> Result<()> {
+    pub fn upsert_model(
+        &self,
+        canonical_key: &str,
+        provider_slug: &str,
+        real_slug: &str,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO catalog (canonical_key, provider_slug, real_slug) VALUES (?1, ?2, ?3)
              ON CONFLICT(canonical_key, provider_slug) DO UPDATE SET real_slug = excluded.real_slug",
@@ -453,13 +458,23 @@ impl Store {
                 "SELECT provider_token, model_token FROM aliases
                  WHERE canonical_key = ?1 AND provider_slug = ?2",
                 rusqlite::params![canonical_key, provider_slug],
-                |r| Ok(Alias { provider_token: r.get(0)?, model_token: r.get(1)? }),
+                |r| {
+                    Ok(Alias {
+                        provider_token: r.get(0)?,
+                        model_token: r.get(1)?,
+                    })
+                },
             )
             .optional()?)
     }
 
     /// Persist a freshly minted alias (immutable once written).
-    pub fn insert_alias(&self, alias: &Alias, canonical_key: &str, provider_slug: &str) -> Result<()> {
+    pub fn insert_alias(
+        &self,
+        alias: &Alias,
+        canonical_key: &str,
+        provider_slug: &str,
+    ) -> Result<()> {
         self.conn.execute(
             "INSERT INTO aliases (alias, provider_token, model_token, canonical_key, provider_slug)
              VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -576,7 +591,9 @@ mod tests {
         // Empirical check that the v3 table rebuilds are safe: append-only triggers survive on BOTH
         // rebuilt tables, the new CHECKs reject bad values, FK integrity is clean, data is preserved.
         let s = Store::open_in_memory().unwrap(); // runs all migrations, incl. the v3 rebuilds
-        s.conn.execute("INSERT INTO sessions (alias) VALUES ('a:b')", []).unwrap();
+        s.conn
+            .execute("INSERT INTO sessions (alias) VALUES ('a:b')", [])
+            .unwrap();
         let sid = s.conn.last_insert_rowid();
         s.conn
             .execute(
@@ -587,29 +604,73 @@ mod tests {
             .unwrap();
 
         // (a) append-only triggers still fire on both rebuilt tables.
-        assert!(s.conn.execute("UPDATE sessions SET alias='x' WHERE id=?1", [sid]).is_err());
-        assert!(s.conn.execute("DELETE FROM sessions WHERE id=?1", [sid]).is_err());
-        assert!(s.conn.execute("UPDATE session_end SET error_status=500 WHERE session_id=?1", [sid]).is_err());
-        assert!(s.conn.execute("DELETE FROM session_end WHERE session_id=?1", [sid]).is_err());
+        assert!(s
+            .conn
+            .execute("UPDATE sessions SET alias='x' WHERE id=?1", [sid])
+            .is_err());
+        assert!(s
+            .conn
+            .execute("DELETE FROM sessions WHERE id=?1", [sid])
+            .is_err());
+        assert!(s
+            .conn
+            .execute(
+                "UPDATE session_end SET error_status=500 WHERE session_id=?1",
+                [sid]
+            )
+            .is_err());
+        assert!(s
+            .conn
+            .execute("DELETE FROM session_end WHERE session_id=?1", [sid])
+            .is_err());
 
         // (b) the new CHECKs accept valid and reject invalid values.
-        s.conn.execute("INSERT INTO sessions (alias, capture_level) VALUES ('c:d','replay')", []).unwrap();
-        assert!(s.conn.execute("INSERT INTO sessions (alias, capture_level) VALUES ('e:f','bogus')", []).is_err());
-        s.conn.execute("INSERT INTO sessions (alias) VALUES ('g:h')", []).unwrap();
+        s.conn
+            .execute(
+                "INSERT INTO sessions (alias, capture_level) VALUES ('c:d','replay')",
+                [],
+            )
+            .unwrap();
+        assert!(s
+            .conn
+            .execute(
+                "INSERT INTO sessions (alias, capture_level) VALUES ('e:f','bogus')",
+                []
+            )
+            .is_err());
+        s.conn
+            .execute("INSERT INTO sessions (alias) VALUES ('g:h')", [])
+            .unwrap();
         let sid2 = s.conn.last_insert_rowid();
-        assert!(s.conn.execute("INSERT INTO session_end (session_id, error_kind) VALUES (?1,'nonsense')", [sid2]).is_err());
-        assert!(s.conn.execute("INSERT INTO session_end (session_id, terminated_by) VALUES (?1,'nope')", [sid2]).is_err());
+        assert!(s
+            .conn
+            .execute(
+                "INSERT INTO session_end (session_id, error_kind) VALUES (?1,'nonsense')",
+                [sid2]
+            )
+            .is_err());
+        assert!(s
+            .conn
+            .execute(
+                "INSERT INTO session_end (session_id, terminated_by) VALUES (?1,'nope')",
+                [sid2]
+            )
+            .is_err());
         // v4 widened the error_kind set: 'too_large' (413) is now accepted.
-        s.conn.execute("INSERT INTO sessions (alias) VALUES ('i:j')", []).unwrap();
+        s.conn
+            .execute("INSERT INTO sessions (alias) VALUES ('i:j')", [])
+            .unwrap();
         let sid3 = s.conn.last_insert_rowid();
         s.conn.execute("INSERT INTO session_end (session_id, error_kind, error_status) VALUES (?1,'too_large',413)", [sid3]).unwrap();
 
         // (c) data preserved incl. the new error_status column.
         let (ek, es): (String, i64) = s
             .conn
-            .query_row("SELECT error_kind, error_status FROM session_end WHERE session_id=?1", [sid], |r| {
-                Ok((r.get(0)?, r.get(1)?))
-            })
+            .query_row(
+                "SELECT error_kind, error_status FROM session_end WHERE session_id=?1",
+                [sid],
+                |r| Ok((r.get(0)?, r.get(1)?)),
+            )
             .unwrap();
         assert_eq!(ek, "rate_limit");
         assert_eq!(es, 429);
@@ -617,7 +678,9 @@ mod tests {
         // (d) foreign-key integrity is clean after rebuilding the referenced `sessions` table.
         let fk_issues: i64 = s
             .conn
-            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| r.get(0))
+            .query_row("SELECT count(*) FROM pragma_foreign_key_check", [], |r| {
+                r.get(0)
+            })
             .unwrap();
         assert_eq!(fk_issues, 0);
     }
@@ -633,9 +696,13 @@ mod tests {
         // Simulate a pre-migration DB: baseline schema only (v1), a real row, no cost_source.
         let mut conn = Connection::open_in_memory().unwrap();
         conn.execute_batch(SCHEMA).unwrap();
-        conn.execute("INSERT INTO sessions (alias) VALUES ('a:b')", []).unwrap();
-        conn.execute("INSERT INTO session_end (session_id, realized_cost) VALUES (1, 0.5)", [])
+        conn.execute("INSERT INTO sessions (alias) VALUES ('a:b')", [])
             .unwrap();
+        conn.execute(
+            "INSERT INTO session_end (session_id, realized_cost) VALUES (1, 0.5)",
+            [],
+        )
+        .unwrap();
         assert!(
             conn.prepare("SELECT cost_source FROM session_end").is_err(),
             "cost_source should not exist on the baseline yet"
@@ -658,12 +725,20 @@ mod tests {
             .unwrap();
         assert_eq!(cost, 0.5);
         assert_eq!(src, None);
-        conn.execute("INSERT INTO sessions (alias) VALUES ('c:d')", []).unwrap();
-        conn.execute("INSERT INTO session_end (session_id, cost_source) VALUES (2, 'provider')", [])
+        conn.execute("INSERT INTO sessions (alias) VALUES ('c:d')", [])
             .unwrap();
-        conn.execute("INSERT INTO sessions (alias) VALUES ('e:f')", []).unwrap();
+        conn.execute(
+            "INSERT INTO session_end (session_id, cost_source) VALUES (2, 'provider')",
+            [],
+        )
+        .unwrap();
+        conn.execute("INSERT INTO sessions (alias) VALUES ('e:f')", [])
+            .unwrap();
         assert!(conn
-            .execute("INSERT INTO session_end (session_id, cost_source) VALUES (3, 'bogus')", [])
+            .execute(
+                "INSERT INTO session_end (session_id, cost_source) VALUES (3, 'bogus')",
+                []
+            )
             .is_err());
     }
 
@@ -749,12 +824,20 @@ mod tests {
     #[test]
     fn seed_resolve_route_round_trips() {
         let s = Store::open_in_memory().unwrap();
-        s.upsert_provider("prov-a", "http://prov-a.test/v1", "openai").unwrap();
-        s.upsert_model("model-x", "prov-a", "prov-a/model-x").unwrap();
-        let a = Alias { provider_token: "pt01".into(), model_token: "mt01".into() };
+        s.upsert_provider("prov-a", "http://prov-a.test/v1", "openai")
+            .unwrap();
+        s.upsert_model("model-x", "prov-a", "prov-a/model-x")
+            .unwrap();
+        let a = Alias {
+            provider_token: "pt01".into(),
+            model_token: "mt01".into(),
+        };
         s.insert_alias(&a, "model-x", "prov-a").unwrap();
 
-        let route = s.resolve_route(&a.display()).unwrap().expect("route resolves");
+        let route = s
+            .resolve_route(&a.display())
+            .unwrap()
+            .expect("route resolves");
         assert_eq!(route.real_slug, "prov-a/model-x");
         assert_eq!(route.base_url, "http://prov-a.test/v1");
         assert_eq!(route.canonical_key, "model-x");
@@ -767,17 +850,28 @@ mod tests {
         // aliases still reveal they are the same model.
         let s = Store::open_in_memory().unwrap();
         assert!(s.model_token_for("model-x").unwrap().is_none());
-        let a = Alias { provider_token: "pt01".into(), model_token: "mt01".into() };
+        let a = Alias {
+            provider_token: "pt01".into(),
+            model_token: "mt01".into(),
+        };
         s.insert_alias(&a, "model-x", "prov-a").unwrap();
-        assert_eq!(s.model_token_for("model-x").unwrap().as_deref(), Some("mt01"));
-        assert_eq!(s.provider_token_for("prov-a").unwrap().as_deref(), Some("pt01"));
+        assert_eq!(
+            s.model_token_for("model-x").unwrap().as_deref(),
+            Some("mt01")
+        );
+        assert_eq!(
+            s.provider_token_for("prov-a").unwrap().as_deref(),
+            Some("pt01")
+        );
     }
 
     #[test]
     fn prices_append_on_change_only() {
         let s = Store::open_in_memory().unwrap();
-        s.record_price_if_changed("model-x", "prov-a", Some(0.55), Some(2.2)).unwrap();
-        s.record_price_if_changed("model-x", "prov-a", Some(0.55), Some(2.2)).unwrap(); // unchanged → no-op
+        s.record_price_if_changed("model-x", "prov-a", Some(0.55), Some(2.2))
+            .unwrap();
+        s.record_price_if_changed("model-x", "prov-a", Some(0.55), Some(2.2))
+            .unwrap(); // unchanged → no-op
         let n: i64 = s
             .conn
             .query_row("SELECT count(*) FROM price_history", [], |r| r.get(0))
@@ -792,15 +886,28 @@ mod tests {
     #[test]
     fn session_lifecycle_records_start_and_terminated_end() {
         let s = Store::open_in_memory().unwrap();
-        let sid = s.record_session_start("x7k2:q4m9", Some("opencode"), None, "replay").unwrap();
+        let sid = s
+            .record_session_start("x7k2:q4m9", Some("opencode"), None, "replay")
+            .unwrap();
         // The capture level the session was recorded at is persisted on the sessions row.
         let cap: String = s
             .conn
-            .query_row("SELECT capture_level FROM sessions WHERE id = ?1", [sid], |r| r.get(0))
+            .query_row(
+                "SELECT capture_level FROM sessions WHERE id = ?1",
+                [sid],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(cap, "replay");
         s.record_session_end(
-            sid, Some(0.0), Some("provider"), Some(1200), Some(340), Some("rate_limit"), Some(429), Some("cost_cap"),
+            sid,
+            Some(0.0),
+            Some("provider"),
+            Some(1200),
+            Some(340),
+            Some("rate_limit"),
+            Some(429),
+            Some("cost_cap"),
         )
         .unwrap();
         let (cost, src, ek, es, term): (Option<f64>, Option<String>, Option<String>, Option<i64>, Option<String>) = s

@@ -23,7 +23,10 @@ pub struct CostBasis {
 
 impl Default for CostBasis {
     fn default() -> Self {
-        Self { input_weight: 0.70, output_weight: 0.30 }
+        Self {
+            input_weight: 0.70,
+            output_weight: 0.30,
+        }
     }
 }
 
@@ -166,7 +169,9 @@ impl Config {
     /// Build the effective config: defaults → TOML file (if given/found) → environment overlay.
     /// CLI-flag overrides are applied by the caller afterwards (highest precedence).
     pub fn load(explicit_path: Option<&Path>) -> anyhow::Result<Config> {
-        let path = explicit_path.map(PathBuf::from).or_else(default_config_path);
+        let path = explicit_path
+            .map(PathBuf::from)
+            .or_else(default_config_path);
         let mut cfg = match path {
             Some(p) if p.exists() => {
                 let text = std::fs::read_to_string(&p)?;
@@ -235,7 +240,9 @@ fn xdg_dir(env_key: &str, home_suffix: &str) -> Option<PathBuf> {
             return Some(PathBuf::from(v));
         }
     }
-    std::env::var("HOME").ok().map(|h| PathBuf::from(h).join(home_suffix))
+    std::env::var("HOME")
+        .ok()
+        .map(|h| PathBuf::from(h).join(home_suffix))
 }
 
 #[cfg(test)]
@@ -298,7 +305,10 @@ output_per_mtok = 2.2
         assert!(free.models[0].input_per_mtok.is_none()); // free
 
         let paid = &c.providers[1];
-        assert_eq!(paid.extra_headers.get("X-Title").map(String::as_str), Some("blindcoder"));
+        assert_eq!(
+            paid.extra_headers.get("X-Title").map(String::as_str),
+            Some("blindcoder")
+        );
         assert!(paid.extra_body.contains_key("provider"));
         // Same canonical_key under both providers — the cross-provider identity the selector shares.
         assert_eq!(paid.models[0].canonical_key, free.models[0].canonical_key);

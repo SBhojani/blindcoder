@@ -99,7 +99,10 @@ fn ensure_alias<R: Rng + ?Sized>(
         Some(t) => t,
         None => mint_token(rng, TOKEN_LEN),
     };
-    let a = Alias { provider_token, model_token };
+    let a = Alias {
+        provider_token,
+        model_token,
+    };
     store.insert_alias(&a, canonical_key, provider_slug)?;
     Ok(a)
 }
@@ -147,10 +150,13 @@ fn build_pool(store: &Store, cfg: &Config) -> Result<(Vec<Candidate>, Vec<PoolEn
         let loss_weight = ErrorKind::from_wire(&f.error_kind)
             .unwrap_or(ErrorKind::Unknown)
             .loss_weight();
-        fails_by_key.entry(f.canonical_key).or_default().push(Failure {
-            loss_weight,
-            age_days: f.age_days,
-        });
+        fails_by_key
+            .entry(f.canonical_key)
+            .or_default()
+            .push(Failure {
+                loss_weight,
+                age_days: f.age_days,
+            });
     }
     let no_ratings: Vec<Rating> = Vec::new();
     let no_fails: Vec<Failure> = Vec::new();
@@ -184,7 +190,11 @@ fn build_pool(store: &Store, cfg: &Config) -> Result<(Vec<Candidate>, Vec<PoolEn
             } else {
                 fold_track_record_with_failures(ratings, failures, &t)
             };
-            Candidate { id: i, track, normalized_price: norm[i] }
+            Candidate {
+                id: i,
+                track,
+                normalized_price: norm[i],
+            }
         })
         .collect();
     Ok((cands, entries))
@@ -227,8 +237,12 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     // inside the reveal gate (the single audited crossing point) and is journaled, so the crossing
     // stays auditable and the real identity never leaks to stdout.
     let cli_label = args.command.first().map(String::as_str).unwrap_or("proxy");
-    let sid =
-        store.record_session_start(&alias_display, Some(cli_label), None, cfg.capture_level.as_str())?;
+    let sid = store.record_session_start(
+        &alias_display,
+        Some(cli_label),
+        None,
+        cfg.capture_level.as_str(),
+    )?;
     let route = RevealGate
         .reveal(&entry.alias, RevealReason::Routing, |a| {
             store.resolve_route(&a.display()).ok().flatten()
@@ -238,8 +252,11 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
 
     // Resolve the provider's credentials + passthrough hooks (all data, no provider branch).
     let api_key = resolve_api_key(provider)?;
-    let extra_headers: Vec<(String, String)> =
-        provider.extra_headers.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+    let extra_headers: Vec<(String, String)> = provider
+        .extra_headers
+        .iter()
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
     let mut extra_body = serde_json::Map::new();
     for (k, v) in &provider.extra_body {
         if let Ok(jv) = serde_json::to_value(v) {
@@ -281,7 +298,14 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
         .build()
         .context("building the async runtime")?;
     let outcome = runtime.block_on(drive_session(
-        &backend, &pick, &alias_display, entries.len(), cap, in_price, out_price, &args.command,
+        &backend,
+        &pick,
+        &alias_display,
+        entries.len(),
+        cap,
+        in_price,
+        out_price,
+        &args.command,
     ))?;
 
     // Record the terminal event: how it ended, and the realized cost — the provider-reported figure
@@ -290,7 +314,10 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     let completion_tokens = outcome.completion_tokens.unwrap_or(0);
     let (realized_cost, cost_source) = match outcome.realized_cost {
         Some(c) => (c, CostSource::Provider),
-        None => (cost_usd(prompt_tokens, completion_tokens, in_price, out_price), CostSource::Estimate),
+        None => (
+            cost_usd(prompt_tokens, completion_tokens, in_price, out_price),
+            CostSource::Estimate,
+        ),
     };
     store.record_session_end(
         sid,
@@ -326,7 +353,9 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
             println!("  rate later:  blindcoder rate --session {sid} --performance <-2..2> --difficulty <0..4>");
         }
     } else {
-        println!("  rate it:  blindcoder rate --session {sid} --performance <-2..2> --difficulty <0..4>");
+        println!(
+            "  rate it:  blindcoder rate --session {sid} --performance <-2..2> --difficulty <0..4>"
+        );
     }
     Ok(())
 }
@@ -334,7 +363,8 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
 /// Prompt the two blind ratings on stdin after a launched session and record them. Enter on the
 /// first question skips rating entirely.
 fn prompt_and_rate(store: &Store, sid: i64) -> Result<()> {
-    let Some(performance) = prompt_int("  how did it perform?  [-2..2, Enter to skip]: ", -2, 2)? else {
+    let Some(performance) = prompt_int("  how did it perform?  [-2..2, Enter to skip]: ", -2, 2)?
+    else {
         println!("  rating skipped.");
         return Ok(());
     };
@@ -461,7 +491,9 @@ async fn drive_session(
             if let Some(reason) = abort_reason {
                 aborting = true;
                 match reason {
-                    AbortReason::CostCap => eprintln!("cost cap ${cap:.2} reached — stopping session."),
+                    AbortReason::CostCap => {
+                        eprintln!("cost cap ${cap:.2} reached — stopping session.")
+                    }
                     AbortReason::User => eprintln!("\nstopping session…"),
                 }
                 sess.abort(reason).await;
@@ -474,7 +506,10 @@ async fn drive_session(
         cmd.args(&command[1..])
             .env("OPENAI_BASE_URL", &base_url)
             .env("OPENAI_API_KEY", "blindcoder")
-            .env("OPENCODE_CONFIG_CONTENT", opencode_config_content(&base_url, alias_display));
+            .env(
+                "OPENCODE_CONFIG_CONTENT",
+                opencode_config_content(&base_url, alias_display),
+            );
         let mut child = cmd
             .spawn()
             .with_context(|| format!("failed to launch `{}`", command[0]))?;
@@ -504,7 +539,10 @@ async fn drive_session(
             }
             if let Some(reason) = abort_reason {
                 aborting = true;
-                eprintln!("\nblindcoder: cost cap ${cap:.2} reached — terminating `{}`.", command[0]);
+                eprintln!(
+                    "\nblindcoder: cost cap ${cap:.2} reached — terminating `{}`.",
+                    command[0]
+                );
                 sess.abort(reason).await;
                 let _ = child.start_kill();
             }
@@ -551,10 +589,20 @@ pub struct RateArgs {
 pub fn rate(args: &RateArgs) -> Result<()> {
     let store = open_store()?;
     let id = store
-        .record_rating(args.session, args.performance, args.difficulty, args.supersedes)
-        .context("failed to record rating (check the ranges: performance -2..=2, difficulty 0..=4)")?;
+        .record_rating(
+            args.session,
+            args.performance,
+            args.difficulty,
+            args.supersedes,
+        )
+        .context(
+            "failed to record rating (check the ranges: performance -2..=2, difficulty 0..=4)",
+        )?;
     match args.supersedes {
-        Some(old) => println!("recorded rating #{id} for session #{} (supersedes #{old})", args.session),
+        Some(old) => println!(
+            "recorded rating #{id} for session #{} (supersedes #{old})",
+            args.session
+        ),
         None => println!("recorded rating #{id} for session #{}", args.session),
     }
     Ok(())
@@ -596,7 +644,10 @@ mod tests {
             }],
             ..Default::default()
         };
-        Config { providers: vec![free, paid], ..Default::default() }
+        Config {
+            providers: vec![free, paid],
+            ..Default::default()
+        }
     }
 
     #[test]
@@ -642,8 +693,14 @@ mod tests {
         assert_eq!(n, 2);
         let free_alias = store.alias_for("model-x", "free-prov").unwrap().unwrap();
         let paid_alias = store.alias_for("model-x", "paid-prov").unwrap().unwrap();
-        assert_eq!(free_alias.model_token, paid_alias.model_token, "same model → same model-token");
-        assert_ne!(free_alias.provider_token, paid_alias.provider_token, "different providers");
+        assert_eq!(
+            free_alias.model_token, paid_alias.model_token,
+            "same model → same model-token"
+        );
+        assert_ne!(
+            free_alias.provider_token, paid_alias.provider_token,
+            "different providers"
+        );
         // The free model records no price row; only the priced provider does.
         assert_eq!(store.latest_prices().unwrap().len(), 1);
     }
@@ -658,8 +715,14 @@ mod tests {
         let (cands, entries) = build_pool(&store, &cfg).unwrap();
         assert_eq!(cands.len(), 2);
         // The free entry normalizes to price 0; the priced entry to 1 (pool max).
-        let free_i = entries.iter().position(|e| e.provider_slug == "free-prov").unwrap();
-        let paid_i = entries.iter().position(|e| e.provider_slug == "paid-prov").unwrap();
+        let free_i = entries
+            .iter()
+            .position(|e| e.provider_slug == "free-prov")
+            .unwrap();
+        let paid_i = entries
+            .iter()
+            .position(|e| e.provider_slug == "paid-prov")
+            .unwrap();
         assert_eq!(cands[free_i].normalized_price, 0.0);
         assert_eq!(cands[paid_i].normalized_price, 1.0);
         // No ratings yet → both candidates fold to the blank prior.
@@ -677,14 +740,29 @@ mod tests {
         // priced provider's entry for the same model must see the same lifted track record. Start
         // the session with the real alias so the ratings→aliases fold join resolves (sessions are
         // append-only, so the alias is set at creation, never updated).
-        let free_alias = store.alias_for("model-x", "free-prov").unwrap().unwrap().display();
-        let sid = store.record_session_start(&free_alias, None, None, "metadata").unwrap();
+        let free_alias = store
+            .alias_for("model-x", "free-prov")
+            .unwrap()
+            .unwrap()
+            .display();
+        let sid = store
+            .record_session_start(&free_alias, None, None, "metadata")
+            .unwrap();
         store.record_rating(sid, 2, 0, None).unwrap();
 
         let (cands, entries) = build_pool(&store, &cfg).unwrap();
-        let free_i = entries.iter().position(|e| e.provider_slug == "free-prov").unwrap();
-        let paid_i = entries.iter().position(|e| e.provider_slug == "paid-prov").unwrap();
-        assert!(cands[free_i].track.mean() > 0.5, "a positive rating lifts the track record");
+        let free_i = entries
+            .iter()
+            .position(|e| e.provider_slug == "free-prov")
+            .unwrap();
+        let paid_i = entries
+            .iter()
+            .position(|e| e.provider_slug == "paid-prov")
+            .unwrap();
+        assert!(
+            cands[free_i].track.mean() > 0.5,
+            "a positive rating lifts the track record"
+        );
         assert_eq!(
             cands[free_i].track.mean(),
             cands[paid_i].track.mean(),
@@ -701,17 +779,40 @@ mod tests {
 
         // A too_large failure on the free provider's alias — never rated, but it must still be learned
         // against, keyed on canonical_key so both providers' entries for the model see it.
-        let free_alias = store.alias_for("model-x", "free-prov").unwrap().unwrap().display();
-        let sid = store.record_session_start(&free_alias, None, None, "metadata").unwrap();
+        let free_alias = store
+            .alias_for("model-x", "free-prov")
+            .unwrap()
+            .unwrap()
+            .display();
+        let sid = store
+            .record_session_start(&free_alias, None, None, "metadata")
+            .unwrap();
         store
-            .record_session_end(sid, Some(0.0), Some("estimate"), Some(0), Some(0),
-                                Some(ErrorKind::TooLarge.as_str()), Some(413), None)
+            .record_session_end(
+                sid,
+                Some(0.0),
+                Some("estimate"),
+                Some(0),
+                Some(0),
+                Some(ErrorKind::TooLarge.as_str()),
+                Some(413),
+                None,
+            )
             .unwrap();
 
         let (cands, entries) = build_pool(&store, &cfg).unwrap();
-        let free_i = entries.iter().position(|e| e.provider_slug == "free-prov").unwrap();
-        let paid_i = entries.iter().position(|e| e.provider_slug == "paid-prov").unwrap();
-        assert!(cands[free_i].track.mean() < 0.5, "a failure drags the track record below the prior");
+        let free_i = entries
+            .iter()
+            .position(|e| e.provider_slug == "free-prov")
+            .unwrap();
+        let paid_i = entries
+            .iter()
+            .position(|e| e.provider_slug == "paid-prov")
+            .unwrap();
+        assert!(
+            cands[free_i].track.mean() < 0.5,
+            "a failure drags the track record below the prior"
+        );
         assert_eq!(
             cands[free_i].track.mean(),
             cands[paid_i].track.mean(),
@@ -722,6 +823,9 @@ mod tests {
         let mut cfg0 = cfg.clone();
         cfg0.failure_sensitivity = 0.0;
         let (cands0, _) = build_pool(&store, &cfg0).unwrap();
-        assert!((cands0[free_i].track.mean() - 0.5).abs() < 1e-12, "sensitivity 0 ignores failures");
+        assert!(
+            (cands0[free_i].track.mean() - 0.5).abs() < 1e-12,
+            "sensitivity 0 ignores failures"
+        );
     }
 }

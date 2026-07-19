@@ -84,7 +84,10 @@ mod tests {
 
     #[test]
     fn reveal_goes_through_the_gate() {
-        let a = Alias { provider_token: "x7k2".into(), model_token: "q4m9".into() };
+        let a = Alias {
+            provider_token: "x7k2".into(),
+            model_token: "q4m9".into(),
+        };
         let got = RevealGate.reveal(&a, RevealReason::UserRequested, |al| {
             (al.model_token == "q4m9").then(|| "acme/model-x".to_string())
         });

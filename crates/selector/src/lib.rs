@@ -120,7 +120,10 @@ pub struct TrackRecord {
 impl TrackRecord {
     /// The blank-slate prior every candidate starts from.
     pub fn blank() -> Self {
-        Self { wins: PRIOR, losses: PRIOR }
+        Self {
+            wins: PRIOR,
+            losses: PRIOR,
+        }
     }
 
     /// Posterior mean quality (point estimate; the selector uses a *draw*, not this).
@@ -238,11 +241,16 @@ pub fn prune_dominated(cands: &[Candidate], t: &Tuneables) -> Vec<usize> {
             let std = ((w * l) / (n * n * (n + 1.0))).sqrt();
             let q_lo = (mean - k * std).clamp(0.0, 1.0);
             let q_hi = (mean + k * std).clamp(0.0, 1.0);
-            (value_score(q_lo, c.normalized_price, t), value_score(q_hi, c.normalized_price, t))
+            (
+                value_score(q_lo, c.normalized_price, t),
+                value_score(q_hi, c.normalized_price, t),
+            )
         })
         .collect();
     let best_pess = bounds.iter().map(|b| b.0).fold(f64::NEG_INFINITY, f64::max);
-    let keep: Vec<usize> = (0..cands.len()).filter(|&i| bounds[i].1 >= best_pess).collect();
+    let keep: Vec<usize> = (0..cands.len())
+        .filter(|&i| bounds[i].1 >= best_pess)
+        .collect();
     if keep.is_empty() {
         (0..cands.len()).collect() // defensive: never prune everything
     } else {
@@ -267,7 +275,11 @@ mod tests {
     fn decay_halves_contribution_at_one_half_life() {
         let t = Tuneables::default();
         let fresh = fold_track_record(
-            &[Rating { performance_points: 2.0, difficulty_points: 0.0, age_days: 0.0 }],
+            &[Rating {
+                performance_points: 2.0,
+                difficulty_points: 0.0,
+                age_days: 0.0,
+            }],
             &t,
         );
         let old = fold_track_record(
@@ -287,15 +299,28 @@ mod tests {
     #[test]
     fn failures_lower_quality_and_sensitivity_disables_them() {
         let t = Tuneables::default();
-        let rating = Rating { performance_points: 2.0, difficulty_points: 0.0, age_days: 0.0 };
+        let rating = Rating {
+            performance_points: 2.0,
+            difficulty_points: 0.0,
+            age_days: 0.0,
+        };
         let clean = fold_track_record(&[rating], &t);
         // Same rating, but the candidate also failed hard three times → lower posterior mean.
-        let fails = [Failure { loss_weight: 1.0, age_days: 0.0 }; 3];
+        let fails = [Failure {
+            loss_weight: 1.0,
+            age_days: 0.0,
+        }; 3];
         let with_fails = fold_track_record_with_failures(&[rating], &fails, &t);
-        assert!(with_fails.mean() < clean.mean(), "failures must drag the quality belief down");
+        assert!(
+            with_fails.mean() < clean.mean(),
+            "failures must drag the quality belief down"
+        );
         assert!(with_fails.losses > clean.losses);
         // failure_sensitivity = 0 makes failures inert (back to the clean record).
-        let t0 = Tuneables { failure_sensitivity: 0.0, ..t };
+        let t0 = Tuneables {
+            failure_sensitivity: 0.0,
+            ..t
+        };
         let disabled = fold_track_record_with_failures(&[rating], &fails, &t0);
         assert_eq!(disabled.losses, clean.losses);
         assert_eq!(disabled.wins, clean.wins);
@@ -305,9 +330,21 @@ mod tests {
     fn failures_decay_with_age() {
         let t = Tuneables::default();
         let fresh = fold_track_record_with_failures(
-            &[], &[Failure { loss_weight: 1.0, age_days: 0.0 }], &t);
+            &[],
+            &[Failure {
+                loss_weight: 1.0,
+                age_days: 0.0,
+            }],
+            &t,
+        );
         let old = fold_track_record_with_failures(
-            &[], &[Failure { loss_weight: 1.0, age_days: t.rating_half_life_days }], &t);
+            &[],
+            &[Failure {
+                loss_weight: 1.0,
+                age_days: t.rating_half_life_days,
+            }],
+            &t,
+        );
         // An aged failure adds half the loss mass (above the prior) of a fresh one.
         assert!(((old.losses - PRIOR) - (fresh.losses - PRIOR) * 0.5).abs() < 1e-9);
     }
@@ -349,13 +386,30 @@ mod tests {
         let t = Tuneables::default();
         let cands = vec![
             // cheap and well-rated
-            Candidate { id: 0, track: TrackRecord { wins: 20.0, losses: 2.0 }, normalized_price: 0.0 },
+            Candidate {
+                id: 0,
+                track: TrackRecord {
+                    wins: 20.0,
+                    losses: 2.0,
+                },
+                normalized_price: 0.0,
+            },
             // priciest possible and badly rated → cannot win on value
-            Candidate { id: 1, track: TrackRecord { wins: 2.0, losses: 20.0 }, normalized_price: 1.0 },
+            Candidate {
+                id: 1,
+                track: TrackRecord {
+                    wins: 2.0,
+                    losses: 20.0,
+                },
+                normalized_price: 1.0,
+            },
         ];
         let keep = prune_dominated(&cands, &t);
         assert!(keep.contains(&0), "the leader must be kept");
-        assert!(!keep.contains(&1), "the hopeless expensive candidate should be pruned");
+        assert!(
+            !keep.contains(&1),
+            "the hopeless expensive candidate should be pruned"
+        );
         assert!(!keep.is_empty());
     }
 
@@ -364,8 +418,16 @@ mod tests {
         let t = Tuneables::default();
         // two blank-slate candidates at the same price: nothing is known, prune nothing.
         let cands = vec![
-            Candidate { id: 0, track: TrackRecord::blank(), normalized_price: 0.5 },
-            Candidate { id: 1, track: TrackRecord::blank(), normalized_price: 0.5 },
+            Candidate {
+                id: 0,
+                track: TrackRecord::blank(),
+                normalized_price: 0.5,
+            },
+            Candidate {
+                id: 1,
+                track: TrackRecord::blank(),
+                normalized_price: 0.5,
+            },
         ];
         assert_eq!(prune_dominated(&cands, &t).len(), 2);
     }
@@ -376,13 +438,24 @@ mod tests {
         // Before the credit-gating fix this was -2 + 0.75*4 = +1 -> logistic(0.5) ~ 0.62 (a "win").
         let t = Tuneables::default();
         let hard_fail = session_score(
-            &Rating { performance_points: -2.0, difficulty_points: 4.0, age_days: 0.0 },
+            &Rating {
+                performance_points: -2.0,
+                difficulty_points: 4.0,
+                age_days: 0.0,
+            },
             &t,
         );
-        assert!(hard_fail < 0.5, "hard failure scored {hard_fail} (should be a loss)");
+        assert!(
+            hard_fail < 0.5,
+            "hard failure scored {hard_fail} (should be a loss)"
+        );
         // It should match a plain failure of the same performance — difficulty gives no credit.
         let plain_fail = session_score(
-            &Rating { performance_points: -2.0, difficulty_points: 0.0, age_days: 0.0 },
+            &Rating {
+                performance_points: -2.0,
+                difficulty_points: 0.0,
+                age_days: 0.0,
+            },
             &t,
         );
         assert_eq!(hard_fail, plain_fail);
@@ -393,11 +466,19 @@ mod tests {
         // The fairness correction is preserved: acing a hard task outranks acing a trivial one.
         let t = Tuneables::default();
         let hard_win = session_score(
-            &Rating { performance_points: 2.0, difficulty_points: 4.0, age_days: 0.0 },
+            &Rating {
+                performance_points: 2.0,
+                difficulty_points: 4.0,
+                age_days: 0.0,
+            },
             &t,
         );
         let trivial_win = session_score(
-            &Rating { performance_points: 2.0, difficulty_points: 0.0, age_days: 0.0 },
+            &Rating {
+                performance_points: 2.0,
+                difficulty_points: 0.0,
+                age_days: 0.0,
+            },
             &t,
         );
         assert!(hard_win > trivial_win);

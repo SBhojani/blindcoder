@@ -15,7 +15,6 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use warc::{RecordBuilder, RecordType, WarcHeader, WarcWriter};
 use async_trait::async_trait;
 use axum::{
     body::Body,
@@ -30,9 +29,12 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
+use warc::{RecordBuilder, RecordType, WarcHeader, WarcWriter};
 
 use crate::rewrite::{mask_json_body, mask_sse_line, parse_usage, rewrite_request};
-use crate::{AbortReason, Backend, ErrorKind, Pick, Session, SessionEvent, SessionOutcome, UsageSnapshot};
+use crate::{
+    AbortReason, Backend, ErrorKind, Pick, Session, SessionEvent, SessionOutcome, UsageSnapshot,
+};
 
 /// Map an upstream HTTP status to an [`ErrorKind`] (for the "no clean completion" case).
 fn classify_http(code: u16) -> ErrorKind {
@@ -77,7 +79,9 @@ impl ProxyBackend {
             extra_headers,
             extra_body,
             capture_path,
-            client: reqwest::Client::builder().build().context("building HTTP client")?,
+            client: reqwest::Client::builder()
+                .build()
+                .context("building HTTP client")?,
         })
     }
 }
@@ -96,7 +100,12 @@ struct CaptureLeg {
 /// Spawn the blocking WARC writer task: opens `path` (0600), writes each leg as a WARC record, and
 /// flushes on channel close. Sync I/O runs on a blocking thread so it never stalls the async
 /// runtime. Returns the sender legs are pushed to, and the task handle to await at session end.
-fn spawn_warc_writer(path: PathBuf) -> (mpsc::UnboundedSender<CaptureLeg>, tokio::task::JoinHandle<()>) {
+fn spawn_warc_writer(
+    path: PathBuf,
+) -> (
+    mpsc::UnboundedSender<CaptureLeg>,
+    tokio::task::JoinHandle<()>,
+) {
     let (tx, mut rx) = mpsc::unbounded_channel::<CaptureLeg>();
     let handle = tokio::task::spawn_blocking(move || {
         let mut writer = match WarcWriter::from_path(&path) {
@@ -108,7 +117,10 @@ fn spawn_warc_writer(path: PathBuf) -> (mpsc::UnboundedSender<CaptureLeg>, tokio
             let record = RecordBuilder::default()
                 .warc_type(leg.warc_type)
                 .header(WarcHeader::TargetURI, leg.target_uri.into_bytes())
-                .header(WarcHeader::Unknown("x-blindcoder-leg".into()), leg.leg.as_bytes().to_vec())
+                .header(
+                    WarcHeader::Unknown("x-blindcoder-leg".into()),
+                    leg.leg.as_bytes().to_vec(),
+                )
                 .header(
                     WarcHeader::Unknown("x-blindcoder-exchange".into()),
                     leg.exchange.to_string().into_bytes(),
@@ -135,22 +147,29 @@ struct Cumulative {
     cost_nano: AtomicU64,
     has_cost: AtomicBool,
     any_success: AtomicBool,
-    http_error: AtomicU64,    // 0 = none, 1 = network (no response), else the HTTP status
+    http_error: AtomicU64, // 0 = none, 1 = network (no response), else the HTTP status
     content_issue: AtomicU64, // 0 = none, 1 = truncated (length), 2 = refused (content_filter)
-    body_error: AtomicBool,   // a 2xx response whose body carried an `error`
+    body_error: AtomicBool, // a 2xx response whose body carried an `error`
 }
 
 impl Cumulative {
     /// Add one response's usage and return the new cumulative snapshot.
     fn add(&self, u: &UsageSnapshot) -> UsageSnapshot {
         let prompt = self.prompt.fetch_add(u.prompt_tokens, Ordering::Relaxed) + u.prompt_tokens;
-        let completion =
-            self.completion.fetch_add(u.completion_tokens, Ordering::Relaxed) + u.completion_tokens;
+        let completion = self
+            .completion
+            .fetch_add(u.completion_tokens, Ordering::Relaxed)
+            + u.completion_tokens;
         if let Some(c) = u.cost_so_far {
-            self.cost_nano.fetch_add((c * 1e9).round() as u64, Ordering::Relaxed);
+            self.cost_nano
+                .fetch_add((c * 1e9).round() as u64, Ordering::Relaxed);
             self.has_cost.store(true, Ordering::Relaxed);
         }
-        UsageSnapshot { prompt_tokens: prompt, completion_tokens: completion, cost_so_far: self.cost() }
+        UsageSnapshot {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cost_so_far: self.cost(),
+        }
     }
 
     /// Cumulative provider-reported cost in dollars, or `None` if no response reported one.
@@ -163,7 +182,10 @@ impl Cumulative {
     }
 
     fn totals(&self) -> (u64, u64) {
-        (self.prompt.load(Ordering::Relaxed), self.completion.load(Ordering::Relaxed))
+        (
+            self.prompt.load(Ordering::Relaxed),
+            self.completion.load(Ordering::Relaxed),
+        )
     }
 
     fn note_network(&self) {
@@ -270,7 +292,9 @@ fn response_signals(body: &[u8]) -> Signals {
     let mut out = Signals::default();
     if let Ok(text) = std::str::from_utf8(body) {
         for line in text.lines() {
-            let Some(rest) = line.trim_start().strip_prefix("data:") else { continue };
+            let Some(rest) = line.trim_start().strip_prefix("data:") else {
+                continue;
+            };
             let rest = rest.trim();
             if rest == "[DONE]" {
                 continue;
@@ -371,7 +395,11 @@ async fn proxy_handler(
         Ok(r) => r,
         Err(e) => {
             st.cumulative.note_network();
-            return (StatusCode::BAD_GATEWAY, format!("upstream request failed: {e}")).into_response();
+            return (
+                StatusCode::BAD_GATEWAY,
+                format!("upstream request failed: {e}"),
+            )
+                .into_response();
         }
     };
 
@@ -552,7 +580,11 @@ impl Session for ProxySession {
 
     fn usage(&self) -> UsageSnapshot {
         let (prompt_tokens, completion_tokens) = self.cumulative.totals();
-        UsageSnapshot { prompt_tokens, completion_tokens, cost_so_far: self.cumulative.cost() }
+        UsageSnapshot {
+            prompt_tokens,
+            completion_tokens,
+            cost_so_far: self.cumulative.cost(),
+        }
     }
 
     async fn abort(&mut self, reason: AbortReason) {
@@ -654,8 +686,14 @@ mod tests {
         // Response is masked: the real slug/provider must NOT leak; the model reads as the alias.
         let body: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(body["model"], "al:al", "response model masked to the alias");
-        assert!(body.get("provider").is_none(), "provider fingerprint stripped");
-        assert!(!text.contains("prov/model-x"), "real slug must not appear in the response");
+        assert!(
+            body.get("provider").is_none(),
+            "provider fingerprint stripped"
+        );
+        assert!(
+            !text.contains("prov/model-x"),
+            "real slug must not appear in the response"
+        );
 
         // Upstream saw the real slug in the *request*, never the alias — the request rewrite happened.
         assert_eq!(captured.lock().unwrap().as_deref(), Some("prov/model-x"));
@@ -704,7 +742,9 @@ mod tests {
         );
         let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let up_addr = up_listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(up_listener, up_app).await.unwrap(); });
+        tokio::spawn(async move {
+            axum::serve(up_listener, up_app).await.unwrap();
+        });
 
         let backend = ProxyBackend::new(
             "127.0.0.1:0".parse().unwrap(),
@@ -766,7 +806,10 @@ mod tests {
         let v: Value = serde_json::from_str(&text).unwrap();
         assert_eq!(v["data"].as_array().unwrap().len(), 1);
         assert_eq!(v["data"][0]["id"], "al:al");
-        assert!(!text.contains("prov/model-x"), "real slug must not leak in the model list");
+        assert!(
+            !text.contains("prov/model-x"),
+            "real slug must not leak in the model list"
+        );
     }
 
     /// At the `replay` capture level, a completed exchange writes all four legs (cli_request,
@@ -786,7 +829,9 @@ mod tests {
         );
         let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
         let up_addr = up_listener.local_addr().unwrap();
-        tokio::spawn(async move { axum::serve(up_listener, up_app).await.unwrap(); });
+        tokio::spawn(async move {
+            axum::serve(up_listener, up_app).await.unwrap();
+        });
 
         let tmp = tempfile::tempdir().unwrap();
         let warc_path = tmp.path().join("sess.warc");
@@ -830,13 +875,24 @@ mod tests {
         let leg = |name: &str| {
             records
                 .iter()
-                .find(|r| r.header(WarcHeader::Unknown("x-blindcoder-leg".into())).as_deref() == Some(name))
+                .find(|r| {
+                    r.header(WarcHeader::Unknown("x-blindcoder-leg".into()))
+                        .as_deref()
+                        == Some(name)
+                })
                 .unwrap_or_else(|| panic!("missing leg {name}"))
         };
         assert_eq!(records.len(), 4, "four legs archived");
-        for name in ["cli_request", "provider_request", "provider_response", "cli_response"] {
+        for name in [
+            "cli_request",
+            "provider_request",
+            "provider_response",
+            "cli_response",
+        ] {
             assert_eq!(
-                leg(name).header(WarcHeader::Unknown("x-blindcoder-exchange".into())).as_deref(),
+                leg(name)
+                    .header(WarcHeader::Unknown("x-blindcoder-exchange".into()))
+                    .as_deref(),
                 Some("0"),
                 "{name} grouped into exchange 0"
             );
@@ -851,8 +907,17 @@ mod tests {
         // response is the MASKED copy (alias only, fingerprint stripped).
         let prov_resp = std::str::from_utf8(leg("provider_response").body()).unwrap();
         let cli_resp = std::str::from_utf8(leg("cli_response").body()).unwrap();
-        assert!(prov_resp.contains("prov/model-x") && prov_resp.contains("AcmeProv"), "raw upstream body");
-        assert!(cli_resp.contains("al:al") && !cli_resp.contains("prov/model-x"), "masked CLI body");
-        assert!(!cli_resp.contains("AcmeProv"), "provider fingerprint stripped from the CLI leg");
+        assert!(
+            prov_resp.contains("prov/model-x") && prov_resp.contains("AcmeProv"),
+            "raw upstream body"
+        );
+        assert!(
+            cli_resp.contains("al:al") && !cli_resp.contains("prov/model-x"),
+            "masked CLI body"
+        );
+        assert!(
+            !cli_resp.contains("AcmeProv"),
+            "provider fingerprint stripped from the CLI leg"
+        );
     }
 }

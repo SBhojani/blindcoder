@@ -40,10 +40,20 @@ pub fn rewrite_request(
 /// its own tokens × shelf-price estimate.
 pub fn parse_usage(value: &Value) -> Option<UsageSnapshot> {
     let usage = value.get("usage")?;
-    let prompt_tokens = usage.get("prompt_tokens").and_then(Value::as_u64).unwrap_or(0);
-    let completion_tokens = usage.get("completion_tokens").and_then(Value::as_u64).unwrap_or(0);
+    let prompt_tokens = usage
+        .get("prompt_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("completion_tokens")
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let cost_so_far = usage.get("cost").and_then(Value::as_f64);
-    Some(UsageSnapshot { prompt_tokens, completion_tokens, cost_so_far })
+    Some(UsageSnapshot {
+        prompt_tokens,
+        completion_tokens,
+        cost_so_far,
+    })
 }
 
 /// Response-side fields that name or fingerprint the real model/provider. Stripped on the way back
@@ -114,7 +124,9 @@ pub fn mask_sse_line(line: &str, real_slug: &str, alias: &str) -> String {
             line.to_string()
         } else if let Ok(mut v) = serde_json::from_str::<Value>(payload) {
             mask_response_obj(&mut v, alias);
-            serde_json::to_string(&v).map(|s| format!("data: {s}")).unwrap_or_else(|_| line.to_string())
+            serde_json::to_string(&v)
+                .map(|s| format!("data: {s}"))
+                .unwrap_or_else(|_| line.to_string())
         } else {
             line.to_string()
         }
@@ -182,7 +194,9 @@ mod tests {
         assert_eq!(u.cost_so_far, Some(0.00025938)); // provider-reported cost captured
 
         // No `cost` field → None (router falls back to its estimate).
-        let no_cost = parse_usage(&json!({ "usage": { "prompt_tokens": 1, "completion_tokens": 2 } })).unwrap();
+        let no_cost =
+            parse_usage(&json!({ "usage": { "prompt_tokens": 1, "completion_tokens": 2 } }))
+                .unwrap();
         assert_eq!(no_cost.cost_so_far, None);
         assert!(parse_usage(&json!({ "choices": [] })).is_none());
     }
@@ -193,12 +207,15 @@ mod tests {
             "id": "gen-123", "model": "openai/gpt-oss-120b", "provider": "AkashML",
             "system_fingerprint": "fp_x", "choices": [{"message": {"content": "hi"}}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 3}
-        })).unwrap();
-        let out: Value = serde_json::from_slice(&mask_json_body(&body, "openai/gpt-oss-120b", "x7k2:q4m9")).unwrap();
-        assert_eq!(out["model"], "x7k2:q4m9");            // real slug masked to alias
-        assert!(out.get("provider").is_none());            // fingerprint stripped
+        }))
+        .unwrap();
+        let out: Value =
+            serde_json::from_slice(&mask_json_body(&body, "openai/gpt-oss-120b", "x7k2:q4m9"))
+                .unwrap();
+        assert_eq!(out["model"], "x7k2:q4m9"); // real slug masked to alias
+        assert!(out.get("provider").is_none()); // fingerprint stripped
         assert!(out.get("system_fingerprint").is_none());
-        assert_eq!(out["id"], "gen-123");                  // id preserved
+        assert_eq!(out["id"], "gen-123"); // id preserved
         assert_eq!(out["choices"][0]["message"]["content"], "hi"); // content untouched
     }
 
@@ -211,29 +228,50 @@ mod tests {
         })).unwrap();
         let out = mask_json_body(&body, "openai/gpt-oss-120b", "x7k2:q4m9");
         let text = String::from_utf8(out).unwrap();
-        assert!(!text.contains("openai/gpt-oss-120b"), "real slug must not survive in the error text");
+        assert!(
+            !text.contains("openai/gpt-oss-120b"),
+            "real slug must not survive in the error text"
+        );
         assert!(text.contains("x7k2:q4m9"), "the alias replaces it");
-        assert!(text.contains("rate_limit_exceeded"), "the rest of the error is intact");
+        assert!(
+            text.contains("rate_limit_exceeded"),
+            "the rest of the error is intact"
+        );
     }
 
     #[test]
     fn mask_json_body_leaves_non_json_without_the_slug_untouched() {
         assert_eq!(mask_json_body(b"not json", "real/slug", "a"), b"not json");
         // but a real slug in a non-JSON body is still scrubbed
-        assert_eq!(mask_json_body(b"failed on real/slug", "real/slug", "al"), b"failed on al");
+        assert_eq!(
+            mask_json_body(b"failed on real/slug", "real/slug", "al"),
+            b"failed on al"
+        );
     }
 
     #[test]
     fn mask_sse_line_masks_data_frames_only() {
         let masked = mask_sse_line(
-            r#"data: {"model":"qwen/qwen3.6-35b-a3b","provider":"AkashML"}"#, "qwen/qwen3.6-35b-a3b", "al:al");
+            r#"data: {"model":"qwen/qwen3.6-35b-a3b","provider":"AkashML"}"#,
+            "qwen/qwen3.6-35b-a3b",
+            "al:al",
+        );
         let v: Value = serde_json::from_str(masked.strip_prefix("data: ").unwrap()).unwrap();
         assert_eq!(v["model"], "al:al");
         assert!(v.get("provider").is_none());
         // control frames + non-data lines pass through verbatim
-        assert_eq!(mask_sse_line("data: [DONE]", "real/slug", "al:al"), "data: [DONE]");
-        assert_eq!(mask_sse_line(": keep-alive", "real/slug", "al:al"), ": keep-alive");
+        assert_eq!(
+            mask_sse_line("data: [DONE]", "real/slug", "al:al"),
+            "data: [DONE]"
+        );
+        assert_eq!(
+            mask_sse_line(": keep-alive", "real/slug", "al:al"),
+            ": keep-alive"
+        );
         // the slug is scrubbed even from a non-data SSE error line
-        assert_eq!(mask_sse_line("event: error real/slug", "real/slug", "al"), "event: error al");
+        assert_eq!(
+            mask_sse_line("event: error real/slug", "real/slug", "al"),
+            "event: error al"
+        );
     }
 }

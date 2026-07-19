@@ -27,7 +27,10 @@ use config::Config;
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
 use rand_distr::{Distribution, Normal};
-use selector::{fold_track_record, normalize_prices, pick, prune_dominated, value_score, Candidate, Rating, Tuneables};
+use selector::{
+    fold_track_record, normalize_prices, pick, prune_dominated, value_score, Candidate, Rating,
+    Tuneables,
+};
 
 // ---------------------------------------------------------------------------------------------
 // CLI args
@@ -215,7 +218,9 @@ fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
 
     // hidden world — qualities may drift over the run (non-stationary); prices are fixed.
     let mut quality: Vec<f64> = (0..h.pool).map(|_| rng.gen_range(0.20..0.95)).collect();
-    let raw_price: Vec<f64> = (0..h.pool).map(|_| 10f64.powf(rng.gen_range(-1.0..1.18))).collect();
+    let raw_price: Vec<f64> = (0..h.pool)
+        .map(|_| 10f64.powf(rng.gen_range(-1.0..1.18)))
+        .collect();
     let norm_price = normalize_prices(&raw_price);
 
     let rating_noise = Normal::new(0.0, h.noise.max(1e-9)).unwrap();
@@ -249,7 +254,9 @@ fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
         }
 
         // current-session ground truth — the best candidate can move under drift.
-        let true_value: Vec<f64> = (0..h.pool).map(|i| value_score(quality[i], norm_price[i], t)).collect();
+        let true_value: Vec<f64> = (0..h.pool)
+            .map(|i| value_score(quality[i], norm_price[i], t))
+            .collect();
         let best = argmax(&true_value);
         let best_value = true_value[best];
         random_regret_hist[s] = best_value - true_value.iter().sum::<f64>() / h.pool as f64;
@@ -258,9 +265,17 @@ fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
             .map(|i| {
                 buf.clear();
                 for &(ts, perf, diff) in &raw_events[i] {
-                    buf.push(Rating { performance_points: perf, difficulty_points: diff, age_days: now - ts });
+                    buf.push(Rating {
+                        performance_points: perf,
+                        difficulty_points: diff,
+                        age_days: now - ts,
+                    });
                 }
-                Candidate { id: i, track: fold_track_record(&buf, t), normalized_price: norm_price[i] }
+                Candidate {
+                    id: i,
+                    track: fold_track_record(&buf, t),
+                    normalized_price: norm_price[i],
+                }
             })
             .collect();
 
@@ -276,7 +291,10 @@ fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
         best_hist[s] = picked == best;
         good_hist[s] = true_value[picked] >= best_value - h.value_epsilon;
 
-        if ttc.is_none() && s + 1 >= h.window && window_rate(&good_hist, s + 1, h.window) >= h.converge_at {
+        if ttc.is_none()
+            && s + 1 >= h.window
+            && window_rate(&good_hist, s + 1, h.window) >= h.converge_at
+        {
             ttc = Some(s + 1);
         }
 
@@ -296,10 +314,18 @@ fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
     let good_rate = window_rate(&good_hist, h.sessions, h.window);
     let win_regret = window_mean(&regret_hist, h.sessions, h.window);
     let win_random = window_mean(&random_regret_hist, h.sessions, h.window);
-    let value_eff_window = if win_random < 1e-9 { 1.0 } else { 1.0 - win_regret / win_random };
+    let value_eff_window = if win_random < 1e-9 {
+        1.0
+    } else {
+        1.0 - win_regret / win_random
+    };
     let cum_regret: f64 = regret_hist.iter().sum();
     let random_cum: f64 = random_regret_hist.iter().sum();
-    let gap_captured = if random_cum < 1e-9 { 1.0 } else { 1.0 - cum_regret / random_cum };
+    let gap_captured = if random_cum < 1e-9 {
+        1.0
+    } else {
+        1.0 - cum_regret / random_cum
+    };
 
     let q = |frac: f64| ((h.sessions as f64 * frac) as usize).max(1);
     let cp_good = [
@@ -315,7 +341,15 @@ fn run_trial(h: &Harness, rng: &mut StdRng) -> Trial {
         best_rate,
     ];
 
-    Trial { best_rate, good_rate, value_eff_window, gap_captured, ttc, cp_good, cp_best }
+    Trial {
+        best_rate,
+        good_rate,
+        value_eff_window,
+        gap_captured,
+        ttc,
+        cp_good,
+        cp_best,
+    }
 }
 
 fn aggregate(h: &Harness, trials: &[Trial]) -> Aggregate {
@@ -409,27 +443,57 @@ pub fn run(args: &SimulateArgs, cfg: &Config) -> anyhow::Result<()> {
     );
     println!(
         "pruning: {}",
-        if h.prune { format!("on (confidence={} std-devs)", t.prune_confidence) } else { "off".to_string() }
+        if h.prune {
+            format!("on (confidence={} std-devs)", t.prune_confidence)
+        } else {
+            "off".to_string()
+        }
     );
     if h.drift > 0.0 || h.jump_rate > 0.0 {
-        println!("world: NON-STATIONARY (drift={}/day, jump_rate={}/candidate/day) — the best arm moves", h.drift, h.jump_rate);
+        println!(
+            "world: NON-STATIONARY (drift={}/day, jump_rate={}/candidate/day) — the best arm moves",
+            h.drift, h.jump_rate
+        );
     } else {
         println!("world: stationary");
     }
     println!();
     println!("value capture (the router's actual job):");
-    println!("   value efficiency (final window): {:.2}   (1.00 = perfect, 0.00 = random)", a.value_eff_window);
-    println!("   cumulative gap captured vs random: {:.0}%", 100.0 * a.gap_captured);
+    println!(
+        "   value efficiency (final window): {:.2}   (1.00 = perfect, 0.00 = random)",
+        a.value_eff_window
+    );
+    println!(
+        "   cumulative gap captured vs random: {:.0}%",
+        100.0 * a.gap_captured
+    );
     println!("   within-ε good-rate (final window): {:.2}", a.good_rate);
-    println!("   good-rate over training  25%: {:.2}   50%: {:.2}   75%: {:.2}   100%: {:.2}", a.cp_good[0], a.cp_good[1], a.cp_good[2], a.cp_good[3]);
+    println!(
+        "   good-rate over training  25%: {:.2}   50%: {:.2}   75%: {:.2}   100%: {:.2}",
+        a.cp_good[0], a.cp_good[1], a.cp_good[2], a.cp_good[3]
+    );
     println!();
-    println!("best-arm identification (strict; picks THE best of {}):", h.pool);
-    println!("   over training  25%: {:.2}   50%: {:.2}   75%: {:.2}   100%: {:.2}", a.cp_best[0], a.cp_best[1], a.cp_best[2], a.cp_best[3]);
+    println!(
+        "best-arm identification (strict; picks THE best of {}):",
+        h.pool
+    );
+    println!(
+        "   over training  25%: {:.2}   50%: {:.2}   75%: {:.2}   100%: {:.2}",
+        a.cp_best[0], a.cp_best[1], a.cp_best[2], a.cp_best[3]
+    );
     println!("   random-choice baseline: {:.2}", random_rate);
     println!();
-    println!("convergence (good-rate ≥ {:.2} sustained over {} sessions):", h.converge_at, h.window);
+    println!(
+        "convergence (good-rate ≥ {:.2} sustained over {} sessions):",
+        h.converge_at, h.window
+    );
     match a.median_ttc {
-        Some(m) => println!("   {:.0}% of trials converged; median ≈ {} sessions ({:.1} days)", 100.0 * a.converged_frac, m, m as f64 / h.rate),
+        Some(m) => println!(
+            "   {:.0}% of trials converged; median ≈ {} sessions ({:.1} days)",
+            100.0 * a.converged_frac,
+            m,
+            m as f64 / h.rate
+        ),
         None => println!("   {:.0}% of trials converged", 100.0 * a.converged_frac),
     }
     println!();
@@ -484,10 +548,21 @@ pub fn run_sweep(args: &SweepArgs, cfg: &Config) -> anyhow::Result<()> {
             };
             let a = run_config(&h);
             let tag = verdict(&a).split(' ').next().unwrap_or("?");
-            let ttc = a.median_ttc.map(|m| m.to_string()).unwrap_or_else(|| "-".to_string());
+            let ttc = a
+                .median_ttc
+                .map(|m| m.to_string())
+                .unwrap_or_else(|| "-".to_string());
             println!(
                 "{},{:.2},{:.3},{:.3},{:.3},{:.3},{:.2},{},{}",
-                pool, expl, a.value_eff_window, a.gap_captured, a.good_rate, a.best_rate, a.converged_frac, ttc, tag
+                pool,
+                expl,
+                a.value_eff_window,
+                a.gap_captured,
+                a.good_rate,
+                a.best_rate,
+                a.converged_frac,
+                ttc,
+                tag
             );
         }
     }
