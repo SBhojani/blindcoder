@@ -33,14 +33,14 @@ is honest to say where it can leak:
 - **A small pool is low-entropy.** With two or three candidates, a confident guess is sometimes
   right by chance. The tokens stop *deterministic* de-anonymization (a hash wouldn't), not
   informed inference.
-- **Error messages can name the model (known gap).** Response masking rewrites the structured
-  `model` field and strips provider fingerprint keys, but a provider's *error message* is free text
-  that can embed the real slug — e.g. `Request too large for model \`vendor/model-x\` in organization
-  \`org_…\``, printed verbatim by the CLI. A failed session is never rated, so this does not bias a
-  rating directly, but it defeats blinding for the user and *would* bias a rating if an error
-  surfaced mid-session in a session they then rate. The fix (not yet shipped) is to string-replace
-  every occurrence of the real slug with the alias across the whole body — error text included — not
-  just the `model` field, and optionally redact org IDs.
+- **Error messages can name the model (closed).** A provider's *error message* is free text that can
+  embed the real slug — e.g. `Request too large for model \`vendor/model-x\` in organization
+  \`org_…\``, printed verbatim by the CLI, which masking the structured `model` field alone would
+  miss. This is closed: response masking *additionally* string-replaces every occurrence of the real
+  slug with the alias across the **whole** body — error text included — not just the `model` field.
+  Provider org IDs are deliberately left intact (an account tell, not a model tell; a blanket `org_`
+  scrub risks corrupting unrelated content). A failed session is never rated, so this never biased a
+  rating directly, but it defeated blinding for the user until closed.
 
 The design goal is therefore "don't hand you the label," not "make identification impossible."
 Peeking is always available through the reveal gate — it is just made deliberate and logged,
@@ -196,6 +196,23 @@ from:
 The prior every-session-rated harness was optimistic (its rater was the exact inverse of the
 scorer). The sparsity axis is what makes the go/no-go non-circular. **Conclusion: bound the pool
 (≈3–4).**
+
+**What the sweeps settled about tuning.** Two knobs beyond `cost_sensitivity` shape the pick — how
+much extra exploration to add to the Thompson draw, and how aggressively to prune cost-dominated
+candidates. Sweeping them — including against a *drifting* ground truth, not just a stationary one —
+overturned the a-priori intuitions:
+
+- **Exploration is not the reckless knob.** Low exploration wins in every regime, because Thompson's
+  uniform prior plus recency decay already re-explore a moving target on their own; cranking
+  exploration just pays regret for re-derived information.
+- **Pruning *is* the reckless knob.** Aggressive pruning tops the *stationary* metric but is the
+  worst under drift — it permanently discards an arm that later recovers. A stationary win bought by
+  aggressive pruning is a mirage.
+
+So the responsible defaults are **low exploration and conservative pruning**, chosen for robustness
+across stationary *and* drifting worlds rather than a maximal stationary number. The lesson
+generalizes: for any stochastic/learning knob, stress the non-stationary case before trusting a
+default the stationary metric likes.
 
 ## Storage
 
