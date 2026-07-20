@@ -38,6 +38,9 @@ is honest to say where it can leak:
   \`org_…\``, printed verbatim by the CLI, which masking the structured `model` field alone would
   miss. This is closed: response masking *additionally* string-replaces every occurrence of the real
   slug with the alias across the **whole** body — error text included — not just the `model` field.
+  It scrubs the slug's **base form** too (a `:variant` suffix removed), because a provider error may
+  name the base rather than the exact slug — e.g. a retired `vendor/model:free` tier whose 404
+  suggests the paid `vendor/model` (a real deblind we caught this way).
   Provider org IDs are deliberately left intact (an account tell, not a model tell; a blanket `org_`
   scrub risks corrupting unrelated content). A failed session is never rated, so this never biased a
   rating directly, but it defeated blinding for the user until closed.
@@ -238,11 +241,14 @@ SQLite 12-step `ALTER` — which is how a `CHECK` constraint is added to an exis
 **on afterward** so the `REFERENCES` are enforced at runtime.
 
 A failed session is recorded, not silently dropped: the proxy derives an **`error_kind`** (rate
-limit / auth / too-large / 5xx / truncated / refused / …) from the upstream status and
+limit / auth / too-large / unavailable / 5xx / truncated / refused / …) from the upstream status and
 `finish_reason`, and stores it **with the raw HTTP `error_status`**. The categories are kept
 semantically distinct rather than lumped by status class — a 413 "request too large" (a context or
-per-minute-token limit) is `too_large`, not a *malformed* `bad_request` or a *transient* rate limit,
-because for a large-context workload it means the model+tier structurally cannot serve you. The
+per-minute-token limit) is `too_large`, and a 404 (a delisted model, a free tier retired behind a
+paid slug, or no serving endpoint matching your data policy) is `unavailable` — **not** a *malformed*
+`bad_request` or a *transient* rate limit. Both are *persistent, not-our-fault* failures, so the
+selector learns to avoid that candidate (recovering via decay if it comes back), whereas a malformed
+request or an auth error is blameless and counts nothing. The
 derivation is status-based only; the raw status (and the wire archive at `replay`) preserve the finer
 cause without sniffing provider-specific error text. The tag is a *projection* over the stored ground
 truth, so a failure is diagnosable even at the `metadata` floor (where no wire archive exists) and

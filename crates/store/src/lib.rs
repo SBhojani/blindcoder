@@ -110,6 +110,35 @@ fn migrations() -> Migrations<'static> {
              CREATE TRIGGER session_end_no_delete BEFORE DELETE ON session_end
                BEGIN SELECT RAISE(ABORT, 'append-only: session_end is immutable'); END;",
         ),
+        // v5: widen the error_kind set with 'unavailable' (404 — the model/route is not available to
+        // you: a delisted model, a free tier retired behind a paid slug, or no endpoint matching your
+        // data policy). Like 'too_large' it is persistent (retrying the same candidate keeps failing)
+        // and not our fault, so it must be a learnable avoid-signal, not an inert 'bad_request'.
+        // Table rebuild, as for every error_kind addition (SQLite cannot ALTER a CHECK in place).
+        M::up(
+            "CREATE TABLE session_end_new (
+                 session_id        INTEGER PRIMARY KEY REFERENCES sessions(id),
+                 ended_at          TEXT NOT NULL DEFAULT (datetime('now')),
+                 realized_cost     REAL,
+                 cost_source       TEXT CHECK (cost_source IS NULL OR cost_source IN ('provider','estimate')),
+                 prompt_tokens     INTEGER,
+                 completion_tokens INTEGER,
+                 error_kind        TEXT CHECK (error_kind IS NULL OR error_kind IN
+                     ('rate_limit','http_5xx','auth','too_large','unavailable','bad_request','network','truncated','refused','unknown')),
+                 error_status      INTEGER,
+                 terminated_by     TEXT CHECK (terminated_by IS NULL OR terminated_by IN ('cost_cap','user'))
+             );
+             INSERT INTO session_end_new
+                 (session_id, ended_at, realized_cost, cost_source, prompt_tokens, completion_tokens, error_kind, error_status, terminated_by)
+               SELECT session_id, ended_at, realized_cost, cost_source, prompt_tokens, completion_tokens, error_kind, error_status, terminated_by
+               FROM session_end;
+             DROP TABLE session_end;
+             ALTER TABLE session_end_new RENAME TO session_end;
+             CREATE TRIGGER session_end_no_update BEFORE UPDATE ON session_end
+               BEGIN SELECT RAISE(ABORT, 'append-only: session_end is immutable'); END;
+             CREATE TRIGGER session_end_no_delete BEFORE DELETE ON session_end
+               BEGIN SELECT RAISE(ABORT, 'append-only: session_end is immutable'); END;",
+        ),
     ])
 }
 
@@ -1060,6 +1089,37 @@ mod tests {
         assert_eq!(ek.as_deref(), Some("rate_limit"));
         assert_eq!(es, Some(429));
         assert_eq!(term.as_deref(), Some("cost_cap"));
+    }
+
+    #[test]
+    fn v5_check_accepts_unavailable_error_kind() {
+        // A 404 → 'unavailable' must pass the widened error_kind CHECK (would violate it before v5).
+        let s = Store::open_in_memory().unwrap(); // migrates to latest
+        let sid = s
+            .record_session_start("tok:tok", Some("opencode"), None, "metadata")
+            .unwrap();
+        s.record_session_end(
+            sid,
+            &SessionEnd {
+                realized_cost: None,
+                cost_source: None,
+                prompt_tokens: None,
+                completion_tokens: None,
+                error_kind: Some("unavailable"),
+                error_status: Some(404),
+                terminated_by: None,
+            },
+        )
+        .unwrap();
+        let ek: Option<String> = s
+            .conn
+            .query_row(
+                "SELECT error_kind FROM session_end WHERE session_id = ?1",
+                [sid],
+                |r| r.get(0),
+            )
+            .unwrap();
+        assert_eq!(ek.as_deref(), Some("unavailable"));
     }
 
     #[test]

@@ -155,6 +155,11 @@ pub enum ErrorKind {
     /// serve you — a persistent avoid-signal, not noise. Status-derived; the raw 413 + the `replay`
     /// WARC preserve which cause it was (we do not sniff the body).
     TooLarge,
+    /// 404 — the model/route is not available to you: a delisted model, a free tier retired behind a
+    /// paid slug, or no serving endpoint matching your data policy. Like [`TooLarge`](Self::TooLarge)
+    /// it is *persistent* (retrying the same candidate keeps failing) and *not our fault*, so it is a
+    /// real avoid-signal — distinct from a malformed [`BadRequest`](Self::BadRequest).
+    Unavailable,
     /// Other 4xx (malformed, unknown model, …) or an HTTP-200 body carrying an `error`.
     BadRequest,
     /// No HTTP response at all (connection failure / timeout).
@@ -176,6 +181,7 @@ impl ErrorKind {
             ErrorKind::Http5xx => "http_5xx",
             ErrorKind::Auth => "auth",
             ErrorKind::TooLarge => "too_large",
+            ErrorKind::Unavailable => "unavailable",
             ErrorKind::BadRequest => "bad_request",
             ErrorKind::Network => "network",
             ErrorKind::Truncated => "truncated",
@@ -192,6 +198,7 @@ impl ErrorKind {
             "http_5xx" => ErrorKind::Http5xx,
             "auth" => ErrorKind::Auth,
             "too_large" => ErrorKind::TooLarge,
+            "unavailable" => ErrorKind::Unavailable,
             "bad_request" => ErrorKind::BadRequest,
             "network" => ErrorKind::Network,
             "truncated" => ErrorKind::Truncated,
@@ -209,7 +216,7 @@ impl ErrorKind {
     pub fn loss_weight(&self) -> f64 {
         match self {
             // Structural / persistent for this workload — a real "avoid this candidate" signal.
-            ErrorKind::TooLarge => 1.0,
+            ErrorKind::TooLarge | ErrorKind::Unavailable => 1.0,
             ErrorKind::Refused => 0.75,
             // Partial / config-adjacent.
             ErrorKind::Truncated => 0.4,

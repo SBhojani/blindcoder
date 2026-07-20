@@ -133,6 +133,21 @@ fn replace_bytes(hay: &[u8], needle: &[u8], repl: &[u8]) -> Vec<u8> {
     out
 }
 
+/// The slug strings to scrub from a response body: the full real slug, plus its **base** — the part
+/// before a `:variant` suffix (e.g. `qwen/qwen3-coder` for `qwen/qwen3-coder:free`). A provider error
+/// often names the base rather than the full slug (e.g. suggesting the paid slug when a `:free` tier
+/// is retired), which a full-slug replace alone would miss — leaking the model family. Ordered
+/// longest-first so the full slug is consumed before its base prefix. Empty for an empty slug.
+fn slug_scrub_forms(real_slug: &str) -> Vec<&str> {
+    if real_slug.is_empty() {
+        return Vec::new();
+    }
+    match real_slug.split_once(':') {
+        Some((base, _)) if !base.is_empty() => vec![real_slug, base],
+        _ => vec![real_slug],
+    }
+}
+
 /// Mask a whole non-streaming JSON response body: structured masking (rewrite `model`, strip
 /// fingerprints) **plus** a raw replace of the real slug with the alias across the entire body, so the
 /// slug is scrubbed even when it appears in free text the structured pass can't see (provider error
@@ -148,7 +163,11 @@ pub fn mask_json_body(body: &[u8], real_slug: &str, alias: &str) -> Vec<u8> {
         }
         Err(_) => body.to_vec(),
     };
-    replace_bytes(&structured, real_slug.as_bytes(), alias.as_bytes())
+    let mut out = structured;
+    for needle in slug_scrub_forms(real_slug) {
+        out = replace_bytes(&out, needle.as_bytes(), alias.as_bytes());
+    }
+    out
 }
 
 /// Mask one SSE line (no trailing newline). A `data: {json}` frame gets its `model`/fingerprints
@@ -168,11 +187,11 @@ pub fn mask_sse_line(line: &str, real_slug: &str, alias: &str) -> String {
     } else {
         line.to_string()
     };
-    if real_slug.is_empty() {
-        masked
-    } else {
-        masked.replace(real_slug, alias)
+    let mut out = masked;
+    for needle in slug_scrub_forms(real_slug) {
+        out = out.replace(needle, alias);
     }
+    out
 }
 
 #[cfg(test)]
@@ -272,6 +291,33 @@ mod tests {
             text.contains("rate_limit_exceeded"),
             "the rest of the error is intact"
         );
+    }
+
+    #[test]
+    fn mask_json_body_scrubs_the_base_slug_a_variant_error_suggests() {
+        // The real session #11 deblind: a `:free` tier is retired and the 404 names the *base* (paid)
+        // slug, which the full-slug replace alone would miss.
+        let body = serde_json::to_vec(&json!({
+            "error": {"message": "This model is unavailable for free. The paid version is available \
+                                  now - use this slug instead: qwen/qwen3-coder", "code": 404}
+        })).unwrap();
+        let out = mask_json_body(&body, "qwen/qwen3-coder:free", "tsr0:tjea");
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            !text.contains("qwen/qwen3-coder"),
+            "neither the full slug nor its base may survive: {text}"
+        );
+        assert!(text.contains("tsr0:tjea"), "the alias replaces it");
+    }
+
+    #[test]
+    fn slug_scrub_forms_adds_base_only_for_a_variant_slug() {
+        assert_eq!(
+            slug_scrub_forms("qwen/qwen3-coder:free"),
+            vec!["qwen/qwen3-coder:free", "qwen/qwen3-coder"] // full first, then base
+        );
+        assert_eq!(slug_scrub_forms("openai/gpt-oss-120b"), vec!["openai/gpt-oss-120b"]);
+        assert!(slug_scrub_forms("").is_empty());
     }
 
     #[test]

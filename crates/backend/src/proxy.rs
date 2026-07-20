@@ -46,7 +46,8 @@ fn classify_http(code: u16) -> ErrorKind {
         429 => ErrorKind::RateLimit,
         401 | 403 => ErrorKind::Auth,
         413 => ErrorKind::TooLarge, // request too large: context window or a per-minute token cap
-        400..=499 => ErrorKind::BadRequest, // other 4xx: 400/404/422/…
+        404 => ErrorKind::Unavailable, // model/route not available to you (delisted, free-retired, ZDR-filtered)
+        400..=499 => ErrorKind::BadRequest, // other 4xx: 400/422/…
         500..=599 => ErrorKind::Http5xx,
         // 1xx/3xx/≥600 shouldn't reach here (we only classify non-2xx final statuses; reqwest
         // follows redirects) — distinct Unknown bucket rather than mislabelling as bad_request.
@@ -739,10 +740,16 @@ mod tests {
         // 413 is its own signal (request too large / TPM cap), NOT a malformed 400 or a 429 throttle.
         assert_eq!(classify_http(413), ErrorKind::TooLarge);
         assert_eq!(classify_http(429), ErrorKind::RateLimit);
+        // 404 is its own persistent avoid-signal (model/route unavailable to you), NOT a malformed 400.
+        assert_eq!(classify_http(404), ErrorKind::Unavailable);
         assert_eq!(classify_http(400), ErrorKind::BadRequest);
         assert_eq!(classify_http(422), ErrorKind::BadRequest);
         assert_eq!(classify_http(401), ErrorKind::Auth);
         assert_eq!(classify_http(503), ErrorKind::Http5xx);
+        // Unavailable is a full-weight avoid-signal (like TooLarge), and round-trips through the wire.
+        assert_eq!(ErrorKind::Unavailable.loss_weight(), 1.0);
+        assert_eq!(ErrorKind::from_wire("unavailable"), Some(ErrorKind::Unavailable));
+        assert_eq!(ErrorKind::Unavailable.as_str(), "unavailable");
     }
 
     /// A session whose requests all fail upstream is tagged with the derived error_kind and the raw
