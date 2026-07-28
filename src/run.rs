@@ -558,6 +558,124 @@ fn opencode_config_content(base_url: &str, alias: &str) -> String {
     .to_string()
 }
 
+/// The user's pi `models.json` (if readable) with a `blindcoder` provider merged in, pointing at
+/// the proxy. Their other providers and settings are preserved untouched — only the `blindcoder`
+/// key is ours to overwrite. The model id is the session **alias**, so pi displays the blinded
+/// identity (e.g. `blindcoder/x7k2:q4m9`) just like the OpenCode injection; the matching
+/// `--model` argument is appended by the adapter (see [`CliAdapter`]), never typed by the user.
+/// `maxTokens` is pinned well below pi's default reservation because some gateways' per-minute
+/// token gates count `prompt + max_tokens`, so a large default output reservation can reject a
+/// request whose actual prompt would fit.
+fn pi_models_json(existing: Option<&str>, base_url: &str, alias: &str) -> String {
+    let mut root: serde_json::Value = existing
+        .and_then(|s| serde_json::from_str(s).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    let providers = root
+        .as_object_mut()
+        .expect("root is an object by construction")
+        .entry("providers")
+        .or_insert_with(|| serde_json::json!({}));
+    if !providers.is_object() {
+        *providers = serde_json::json!({});
+    }
+    providers
+        .as_object_mut()
+        .expect("providers forced to an object above")
+        .insert(
+            "blindcoder".to_string(),
+            serde_json::json!({
+                "baseUrl": base_url,
+                "api": "openai-completions",
+                "apiKey": "blindcoder",
+                "models": [{ "id": alias, "contextWindow": 128000, "maxTokens": 4096 }]
+            }),
+        );
+    serde_json::to_string_pretty(&root).expect("a Value serializes")
+}
+
+/// Populate the per-session pi agent dir injected via `PI_CODING_AGENT_DIR` — the pi counterpart
+/// of [`opencode_config_content`], with the same merge-not-replace intent. pi only takes a config
+/// *directory*, so the mechanism is a temp dir whose entries are symlinks into the user's real
+/// agent dir: auth, settings, themes, extensions and sessions all still apply, and pi's writes
+/// (including the extensions its self-extend loop produces) land in the real files. `models.json`
+/// alone is a merged copy adding the proxy provider. `extensions/` and `sessions/` are created in
+/// the real dir first if missing — a fresh install has neither, and without a real dir to symlink
+/// the session's writes would be stranded in the temp dir and silently discarded.
+///
+/// Split from [`pi_agent_dir`] so tests can pass a fabricated real dir instead of racing on
+/// `$HOME`.
+fn populate_pi_agent_dir(
+    dir: &std::path::Path,
+    real: &std::path::Path,
+    base_url: &str,
+    alias: &str,
+) -> std::io::Result<()> {
+    for keep in ["extensions", "sessions"] {
+        std::fs::create_dir_all(real.join(keep))?;
+    }
+    let mut existing = None;
+    for entry in std::fs::read_dir(real)? {
+        let entry = entry?;
+        if entry.file_name() == "models.json" {
+            existing = std::fs::read_to_string(entry.path()).ok();
+        } else {
+            std::os::unix::fs::symlink(entry.path(), dir.join(entry.file_name()))?;
+        }
+    }
+    std::fs::write(
+        dir.join("models.json"),
+        pi_models_json(existing.as_deref(), base_url, alias),
+    )
+}
+
+/// Build the injected pi agent dir from the user's `~/.pi/agent`. The returned guard removes the
+/// temp dir (the symlinks and the merged `models.json`, never their targets) when dropped.
+fn pi_agent_dir(base_url: &str, alias: &str) -> std::io::Result<tempfile::TempDir> {
+    let home = std::env::var_os("HOME")
+        .ok_or_else(|| std::io::Error::other("HOME is not set; cannot locate ~/.pi/agent"))?;
+    let real = std::path::PathBuf::from(home).join(".pi").join("agent");
+    let dir = tempfile::Builder::new()
+        .prefix("blindcoder-pi-")
+        .tempdir()?;
+    populate_pi_agent_dir(dir.path(), &real, base_url, alias)?;
+    Ok(dir)
+}
+
+/// Which CLI-specific setup `run` applies in launcher mode. A *recognized* CLI gets complete
+/// setup — endpoint, provider config, and model selection — so the bare command works with zero
+/// flags and displays the blinded alias. Anything else gets only the universal contract
+/// (`OPENAI_BASE_URL`/`OPENAI_API_KEY`): blindcoder cannot know an arbitrary CLI's config
+/// surface, and a CLI that ignores those env vars needs its own adapter — this enum is the seam
+/// to add one.
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum CliAdapter {
+    OpenCode,
+    Pi,
+    Generic,
+}
+
+impl CliAdapter {
+    /// Detect by the executable's file name so both `pi` and `/some/path/to/pi` match.
+    fn detect(argv0: &str) -> Self {
+        match std::path::Path::new(argv0)
+            .file_name()
+            .and_then(|n| n.to_str())
+        {
+            Some("opencode") => Self::OpenCode,
+            Some("pi") => Self::Pi,
+            _ => Self::Generic,
+        }
+    }
+}
+
+/// True when the user already picked a model on pi's command line (`--model x` or `--model=x`),
+/// in which case the adapter must not override it.
+fn has_model_arg(args: &[String]) -> bool {
+    args.iter()
+        .any(|a| a == "--model" || a.starts_with("--model="))
+}
+
 /// Where the recorded `realized_cost` came from — the provider's inline figure (authoritative) or
 /// our tokens × shelf-price estimate. Serialized to `session_end.cost_source` via [`as_str`].
 #[derive(Clone, Copy)]
@@ -660,22 +778,59 @@ async fn drive_session(params: DriveParams<'_>) -> Result<backend::SessionOutcom
     } else {
         // Launcher mode: spawn the CLI against the proxy (env injects the endpoint + an OpenCode
         // provider so no manual config is needed); the session ends when the CLI exits.
+        let adapter = CliAdapter::detect(&command[0]);
+        let mut args: Vec<String> = command[1..].to_vec();
         let mut cmd = tokio::process::Command::new(&command[0]);
-        cmd.args(&command[1..])
-            .env("OPENAI_BASE_URL", &base_url)
-            .env("OPENAI_API_KEY", "blindcoder")
-            .env(
-                "OPENCODE_CONFIG_CONTENT",
-                opencode_config_content(&base_url, alias_display),
-            );
+        // universal contract, honored by any env-respecting OpenAI-compatible CLI
+        cmd.env("OPENAI_BASE_URL", &base_url)
+            .env("OPENAI_API_KEY", "blindcoder");
+        // recognized-CLI adapters add complete setup on top; the guard (pi) must outlive the
+        // child — dropping it deletes the injected dir
+        let mut _pi_dir = None;
+        match adapter {
+            CliAdapter::OpenCode => {
+                cmd.env(
+                    "OPENCODE_CONFIG_CONTENT",
+                    opencode_config_content(&base_url, alias_display),
+                );
+            }
+            CliAdapter::Pi => {
+                // failure only degrades pi to the universal contract — warn and launch anyway
+                match pi_agent_dir(&base_url, alias_display) {
+                    Ok(dir) => {
+                        cmd.env("PI_CODING_AGENT_DIR", dir.path());
+                        _pi_dir = Some(dir);
+                        if !has_model_arg(&args) {
+                            args.push("--model".to_string());
+                            args.push(format!("blindcoder/{alias_display}"));
+                        }
+                    }
+                    Err(err) => eprintln!(
+                        "blindcoder: pi config injection unavailable ({err}); \
+                         pi would need a manual models.json pointing at {base_url}."
+                    ),
+                }
+            }
+            CliAdapter::Generic => {}
+        }
         let mut child = cmd
+            .args(&args)
             .spawn()
             .with_context(|| format!("failed to launch `{}`", command[0]))?;
         println!(
             "blindcoder: launched `{}` on a blinded session (pool of {pool_size}); ends when it exits.",
             command[0]
         );
-        println!("  model shown in the CLI:  blindcoder/{alias_display}");
+        match adapter {
+            CliAdapter::OpenCode | CliAdapter::Pi => {
+                println!("  model shown in the CLI:  blindcoder/{alias_display}");
+            }
+            CliAdapter::Generic => {
+                println!(
+                    "  model to request:  {alias_display}   (any value works; the proxy rewrites it)"
+                );
+            }
+        }
         if cap > 0.0 {
             println!("  cost cap:  ${cap:.2}");
         }
@@ -772,6 +927,129 @@ mod tests {
     use config::{Privacy, ProviderConfig};
     use rand::rngs::StdRng;
     use rand::SeedableRng;
+
+    #[test]
+    fn pi_models_json_merges_and_preserves_user_providers() {
+        // no existing file → just ours, keyed by the blinded alias
+        let ours: serde_json::Value =
+            serde_json::from_str(&pi_models_json(None, "http://127.0.0.1:1/v1", "x7k2:q4m9"))
+                .unwrap();
+        assert_eq!(
+            ours["providers"]["blindcoder"]["baseUrl"],
+            "http://127.0.0.1:1/v1"
+        );
+        assert_eq!(
+            ours["providers"]["blindcoder"]["models"][0]["id"],
+            "x7k2:q4m9"
+        );
+
+        // existing providers survive; an existing `blindcoder` entry is ours to overwrite
+        let user = r#"{
+            "providers": {
+                "their-provider": { "baseUrl": "http://their.test/v1", "api": "openai-completions" },
+                "blindcoder": { "baseUrl": "http://stale.test/v1" }
+            }
+        }"#;
+        let merged: serde_json::Value = serde_json::from_str(&pi_models_json(
+            Some(user),
+            "http://127.0.0.1:2/v1",
+            "x7k2:q4m9",
+        ))
+        .unwrap();
+        assert_eq!(
+            merged["providers"]["their-provider"]["baseUrl"],
+            "http://their.test/v1"
+        );
+        assert_eq!(
+            merged["providers"]["blindcoder"]["baseUrl"],
+            "http://127.0.0.1:2/v1"
+        );
+
+        // corrupt / non-object input degrades to ours-only rather than erroring
+        let recovered: serde_json::Value = serde_json::from_str(&pi_models_json(
+            Some("not json"),
+            "http://127.0.0.1:3/v1",
+            "x7k2:q4m9",
+        ))
+        .unwrap();
+        assert_eq!(
+            recovered["providers"]["blindcoder"]["baseUrl"],
+            "http://127.0.0.1:3/v1"
+        );
+    }
+
+    #[test]
+    fn cli_adapter_detects_by_file_name_and_model_arg_is_respected() {
+        assert_eq!(CliAdapter::detect("opencode"), CliAdapter::OpenCode);
+        assert_eq!(CliAdapter::detect("pi"), CliAdapter::Pi);
+        assert_eq!(CliAdapter::detect("/nix/store/abc/bin/pi"), CliAdapter::Pi);
+        assert_eq!(CliAdapter::detect("./aider"), CliAdapter::Generic);
+        // "pi" as a path *component* is not a match
+        assert_eq!(CliAdapter::detect("/opt/pi/aider"), CliAdapter::Generic);
+
+        let none: Vec<String> = vec!["-p".into(), "hi".into()];
+        assert!(!has_model_arg(&none));
+        let flagged: Vec<String> = vec!["--model".into(), "their/model".into()];
+        assert!(has_model_arg(&flagged));
+        let joined: Vec<String> = vec!["--model=their/model".into()];
+        assert!(has_model_arg(&joined));
+    }
+
+    #[test]
+    fn populate_pi_agent_dir_symlinks_real_entries_and_merges_models() {
+        let real = tempfile::tempdir().unwrap();
+        let injected = tempfile::tempdir().unwrap();
+        std::fs::write(real.path().join("auth.json"), r#"{"k":"v"}"#).unwrap();
+        std::fs::write(
+            real.path().join("models.json"),
+            r#"{"providers":{"their-provider":{"baseUrl":"http://their.test/v1"}}}"#,
+        )
+        .unwrap();
+
+        populate_pi_agent_dir(
+            injected.path(),
+            real.path(),
+            "http://127.0.0.1:9/v1",
+            "x7k2:q4m9",
+        )
+        .unwrap();
+
+        // real entries are symlinked (writes propagate), models.json is a merged real file
+        let auth = injected.path().join("auth.json");
+        assert!(auth.symlink_metadata().unwrap().file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(auth).unwrap(), r#"{"k":"v"}"#);
+        let models = injected.path().join("models.json");
+        assert!(!models.symlink_metadata().unwrap().file_type().is_symlink());
+        let merged: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(models).unwrap()).unwrap();
+        assert_eq!(
+            merged["providers"]["their-provider"]["baseUrl"],
+            "http://their.test/v1"
+        );
+        assert_eq!(
+            merged["providers"]["blindcoder"]["baseUrl"],
+            "http://127.0.0.1:9/v1"
+        );
+
+        // extensions/ and sessions/ were created in the REAL dir (so a fresh install still gets
+        // write-through for self-written extensions and session files) and symlinked in
+        for keep in ["extensions", "sessions"] {
+            assert!(real.path().join(keep).is_dir());
+            assert!(injected
+                .path()
+                .join(keep)
+                .symlink_metadata()
+                .unwrap()
+                .file_type()
+                .is_symlink());
+            // a write inside the injected dir lands in the real one
+            std::fs::write(injected.path().join(keep).join("probe"), keep).unwrap();
+            assert_eq!(
+                std::fs::read_to_string(real.path().join(keep).join("probe")).unwrap(),
+                keep
+            );
+        }
+    }
 
     #[test]
     fn parse_rating_accepts_numbers_and_letter_shortcuts() {

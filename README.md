@@ -86,15 +86,28 @@ Once you have declared a pool in your config (see [Configuration](#configuration
 way is **launcher mode** — hand `run` your agentic CLI and it does the rest:
 
 ```sh
-blindcoder run opencode          # or: blindcoder run -- aider --some-flag
+blindcoder run opencode          # or: blindcoder run pi
+blindcoder run -- aider --some-flag
 ```
 
 It makes a blind pick, stands up the pinned proxy, launches the CLI against it, and — when the CLI
-exits — records the session and asks you the two rating questions inline. **No manual CLI config:**
-it injects the endpoint via `OPENAI_BASE_URL`/`OPENAI_API_KEY`, and for OpenCode it injects a
-`blindcoder` provider (default model = the session alias) through `OPENCODE_CONFIG_CONTENT`, which
-merges into your config for that run only — nothing is written to disk. The CLI shows the blinded
-alias (e.g. `blindcoder/x7k2:q4m9`), never the real name.
+exits — records the session and asks you the two rating questions inline. Setup comes in two tiers:
+
+- **Recognized CLIs** get complete zero-flag setup — endpoint, provider config, *and* model
+  selection — and display the blinded alias (e.g. `blindcoder/x7k2:q4m9`), never the real name:
+  - **OpenCode:** a `blindcoder` provider (default model = the alias) is injected through
+    `OPENCODE_CONFIG_CONTENT`, merged into your config for that run only — nothing written to disk.
+  - **[pi](https://pi.dev):** a per-session agent dir is injected through `PI_CODING_AGENT_DIR`,
+    whose entries are symlinks into your real `~/.pi/agent` — auth, settings, themes, extensions
+    and sessions all still apply, and pi's writes (including extensions its self-extend loop
+    produces) land in your real files. Only `models.json` diverges: a merged copy adding a
+    `blindcoder` provider keyed on the alias, which the adapter also passes as `--model` (your own
+    `--model` flag, if any, wins). The injected model pins `maxTokens` well below pi's default,
+    because some gateways' per-minute token limits count `prompt + max_tokens` — a large default
+    output *reservation* can get a request rejected even when the actual prompt fits.
+- **Anything else** gets the universal contract: `OPENAI_BASE_URL`/`OPENAI_API_KEY` env vars plus
+  the printed endpoint and alias. Any CLI that honors those just works; one that doesn't needs its
+  own adapter (`CliAdapter` in `src/run.rs` is the seam — contributions welcome).
 
 Prefer to drive the CLI yourself? Omit the command for **standing-proxy mode** — point any
 OpenAI-compatible client at the printed endpoint and end with Ctrl-C, then rate separately:
