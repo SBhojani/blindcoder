@@ -170,11 +170,7 @@ fn validate_pool_privacy(cfg: &Config) -> Result<()> {
                     owner,
                     pv
                 ),
-                None => anyhow::bail!(
-                    "provider {:?}: unknown attestation key `{}`.",
-                    p.slug,
-                    key
-                ),
+                None => anyhow::bail!("provider {:?}: unknown attestation key `{}`.", p.slug, key),
             }
         }
 
@@ -182,7 +178,9 @@ fn validate_pool_privacy(cfg: &Config) -> Result<()> {
         // provider-named attestation. The required key is revealed *only* here.
         if let Some(k) = pv.attestation_key() {
             if p.attestations.get(k) != Some(&true) {
-                let steps = pv.manual_steps().unwrap_or("(see the provider's data-controls docs)");
+                let steps = pv
+                    .manual_steps()
+                    .unwrap_or("(see the provider's data-controls docs)");
                 anyhow::bail!(
                     "provider {:?} uses privacy = {:?}, whose Zero-Data-Retention blindcoder cannot \
                      verify on the wire — it depends on a manual account setup you must perform:\n\n\
