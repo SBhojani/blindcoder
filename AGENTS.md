@@ -7,6 +7,12 @@ locally rather than committing another copy.
 If a gitignored `AGENTS.local.md` is present, follow it too — it holds personal, machine-local
 setup (local toolchain access, VCS workflow) that isn't a project requirement: @AGENTS.local.md
 
+Committed loaders make that local file reach agents that do not auto-read `.local.md`: **opencode**
+via `opencode.jsonc` (`instructions`), and **pi** via an auto-discovered extension at
+`.pi/extensions/load-agents-local.ts` (it appends `AGENTS.local.md` to pi's system prompt). Both are
+no-ops when you keep no local file. Note: because pi auto-discovers `.pi/extensions/`, that committed
+extension runs automatically in your pi sessions here; it only reads `AGENTS.local.md`.
+
 ## What this project is
 
 blindcoder is a blind, cost/quality-aware **router** for agentic coding CLIs: it secretly picks

@@ -19,3 +19,10 @@
 # Personal, machine-local agent instructions (referenced by AGENTS.md). Each contributor keeps
 # their own local setup here (Nix/jj/editor/etc.); it is never shared. See AGENTS.md.
 AGENTS.local.md
+
+# pi coding agent working dir: ignore local state (settings, sessions, auth) but keep the one
+# committed, auto-discovered extension that loads AGENTS.local.md into pi. See AGENTS.md.
+/.pi/*
+!/.pi/extensions/
+/.pi/extensions/*
+!/.pi/extensions/load-agents-local.ts
