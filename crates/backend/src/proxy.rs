@@ -162,6 +162,7 @@ fn spawn_warc_writer(
 struct Cumulative {
     prompt: AtomicU64,
     completion: AtomicU64,
+    cached_prompt: AtomicU64,
     cost_nano: AtomicU64,
     has_cost: AtomicBool,
     any_success: AtomicBool,
@@ -178,6 +179,10 @@ impl Cumulative {
             .completion
             .fetch_add(u.completion_tokens, Ordering::Relaxed)
             + u.completion_tokens;
+        let cached_prompt = self
+            .cached_prompt
+            .fetch_add(u.cached_prompt_tokens, Ordering::Relaxed)
+            + u.cached_prompt_tokens;
         if let Some(c) = u.cost_so_far {
             self.cost_nano
                 .fetch_add((c * 1e9).round() as u64, Ordering::Relaxed);
@@ -186,6 +191,7 @@ impl Cumulative {
         UsageSnapshot {
             prompt_tokens: prompt,
             completion_tokens: completion,
+            cached_prompt_tokens: cached_prompt,
             cost_so_far: self.cost(),
         }
     }
@@ -199,10 +205,13 @@ impl Cumulative {
         }
     }
 
-    fn totals(&self) -> (u64, u64) {
+    /// Cumulative `(prompt, completion, cached_prompt)` tokens. `cached_prompt` is the
+    /// observability-only prompt-cache-hit total (a subset of `prompt`).
+    fn totals(&self) -> (u64, u64, u64) {
         (
             self.prompt.load(Ordering::Relaxed),
             self.completion.load(Ordering::Relaxed),
+            self.cached_prompt.load(Ordering::Relaxed),
         )
     }
 
@@ -597,10 +606,11 @@ impl Session for ProxySession {
     }
 
     fn usage(&self) -> UsageSnapshot {
-        let (prompt_tokens, completion_tokens) = self.cumulative.totals();
+        let (prompt_tokens, completion_tokens, cached_prompt_tokens) = self.cumulative.totals();
         UsageSnapshot {
             prompt_tokens,
             completion_tokens,
+            cached_prompt_tokens,
             cost_so_far: self.cumulative.cost(),
         }
     }
@@ -622,11 +632,12 @@ impl Session for ProxySession {
         if let Some(writer) = self.warc_writer.take() {
             let _ = writer.await; // wait for the WARC file to be written + flushed
         }
-        let (prompt_tokens, completion_tokens) = self.cumulative.totals();
+        let (prompt_tokens, completion_tokens, cached_prompt_tokens) = self.cumulative.totals();
         Ok(SessionOutcome {
             realized_cost: self.cumulative.cost(), // provider-reported when available, else None
             prompt_tokens: Some(prompt_tokens),
             completion_tokens: Some(completion_tokens),
+            cached_prompt_tokens: Some(cached_prompt_tokens),
             error_kind: self.cumulative.error_kind(),
             error_status: self.cumulative.error_status(),
             terminated_by: self.aborted,

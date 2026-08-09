@@ -45,7 +45,7 @@ grows in place. Nothing in the core knows the proxy/network exists.
   work only fills more columns. Append-only is enforced by DB triggers.
 - `crates/config` — TOML config with `flag > env > file > default` precedence; XDG paths.
 - `crates/alias` — random stored masking tokens + the reveal gate.
-- `crates/backend` — the load-bearing seam: the `Backend` transport trait. At M0 a trivial
+- `crates/backend` — the central seam: the `Backend` transport trait. At M0 a trivial
   rewrite proxy; M1+ grow the *same* trait into a full tee + fail-closed privacy proxy.
 - `src/` — the CLI binary and the `simulate` harness.
 

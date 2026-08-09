@@ -139,6 +139,14 @@ fn migrations() -> Migrations<'static> {
              CREATE TRIGGER session_end_no_delete BEFORE DELETE ON session_end
                BEGIN SELECT RAISE(ABORT, 'append-only: session_end is immutable'); END;",
         ),
+        // v6: record prompt-cache hits. `cached_prompt_tokens` is the session total of
+        // `usage.prompt_tokens_details.cached_tokens` (a subset of prompt_tokens), so cache hit
+        // rate becomes measurable from the persisted DB instead of only from the disposable WARC
+        // transcripts. Pure observability — never fed to the selector. Nullable, no CHECK, and it
+        // references only itself, so a plain ADD COLUMN suffices (no table rebuild, as with the v2
+        // cost_source addition). A recovered forensic finding motivated this: the wire carried cache
+        // hits up to 99.8% (kimi-k2.7) that the DB never saw because parse_usage dropped the field.
+        M::up("ALTER TABLE session_end ADD COLUMN cached_prompt_tokens INTEGER;"),
     ])
 }
 
@@ -226,6 +234,9 @@ pub struct ModelAggregate {
     pub avg_cost: Option<f64>,
     pub total_prompt_tokens: i64,
     pub total_completion_tokens: i64,
+    /// Of `total_prompt_tokens`, how many were prompt-cache hits (observability only). A high ratio
+    /// vs `total_prompt_tokens` means caching is firing for this model at its serving provider.
+    pub total_cached_prompt_tokens: i64,
     pub failures: Vec<ModelFailureCount>,
 }
 
@@ -243,6 +254,8 @@ pub struct SessionEnd<'a> {
     pub cost_source: Option<&'a str>,
     pub prompt_tokens: Option<i64>,
     pub completion_tokens: Option<i64>,
+    /// Session total of prompt-cache-hit tokens (subset of `prompt_tokens`). Observability only.
+    pub cached_prompt_tokens: Option<i64>,
     pub error_kind: Option<&'a str>,
     pub error_status: Option<u16>,
     pub terminated_by: Option<&'a str>,
@@ -272,7 +285,8 @@ impl Store {
                     SUM(e.realized_cost) AS total_cost,
                     AVG(e.realized_cost) AS avg_cost,
                     SUM(e.prompt_tokens) AS prompt_tokens,
-                    SUM(e.completion_tokens) AS completion_tokens
+                    SUM(e.completion_tokens) AS completion_tokens,
+                    SUM(e.cached_prompt_tokens) AS cached_prompt_tokens
              FROM sessions s
              JOIN aliases a ON a.alias = s.alias
              LEFT JOIN session_end e ON e.session_id = s.id
@@ -306,6 +320,9 @@ impl Store {
                     total_prompt_tokens: row.get::<_, Option<i64>>("prompt_tokens")?.unwrap_or(0),
                     total_completion_tokens: row
                         .get::<_, Option<i64>>("completion_tokens")?
+                        .unwrap_or(0),
+                    total_cached_prompt_tokens: row
+                        .get::<_, Option<i64>>("cached_prompt_tokens")?
                         .unwrap_or(0),
                     failures: Vec::new(),
                 })
@@ -708,6 +725,7 @@ impl Store {
             cost_source,
             prompt_tokens,
             completion_tokens,
+            cached_prompt_tokens,
             error_kind,
             error_status,
             terminated_by,
@@ -715,14 +733,15 @@ impl Store {
         self.conn.execute(
             "INSERT INTO session_end
                  (session_id, realized_cost, cost_source, prompt_tokens, completion_tokens,
-                  error_kind, error_status, terminated_by)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                  cached_prompt_tokens, error_kind, error_status, terminated_by)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             rusqlite::params![
                 session_id,
                 realized_cost,
                 cost_source,
                 prompt_tokens,
                 completion_tokens,
+                cached_prompt_tokens,
                 error_kind,
                 error_status.map(|v| v as i64),
                 terminated_by
@@ -1070,6 +1089,7 @@ mod tests {
                 cost_source: Some("provider"),
                 prompt_tokens: Some(1200),
                 completion_tokens: Some(340),
+                cached_prompt_tokens: None,
                 error_kind: Some("rate_limit"),
                 error_status: Some(429),
                 terminated_by: Some("cost_cap"),
@@ -1105,6 +1125,7 @@ mod tests {
                 cost_source: None,
                 prompt_tokens: None,
                 completion_tokens: None,
+                cached_prompt_tokens: None,
                 error_kind: Some("unavailable"),
                 error_status: Some(404),
                 terminated_by: None,
@@ -1174,6 +1195,7 @@ mod tests {
                 cost_source: Some("provider"),
                 prompt_tokens: Some(100),
                 completion_tokens: Some(50),
+                cached_prompt_tokens: Some(80),
                 error_kind: None,
                 error_status: None,
                 terminated_by: None,
@@ -1187,6 +1209,7 @@ mod tests {
                 cost_source: Some("provider"),
                 prompt_tokens: Some(200),
                 completion_tokens: Some(100),
+                cached_prompt_tokens: Some(120),
                 error_kind: None,
                 error_status: None,
                 terminated_by: None,
@@ -1202,6 +1225,7 @@ mod tests {
                 cost_source: Some("estimate"),
                 prompt_tokens: Some(1000),
                 completion_tokens: Some(500),
+                cached_prompt_tokens: None,
                 error_kind: Some("too_large"),
                 error_status: Some(413),
                 terminated_by: None,
@@ -1228,6 +1252,7 @@ mod tests {
         assert!((x.avg_cost.unwrap() - 1.0).abs() < 1e-9);
         assert_eq!(x.total_prompt_tokens, 300);
         assert_eq!(x.total_completion_tokens, 150);
+        assert_eq!(x.total_cached_prompt_tokens, 200); // 80 + 120 prompt-cache hits
         assert!(x.failures.is_empty());
         assert_eq!(x.real_slug.as_deref(), Some("prov/model-x"));
 

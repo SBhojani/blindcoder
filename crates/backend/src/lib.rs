@@ -104,6 +104,11 @@ pub struct Pick {
 pub struct UsageSnapshot {
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
+    /// Of `prompt_tokens`, how many were served from the provider's prompt (KV-prefix) cache —
+    /// `usage.prompt_tokens_details.cached_tokens` on the wire. A pure observability signal (billed
+    /// at a discount but that discount is already folded into `cost_so_far`): it lets us measure
+    /// cache hit rate per session/turn. 0 when the provider reports no cache detail.
+    pub cached_prompt_tokens: u64,
     /// Best-effort priced cost so far; `None` when the transport can't price mid-stream.
     /// The router falls back to tokens × the pick's unit price so the cost cap still fires.
     pub cost_so_far: Option<f64>,
@@ -237,6 +242,10 @@ pub struct SessionOutcome {
     pub realized_cost: Option<f64>,
     pub prompt_tokens: Option<u64>,
     pub completion_tokens: Option<u64>,
+    /// Of `prompt_tokens`, how many were served from the provider's prompt cache over the whole
+    /// session (summed across turns). `None` when no response carried cache detail; `Some(0)` means
+    /// the provider reported detail but nothing hit. Observability only — never fed to the selector.
+    pub cached_prompt_tokens: Option<u64>,
     /// Set when the session failed in a way worth tagging; `None` on clean success.
     pub error_kind: Option<ErrorKind>,
     /// The raw upstream HTTP status of an HTTP-level failure (the ground truth `error_kind` is
@@ -330,6 +339,7 @@ mod tests {
             UsageSnapshot {
                 prompt_tokens: 0,
                 completion_tokens: self.completion_tokens.load(Ordering::Relaxed),
+                cached_prompt_tokens: 0,
                 cost_so_far: None,
             }
         }
@@ -343,6 +353,7 @@ mod tests {
                 realized_cost: None,
                 prompt_tokens: None,
                 completion_tokens: Some(self.completion_tokens.load(Ordering::Relaxed)),
+                cached_prompt_tokens: None,
                 error_kind: None,
                 error_status: None,
                 terminated_by: self.aborted,
@@ -354,6 +365,7 @@ mod tests {
         UsageSnapshot {
             prompt_tokens: 100,
             completion_tokens,
+            cached_prompt_tokens: 0,
             cost_so_far: cost,
         }
     }

@@ -43,6 +43,11 @@ and how much have they cost me" — the project's core question — **without br
      from `normalize_prices(..)` over the pool's latest prices. This is the "best per dollar" column;
    - **total cost** and **avg cost/session** (from `session_end.realized_cost`);
    - **total prompt/completion tokens**;
+   - **cache hit rate** (`Cache%`) — prompt-cache-hit tokens as a share of prompt tokens
+     (`session_end.cached_prompt_tokens ÷ prompt_tokens`, turn-weighted), or `—` when there were no
+     prompt tokens. Observability only (the discount is already in `realized_cost`); a high value
+     means the model's serving provider is prefix-caching the resent context, which is a large part
+     of the cost for agentic workloads;
    - **failures**: count of sessions with a non-null `session_end.error_kind`, ideally broken down by
      kind (e.g. `too_large:2 auth:1`).
 3. **Default sort = value score, descending** (best value first). Allow `--sort <col>` for at least

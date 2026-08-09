@@ -47,12 +47,27 @@ struct StatsRow {
     avg_cost: Option<f64>,
     prompt_tokens: i64,
     completion_tokens: i64,
+    cached_prompt_tokens: i64,
     failures: Vec<(String, i64)>,
 }
 
 impl StatsRow {
     fn total_tokens(&self) -> i64 {
         self.prompt_tokens + self.completion_tokens
+    }
+
+    /// Prompt-cache hit rate: cached prompt tokens as a share of all prompt tokens. `—` when there
+    /// were no prompt tokens to hit. A high value means the serving provider is prefix-caching this
+    /// model's turn-over-turn resent context (the dominant cost lever for agentic workloads).
+    fn cache_hit_string(&self) -> String {
+        if self.prompt_tokens == 0 {
+            "—".to_string()
+        } else {
+            format!(
+                "{:.0}%",
+                100.0 * self.cached_prompt_tokens as f64 / self.prompt_tokens as f64
+            )
+        }
     }
 
     fn failure_string(&self) -> String {
@@ -182,6 +197,7 @@ fn gather_rows(store: &Store, cfg: &Config) -> Result<Vec<StatsRow>> {
             avg_cost: agg.avg_cost,
             prompt_tokens: agg.total_prompt_tokens,
             completion_tokens: agg.total_completion_tokens,
+            cached_prompt_tokens: agg.total_cached_prompt_tokens,
             failures: agg
                 .failures
                 .into_iter()
@@ -247,6 +263,7 @@ fn print_table(rows: &[StatsRow], reveal: bool) {
         "Total $",
         "Avg $",
         "Tokens",
+        "Cache%",
         "Failures",
     ];
 
@@ -265,6 +282,7 @@ fn print_table(rows: &[StatsRow], reveal: bool) {
                 format!("{:.4}", r.total_cost),
                 format_num(r.avg_cost.map(|v| format!("{v:.4}"))),
                 r.total_tokens().to_string(),
+                r.cache_hit_string(),
                 r.failure_string(),
             ]
         })
@@ -415,6 +433,7 @@ mod tests {
                     cost_source: Some("provider"),
                     prompt_tokens: Some(1000),
                     completion_tokens: Some(500),
+                    cached_prompt_tokens: None,
                     error_kind: Some("too_large"),
                     error_status: Some(413),
                     terminated_by: None,
@@ -431,6 +450,7 @@ mod tests {
                         cost_source: Some("provider"),
                         prompt_tokens: Some(100),
                         completion_tokens: Some(50),
+                        cached_prompt_tokens: Some(40),
                         error_kind: None,
                         error_status: None,
                         terminated_by: None,

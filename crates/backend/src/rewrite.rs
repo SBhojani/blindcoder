@@ -85,10 +85,20 @@ pub fn parse_usage(value: &Value) -> Option<UsageSnapshot> {
         .get("completion_tokens")
         .and_then(Value::as_u64)
         .unwrap_or(0);
+    // Prompt-cache hits: `usage.prompt_tokens_details.cached_tokens` — the OpenAI-wire shape both
+    // OpenRouter (per upstream) and Groq report. A subset of `prompt_tokens`. Absent when the
+    // provider emits no cache detail → 0 (indistinguishable from a real miss at the token level,
+    // which is fine: the aggregate over turns still tells caching-fires from never-caches apart).
+    let cached_prompt_tokens = usage
+        .get("prompt_tokens_details")
+        .and_then(|d| d.get("cached_tokens"))
+        .and_then(Value::as_u64)
+        .unwrap_or(0);
     let cost_so_far = usage.get("cost").and_then(Value::as_f64);
     Some(UsageSnapshot {
         prompt_tokens,
         completion_tokens,
+        cached_prompt_tokens,
         cost_so_far,
     })
 }
@@ -246,6 +256,7 @@ mod tests {
         assert_eq!(u.prompt_tokens, 1200);
         assert_eq!(u.completion_tokens, 340);
         assert_eq!(u.cost_so_far, Some(0.00025938)); // provider-reported cost captured
+        assert_eq!(u.cached_prompt_tokens, 0); // no prompt_tokens_details → 0
 
         // No `cost` field → None (router falls back to its estimate).
         let no_cost =
@@ -253,6 +264,19 @@ mod tests {
                 .unwrap();
         assert_eq!(no_cost.cost_so_far, None);
         assert!(parse_usage(&json!({ "choices": [] })).is_none());
+
+        // Prompt-cache hit reported in the OpenAI-wire `prompt_tokens_details.cached_tokens` shape
+        // (the exact shape recovered from real kimi-k2.7 / hy3-free WARC transcripts).
+        let cached = parse_usage(&json!({
+            "usage": {
+                "prompt_tokens": 134782,
+                "completion_tokens": 12,
+                "prompt_tokens_details": { "cached_tokens": 134528 }
+            }
+        }))
+        .unwrap();
+        assert_eq!(cached.cached_prompt_tokens, 134528);
+        assert_eq!(cached.prompt_tokens, 134782);
     }
 
     #[test]

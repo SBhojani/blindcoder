@@ -79,7 +79,7 @@ value_score = quality_guess − cost_sensitivity × normalized_price
   request-too-large) counts near a full lost session; a transient backend hiccup (rate limit, 5xx,
   network) counts little (decay clears it); an our-fault error (auth, malformed request) counts
   nothing, because the model is blameless. A single `failure_sensitivity` knob scales the whole
-  effect (0 disables it). Crucially the **selector never sees the error taxonomy** — it folds a
+  effect (0 disables it). Note that the **selector never sees the error taxonomy** — it folds a
   generic weighted loss; the error-kind→weight mapping lives in the router layer, keeping the
   decision core pure.
 
@@ -107,7 +107,7 @@ Everything provider-specific is *data* in the config, not a code path:
 
 A useful consequence: a pool of only-free models makes the cost term inert (every candidate is
 $0), so the selector reduces to a pure quality race. Mixing in at least one priced provider is
-what exercises the cost/quality trade-off — which is the whole point of the router.
+what exercises the cost/quality trade-off — which is what the router is for.
 
 **The proxy is a rewrite, not a translation.** For one session the router picks a candidate,
 starts a session, and forwards requests to the chosen endpoint with just two edits to the wire
@@ -159,6 +159,22 @@ records it as `realized_cost`, falling back to the estimate only when none is re
 `session_end` tags the origin (`cost_source` = `provider` | `estimate`) so the number is never
 misread. The reported cost also drives the mid-session cap when present.
 
+Alongside the token counts the transport also tallies **prompt-cache hits** — the
+`usage.prompt_tokens_details.cached_tokens` field (a subset of the prompt tokens) that providers
+report when a request's prefix was served from their KV-prefix cache. This is **observability only**:
+any cache discount is already folded into the provider-reported `realized_cost`, so accounting stays
+correct without it, but the raw hit count shows whether caching actually fired rather than leaving it
+to be inferred from the cost. It is relevant because agentic workloads are the case caching targets:
+each turn resends the whole growing conversation, so an uncached prefix is reprocessed from scratch
+every turn and cost grows roughly quadratically in turns, whereas a cached prefix pays full price only
+for the new tail. Whether it fires is **per-model at its serving provider, and set by routing**: in
+live use some upstreams cache almost the entire resent prefix turn over turn while others report the
+field but never hit, and a gateway that load-balances a model across upstreams can miss even on an
+identical resent conversation. Two things to watch when reading it: a present field is not a hit (read
+the value, not the key), and the count is **summed across the session's turns** rather than taken from
+the final response — a session's last turn can report zero cached even when caching fired on most
+earlier turns.
+
 The M0 transport is a small **streaming reverse proxy**: `run` binds it on a local port, and for
 each request it rewrites the blind model to the real slug, merges the provider's `extra_body`,
 forwards with the API key and `extra_headers`, and streams the response back while tallying the
@@ -179,7 +195,7 @@ permanent random explorer?* Synthetic raters with a known ground truth drive the
 it reports best-arm pick-rate over time, cumulative regret vs. a random baseline, and
 time-to-converge, and prints a GO / MARGINAL / NO-GO verdict. Use it to size the pool and tune.
 
-**Rating sparsity is the load-bearing stress axis.** Real users rate only a fraction of sessions
+**Rating sparsity is the main stress axis.** Real users rate only a fraction of sessions
 (~1/day), not every one, so the honest question is whether the selector accrues enough evidence
 per arm under *sparse* feedback. The `--rate-prob` knob (probability a session gets rated;
 `rate × rate_prob` = ratings/day) exposes this, and it is where the design's size ceiling comes
