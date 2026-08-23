@@ -42,6 +42,12 @@ pub fn apply_request_privacy(body: &mut Value, privacy: Privacy) {
         }
         // Groq: ZDR is an account-level setting; there is nothing to send per request.
         Privacy::Groq => {}
+        // no-zdr: a REVIEWED NO-OP. The endpoint retains no ZDR promise to enforce, so there is
+        // deliberately nothing to inject — the enforcement is the multi-gate consent chain the
+        // router runs at startup (which a default build refuses outright), plus the fail-closed
+        // per-request audit trail in the transport. Writing this arm (and reading this comment) is
+        // the compile-time review the exhaustive match exists to force.
+        Privacy::NoZdr => {}
     }
 }
 
@@ -241,6 +247,17 @@ mod tests {
     }
 
     #[test]
+    fn no_zdr_arm_injects_nothing() {
+        // The reviewed no-op: the body must come through byte-identical — no wire flags, no
+        // endpoint binding. (The consent chain, not this arm, is the enforcement.)
+        let mut body =
+            json!({ "model": "real/slug", "messages": [{"role": "user", "content": "hi"}] });
+        let before = body.clone();
+        apply_request_privacy(&mut body, Privacy::NoZdr);
+        assert_eq!(body, before, "no-zdr must not modify the request");
+    }
+
+    #[test]
     fn non_object_body_is_refused() {
         let mut body = json!("not an object");
         assert!(rewrite_request(&mut body, "real/slug", &Map::new()).is_err());
@@ -340,7 +357,10 @@ mod tests {
             slug_scrub_forms("qwen/qwen3-coder:free"),
             vec!["qwen/qwen3-coder:free", "qwen/qwen3-coder"] // full first, then base
         );
-        assert_eq!(slug_scrub_forms("openai/gpt-oss-120b"), vec!["openai/gpt-oss-120b"]);
+        assert_eq!(
+            slug_scrub_forms("openai/gpt-oss-120b"),
+            vec!["openai/gpt-oss-120b"]
+        );
         assert!(slug_scrub_forms("").is_empty());
     }
 

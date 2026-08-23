@@ -115,6 +115,21 @@ pub struct ProviderConfig {
     /// reading the manual steps — never a value copied from a template.
     #[serde(flatten)]
     pub attestations: BTreeMap<String, bool>,
+    /// Per-model consent for a `privacy = "no-zdr"` (pay-with-data) provider: must list the exact
+    /// `real_slug` of every model under the provider. Deliberately typed as a slug list rather than
+    /// a blanket boolean, so a provider cannot be opted out once and then silently grow a second
+    /// model. Like the flattened attestations, the key is intentionally absent from
+    /// `config.example.toml` and the docs — it is revealed only by the fail-closed startup error
+    /// (see [`Privacy::non_zdr_attestation_key`]), and only after the build-feature gate passes.
+    /// Rejected on any other privacy protocol. The field parses in every build so a default
+    /// (feature-less) build fails with the feature-gate error, never a confusing parse error.
+    #[serde(default, rename = "no_zdr_models_i_accept_training_on")]
+    pub non_zdr_attested_models: Vec<String>,
+    /// Bounded lifetime of a `no-zdr` provider's consent, as a `"YYYY-MM-DD"` date. Required for
+    /// `privacy = "no-zdr"` (startup refuses when absent, expired, or dated too far ahead);
+    /// rejected on any other privacy protocol.
+    #[serde(default)]
+    pub expires: Option<String>,
     /// The models this provider offers in the pool.
     #[serde(default)]
     pub models: Vec<ModelConfig>,
@@ -138,25 +153,38 @@ pub enum Privacy {
     /// Groq — ZDR enabled at the account level (console data-controls); nothing is sent per request.
     /// Config value: `"groq"`.
     Groq,
+    /// A non-ZDR / pay-with-data endpoint: the provider may log or train on prompts. Config value:
+    /// `"no-zdr"`. Provider-agnostic — no endpoint-host binding and no wire injection; the
+    /// enforcement is the multi-gate consent chain the router runs at startup (build feature +
+    /// per-model attestation + expiry + environment second factor + invocation flag), not this
+    /// variant. The variant itself parses in every build so a default (feature-less) build can
+    /// refuse it with the feature-gate error instead of an opaque parse failure.
+    NoZdr,
 }
 
 impl Privacy {
-    /// The endpoint host this privacy protocol is verified against. An account-level attestation
-    /// (e.g. Groq) does *nothing* on the wire, so it is only meaningful for that provider's real
-    /// endpoint — the pool build refuses a provider whose `base_url` host doesn't match, rather than
-    /// silently trusting an arbitrary endpoint that merely *claims* the protocol. For request-time
-    /// protocols (OpenRouter) the check is defence-in-depth on top of the self-enforcing injection.
-    pub fn endpoint_host(self) -> &'static str {
+    /// The endpoint host this privacy protocol is verified against, if it binds one. An
+    /// account-level attestation (e.g. Groq) does *nothing* on the wire, so it is only meaningful
+    /// for that provider's real endpoint — the pool build refuses a provider whose `base_url` host
+    /// doesn't match, rather than silently trusting an arbitrary endpoint that merely *claims* the
+    /// protocol. For request-time protocols (OpenRouter) the check is defence-in-depth on top of the
+    /// self-enforcing injection. `None` for `no-zdr`: it promises nothing about data retention, so
+    /// there is no attestation to scope to a host — the consent chain, not host matching, gates it.
+    pub fn endpoint_host(self) -> Option<&'static str> {
         match self {
-            Privacy::OpenRouter => "openrouter.ai",
-            Privacy::Groq => "api.groq.com",
+            Privacy::OpenRouter => Some("openrouter.ai"),
+            Privacy::Groq => Some("api.groq.com"),
+            Privacy::NoZdr => None,
         }
     }
 
     /// Whether `base_url`'s host is this protocol's verified endpoint host (or a subdomain of it).
+    /// A protocol with no host binding matches any endpoint.
     pub fn matches_endpoint(self, base_url: &str) -> bool {
+        let Some(want) = self.endpoint_host() else {
+            return true;
+        };
         let host = host_of(base_url);
-        let want = self.endpoint_host();
         host == want || host.strip_suffix(want).is_some_and(|p| p.ends_with('.'))
     }
 
@@ -167,7 +195,7 @@ impl Privacy {
     /// fail-closed routing suffice).
     pub fn manual_steps(self) -> Option<&'static str> {
         match self {
-            Privacy::OpenRouter => None,
+            Privacy::OpenRouter | Privacy::NoZdr => None,
             Privacy::Groq => Some(
                 "In the Groq console (console.groq.com), open Settings → Data Controls and enable \
                  Zero-Data-Retention for the account/API key you use here.",
@@ -181,15 +209,28 @@ impl Privacy {
     /// [`for_attestation_key`](Self::for_attestation_key)).
     pub fn attestation_key(self) -> Option<&'static str> {
         match self {
-            Privacy::OpenRouter => None,
+            Privacy::OpenRouter | Privacy::NoZdr => None,
             Privacy::Groq => Some("groq_manual_steps_done"),
+        }
+    }
+
+    /// The **typed, per-model** attestation key of the `no-zdr` protocol — the config key of
+    /// [`ProviderConfig::non_zdr_attested_models`], which must list the exact `real_slug` of every
+    /// model under the provider. The reveal pattern of [`attestation_key`](Self::attestation_key)
+    /// with a slug-list shape instead of a boolean: the literal lives only here (matching the
+    /// field's serde rename — a test pins the two together) and in the fail-closed startup error,
+    /// never in the example config or docs.
+    pub fn non_zdr_attestation_key(self) -> Option<&'static str> {
+        match self {
+            Privacy::OpenRouter | Privacy::Groq => None,
+            Privacy::NoZdr => Some("no_zdr_models_i_accept_training_on"),
         }
     }
 
     /// Which protocol, if any, owns `key`. Lets validation reject a key that belongs to a *different*
     /// provider's protocol (e.g. `groq_manual_steps_done` on an OpenRouter provider) or is unknown.
     pub fn for_attestation_key(key: &str) -> Option<Privacy> {
-        [Privacy::OpenRouter, Privacy::Groq]
+        [Privacy::OpenRouter, Privacy::Groq, Privacy::NoZdr]
             .into_iter()
             .find(|p| p.attestation_key() == Some(key))
     }
@@ -207,6 +248,36 @@ fn host_of(url: &str) -> &str {
 
 fn default_wire() -> String {
     "openai".to_string()
+}
+
+/// Parse a strict `"YYYY-MM-DD"` calendar date into days since the Unix epoch (proleptic
+/// Gregorian, Hinnant's civil-days algorithm — no time-of-day, no timezone, no date dependency).
+/// `None` for anything else. Used for the `expires` bound on `no-zdr` providers; pure so the
+/// expiry checks can be tested against a fixed "today".
+pub fn date_to_epoch_days(s: &str) -> Option<i64> {
+    let mut parts = s.split('-');
+    let (y, m, d) = (parts.next()?, parts.next()?, parts.next()?);
+    if parts.next().is_some() || y.len() != 4 || m.len() != 2 || d.len() != 2 {
+        return None;
+    }
+    let (y, m, d): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let yy = if m <= 2 { y - 1 } else { y };
+    let era = if yy >= 0 { yy } else { yy - 399 } / 400;
+    let yoe = yy - era * 400;
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// Today (UTC) in days since the Unix epoch — the one clock read callers pass into the pure
+/// [`date_to_epoch_days`]-based expiry checks.
+pub fn today_epoch_days() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| (d.as_secs() / 86_400) as i64)
 }
 
 /// The full application config. `#[serde(default)]` means any field missing from the TOML falls
@@ -413,13 +484,82 @@ real_slug = "groq/m"
 
     #[test]
     fn attestation_key_ownership() {
-        assert_eq!(Privacy::Groq.attestation_key(), Some("groq_manual_steps_done"));
+        assert_eq!(
+            Privacy::Groq.attestation_key(),
+            Some("groq_manual_steps_done")
+        );
         assert_eq!(Privacy::OpenRouter.attestation_key(), None);
+        assert_eq!(Privacy::NoZdr.attestation_key(), None);
         assert_eq!(
             Privacy::for_attestation_key("groq_manual_steps_done"),
             Some(Privacy::Groq)
         );
         assert_eq!(Privacy::for_attestation_key("nope"), None);
+    }
+
+    #[test]
+    fn no_zdr_parses_with_its_typed_attestation_and_expiry() {
+        // The literal key comes from the reveal method, so this test pins the serde rename and the
+        // revealed string together — they can never drift apart. Placeholder slug only.
+        let key = Privacy::NoZdr.non_zdr_attestation_key().unwrap();
+        let toml_src = format!(
+            r#"
+[[providers]]
+slug = "pwd"
+base_url = "https://api.example.test/v1"
+privacy = "no-zdr"
+{key} = ["example/non-zdr-model"]
+expires = "2026-09-01"
+
+[[providers.models]]
+canonical_key = "non-zdr-model"
+real_slug = "example/non-zdr-model"
+input_per_mtok = 0.1
+output_per_mtok = 0.4
+"#
+        );
+        let c: Config = toml::from_str(&toml_src).unwrap();
+        let p = &c.providers[0];
+        assert_eq!(p.privacy, Some(Privacy::NoZdr));
+        assert_eq!(p.non_zdr_attested_models, vec!["example/non-zdr-model"]);
+        assert_eq!(p.expires.as_deref(), Some("2026-09-01"));
+        assert!(
+            p.attestations.is_empty(),
+            "typed fields never leak into the flatten map"
+        );
+        // The cost path sees a normally priced model — non-ZDR does not imply free.
+        assert_eq!(p.models[0].input_per_mtok, Some(0.1));
+    }
+
+    #[test]
+    fn no_zdr_binds_no_endpoint_host() {
+        assert_eq!(Privacy::NoZdr.endpoint_host(), None);
+        assert!(Privacy::NoZdr.matches_endpoint("https://anything.example/v1"));
+        // The bound protocols keep their binding (Option-wrapped, same hosts).
+        assert_eq!(Privacy::Groq.endpoint_host(), Some("api.groq.com"));
+        assert_eq!(Privacy::OpenRouter.endpoint_host(), Some("openrouter.ai"));
+    }
+
+    #[test]
+    fn date_to_epoch_days_is_exact_and_strict() {
+        assert_eq!(date_to_epoch_days("1970-01-01"), Some(0));
+        assert_eq!(date_to_epoch_days("1970-01-02"), Some(1));
+        assert_eq!(date_to_epoch_days("2000-01-01"), Some(10_957));
+        assert_eq!(date_to_epoch_days("2000-03-01"), Some(11_017));
+        // strict YYYY-MM-DD only
+        for bad in [
+            "2026-9-01",
+            "2026-09-1",
+            "26-09-01",
+            "2026-09-01T00:00:00Z",
+            "2026-13-01",
+            "2026-00-10",
+            "2026-01-32",
+            "soon",
+            "",
+        ] {
+            assert_eq!(date_to_epoch_days(bad), None, "{bad:?} must not parse");
+        }
     }
 
     #[test]

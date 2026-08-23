@@ -55,6 +55,40 @@ fn classify_http(code: u16) -> ErrorKind {
     }
 }
 
+/// The fail-closed audit trail of the opt-in non-ZDR routing path: every request forwarded to a
+/// `no-zdr` model appends `timestamp · session_id · real_slug` to a dedicated append-only file
+/// (created `0600`). Deliberately *not* the per-response alias mapping — session-id granularity
+/// keeps the file from becoming an oracle for deblinding the current session's ratings.
+#[cfg(feature = "allow-non-zdr")]
+#[derive(Clone, Debug)]
+pub struct NonZdrAudit {
+    path: PathBuf,
+    session_id: i64,
+}
+
+#[cfg(feature = "allow-non-zdr")]
+impl NonZdrAudit {
+    /// Durably append one routed-request record. Any failure is returned and the caller must
+    /// refuse the request — no routing without a durable record (fail-closed).
+    fn append(&self, real_slug: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&self.path)?;
+        writeln!(
+            f,
+            "{}\t{}\t{}",
+            chrono::Utc::now().to_rfc3339(),
+            self.session_id,
+            real_slug
+        )?;
+        f.sync_all()
+    }
+}
+
 /// A ready-to-run forwarding proxy. Constructed per session by the router with the picked
 /// provider's credentials and passthrough hooks; the per-model target (`base_url`, `real_slug`)
 /// arrives in [`Backend::start`]'s [`Pick`].
@@ -67,6 +101,9 @@ pub struct ProxyBackend {
     /// guarantees only an eligible, host-matched provider reaches here).
     privacy: Privacy,
     capture_path: Option<PathBuf>,
+    /// `Some` when this session routes to a `no-zdr` model: the per-request audit sink.
+    #[cfg(feature = "allow-non-zdr")]
+    non_zdr_audit: Option<NonZdrAudit>,
     client: reqwest::Client,
 }
 
@@ -89,10 +126,21 @@ impl ProxyBackend {
             extra_body,
             privacy,
             capture_path,
+            #[cfg(feature = "allow-non-zdr")]
+            non_zdr_audit: None,
             client: reqwest::Client::builder()
                 .build()
                 .context("building HTTP client")?,
         })
+    }
+
+    /// Arm the fail-closed non-ZDR audit trail for this session: every forwarded request appends
+    /// to `path` (or is refused if the append fails). Only meaningful — and only compiled — on the
+    /// opt-in routing path; the router calls this solely when the pick landed on a `no-zdr` model.
+    #[cfg(feature = "allow-non-zdr")]
+    pub fn with_non_zdr_audit(mut self, path: PathBuf, session_id: i64) -> Self {
+        self.non_zdr_audit = Some(NonZdrAudit { path, session_id });
+        self
     }
 }
 
@@ -288,6 +336,10 @@ struct ProxyState {
     capture_tx: Option<mpsc::UnboundedSender<CaptureLeg>>,
     /// Monotonic id grouping the four legs of one exchange in the archive.
     exchange_seq: AtomicU64,
+    /// `Some` when this session routes to a `no-zdr` model: append before every forward, refuse on
+    /// failure (fail-closed).
+    #[cfg(feature = "allow-non-zdr")]
+    non_zdr_audit: Option<NonZdrAudit>,
 }
 
 /// Signals read from a completed response body in one pass: token usage, the last `finish_reason`,
@@ -384,6 +436,19 @@ async fn proxy_handler(
     let vetted = st
         .endpoint
         .prepare(&body, &st.real_slug, &st.extra_body, st.privacy);
+
+    // Fail-closed non-ZDR audit: the durable record is appended BEFORE anything is forwarded, and
+    // a failed append refuses the request — no routing without a witness on disk.
+    #[cfg(feature = "allow-non-zdr")]
+    if let Some(audit) = &st.non_zdr_audit {
+        if let Err(e) = audit.append(&st.real_slug) {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!("non-ZDR audit append failed ({e}); refusing to forward without a durable record"),
+            )
+                .into_response();
+        }
+    }
 
     // Capture legs 1–2 (request side) at the `replay` level, before sending.
     let exchange = st.exchange_seq.fetch_add(1, Ordering::Relaxed);
@@ -567,6 +632,8 @@ impl Backend for ProxyBackend {
             cumulative: cumulative.clone(),
             capture_tx,
             exchange_seq: AtomicU64::new(0),
+            #[cfg(feature = "allow-non-zdr")]
+            non_zdr_audit: self.non_zdr_audit.clone(),
         });
 
         let app = Router::new().fallback(any(proxy_handler)).with_state(state);
@@ -759,7 +826,10 @@ mod tests {
         assert_eq!(classify_http(503), ErrorKind::Http5xx);
         // Unavailable is a full-weight avoid-signal (like TooLarge), and round-trips through the wire.
         assert_eq!(ErrorKind::Unavailable.loss_weight(), 1.0);
-        assert_eq!(ErrorKind::from_wire("unavailable"), Some(ErrorKind::Unavailable));
+        assert_eq!(
+            ErrorKind::from_wire("unavailable"),
+            Some(ErrorKind::Unavailable)
+        );
         assert_eq!(ErrorKind::Unavailable.as_str(), "unavailable");
     }
 
@@ -847,6 +917,134 @@ mod tests {
         assert!(
             !text.contains("prov/model-x"),
             "real slug must not leak in the model list"
+        );
+    }
+
+    /// The non-ZDR audit trail (feature-gated): every forwarded request appends one
+    /// `timestamp \t session_id \t real_slug` line to the 0600 audit file — request-level
+    /// granularity, and the real slug (never the alias) so the file can't deblind ratings.
+    #[cfg(feature = "allow-non-zdr")]
+    #[tokio::test]
+    async fn non_zdr_audit_appends_one_line_per_forwarded_request() {
+        let up_app = Router::new().route(
+            "/v1/chat/completions",
+            post(|| async {
+                axum::Json(json!({
+                    "choices": [{"message": {"content": "ok"}}],
+                    "usage": {"prompt_tokens": 1, "completion_tokens": 1}
+                }))
+            }),
+        );
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(up_listener, up_app).await.unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let audit_path = tmp.path().join("non-zdr-audit.log");
+        let backend = ProxyBackend::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Some("k".into()),
+            vec![],
+            serde_json::Map::new(),
+            Privacy::NoZdr,
+            None,
+        )
+        .unwrap()
+        .with_non_zdr_audit(audit_path.clone(), 42);
+        let pick = Pick {
+            canonical_key: "non-zdr-model".into(),
+            real_slug: "example/non-zdr-model".into(),
+            endpoint: crate::VettedEndpoint::new(format!("http://{up_addr}/v1")),
+        };
+        let sess = backend.start(&pick, "al:al").await.unwrap();
+        let addr = sess.endpoint().unwrap();
+
+        let client = reqwest::Client::new();
+        for _ in 0..2 {
+            let resp = client
+                .post(format!("http://{addr}/v1/chat/completions"))
+                .json(&json!({"model": "al:al", "messages": []}))
+                .send()
+                .await
+                .unwrap();
+            assert!(resp.status().is_success());
+            let _ = resp.text().await;
+        }
+        let _ = sess.finish().await.unwrap();
+
+        let text = std::fs::read_to_string(&audit_path).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 2, "one line per forwarded request: {text:?}");
+        for line in lines {
+            let fields: Vec<&str> = line.split('\t').collect();
+            assert_eq!(fields.len(), 3, "timestamp/session/slug: {line:?}");
+            assert!(fields[0].starts_with("20"), "timestamp field: {line:?}");
+            assert_eq!(fields[1], "42");
+            assert_eq!(fields[2], "example/non-zdr-model");
+            assert!(
+                !line.contains("al:al"),
+                "the alias must never enter the audit file"
+            );
+        }
+        let mode = std::fs::metadata(&audit_path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "audit file must be 0600");
+    }
+
+    /// Fail-closed: when the audit record cannot be written the request is REFUSED — the upstream
+    /// must never see it. (The audit path is a directory, so every append fails.)
+    #[cfg(feature = "allow-non-zdr")]
+    #[tokio::test]
+    async fn non_zdr_audit_failure_refuses_the_request() {
+        let hit = Arc::new(AtomicBool::new(false));
+        let up_hit = hit.clone();
+        let up_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let up_hit = up_hit.clone();
+                async move {
+                    up_hit.store(true, Ordering::Relaxed);
+                    axum::Json(json!({"choices": []}))
+                }
+            }),
+        );
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(up_listener, up_app).await.unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        let backend = ProxyBackend::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Some("k".into()),
+            vec![],
+            serde_json::Map::new(),
+            Privacy::NoZdr,
+            None,
+        )
+        .unwrap()
+        .with_non_zdr_audit(tmp.path().to_path_buf(), 7); // a directory: append must fail
+        let pick = Pick {
+            canonical_key: "non-zdr-model".into(),
+            real_slug: "example/non-zdr-model".into(),
+            endpoint: crate::VettedEndpoint::new(format!("http://{up_addr}/v1")),
+        };
+        let sess = backend.start(&pick, "al:al").await.unwrap();
+        let addr = sess.endpoint().unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&json!({"model": "al:al", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 503, "refused, not forwarded");
+        let _ = sess.finish().await.unwrap();
+        assert!(
+            !hit.load(Ordering::Relaxed),
+            "upstream must never see the request"
         );
     }
 

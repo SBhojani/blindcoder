@@ -145,15 +145,27 @@ fn validate_pool_privacy(cfg: &Config) -> Result<()> {
         };
 
         // (2) The declaration is only valid for that provider's real endpoint. For an account-level
-        // protocol (which does nothing on the wire) this host match *is* the enforcement.
+        // protocol (which does nothing on the wire) this host match *is* the enforcement. A
+        // protocol with no host binding (`no-zdr`) always matches, so the mismatch arm always has a
+        // host to name.
         if !pv.matches_endpoint(&p.base_url) {
             anyhow::bail!(
                 "provider {:?}: base_url {:?} is not the {} endpoint that privacy = {:?} attests — \
                  an attestation is only valid for that provider's real endpoint.",
                 p.slug,
                 p.base_url,
-                pv.endpoint_host(),
+                pv.endpoint_host().unwrap_or("(unbound)"),
                 pv
+            );
+        }
+
+        // The no-zdr consent fields are scoped to the no-zdr protocol; on any other provider they
+        // are a misconfiguration (likely a copy-paste), refused rather than silently ignored.
+        if pv != Privacy::NoZdr && (p.expires.is_some() || !p.non_zdr_attested_models.is_empty()) {
+            anyhow::bail!(
+                "provider {:?}: `expires` / the per-model non-ZDR attestation are only meaningful \
+                 with privacy = \"no-zdr\" — remove them from this provider.",
+                p.slug
             );
         }
 
@@ -197,6 +209,148 @@ fn validate_pool_privacy(cfg: &Config) -> Result<()> {
         }
     }
     Ok(())
+}
+
+/// (allow-non-zdr only) The environment second factor of the non-ZDR consent chain: must be set,
+/// non-empty, at launch. A committed config can therefore never arm non-ZDR routing on its own.
+/// The literal lives only in source and in the reveal error — never in docs, the example config,
+/// or `--help`.
+#[cfg(feature = "allow-non-zdr")]
+const NON_ZDR_ENV_VAR: &str = "BLINDCODER_NON_ZDR_SESSION_OK";
+
+/// (allow-non-zdr only) Hard cap on how far ahead a `no-zdr` provider's `expires` may be dated —
+/// the maximum time the capability can stay armed per attestation. Revealed only when violated.
+#[cfg(feature = "allow-non-zdr")]
+const NON_ZDR_MAX_ARM_DAYS: i64 = 30;
+
+/// The non-ZDR consent chain (docs/specs/non-zdr-pay-with-data-routing.md): completely dormant
+/// unless a `privacy = "no-zdr"` provider is present in the parsed config (the env var and flag
+/// are silently inert without one). When one is present, a single ordered check short-circuits at
+/// the FIRST unmet gate, revealing only that gate's requirement — a config-level error can never
+/// leak the env var or flag to someone who has not passed the config gates. Returns whether the
+/// pool is armed (all gates passed). Pure in its inputs so the chain is testable against a fixed
+/// clock and without touching process environment.
+fn validate_non_zdr_gates(
+    cfg: &Config,
+    flag_passed: bool,
+    env_present: bool,
+    today_days: i64,
+) -> Result<bool> {
+    let non_zdr: Vec<&ProviderConfig> = cfg
+        .providers
+        .iter()
+        .filter(|p| p.privacy == Some(Privacy::NoZdr))
+        .collect();
+    if non_zdr.is_empty() {
+        return Ok(false);
+    }
+
+    // Gate 1 (documented): the routing path must be compiled in at all.
+    #[cfg(not(feature = "allow-non-zdr"))]
+    {
+        let _ = (flag_passed, env_present, today_days);
+        anyhow::bail!(
+            "provider {:?} declares privacy = \"no-zdr\" — a pay-with-data endpoint whose provider \
+             may log or train on prompts — but this build compiled that routing path out. \
+             Rebuild with the `allow-non-zdr` Cargo feature to proceed.",
+            non_zdr[0].slug
+        );
+    }
+
+    #[cfg(feature = "allow-non-zdr")]
+    {
+        use std::collections::BTreeSet;
+
+        for p in &non_zdr {
+            // Gate 2: the per-model attestation — the exact real_slug of EVERY model under this
+            // provider, so a provider cannot be opted out once and silently grow a second model.
+            let key = Privacy::NoZdr
+                .non_zdr_attestation_key()
+                .expect("no-zdr defines its attestation key");
+            if p.non_zdr_attested_models.is_empty() {
+                anyhow::bail!(
+                    "provider {:?} uses privacy = \"no-zdr\": its endpoint may log or train on \
+                     every prompt sent to it, and blindcoder will not route there on the strength \
+                     of a config value alone. Consent is per model — add\n\n\
+                     \x20   {} = [\"…\"]\n\n\
+                     to this provider, listing the exact `real_slug` of every model it offers.",
+                    p.slug,
+                    key
+                );
+            }
+            let want: BTreeSet<&str> = p.models.iter().map(|m| m.real_slug.as_str()).collect();
+            let have: BTreeSet<&str> = p
+                .non_zdr_attested_models
+                .iter()
+                .map(String::as_str)
+                .collect();
+            if have != want {
+                let missing: Vec<&&str> = want.difference(&have).collect();
+                let extra: Vec<&&str> = have.difference(&want).collect();
+                anyhow::bail!(
+                    "provider {:?}: the non-ZDR model attestation must match this provider's \
+                     models exactly, by `real_slug`. Unattested models: {:?}; attested but not \
+                     among the provider's models: {:?}.",
+                    p.slug,
+                    missing,
+                    extra
+                );
+            }
+
+            // Gate 2½: a bounded lifetime. Absent → required; past → hard stop; too far ahead →
+            // only now reveal the arming cap.
+            let Some(expires) = p.expires.as_deref() else {
+                anyhow::bail!(
+                    "provider {:?}: a non-ZDR attestation must carry a bounded lifetime — add \
+                     `expires = \"YYYY-MM-DD\"` to this provider.",
+                    p.slug
+                );
+            };
+            let Some(expiry_days) = config::date_to_epoch_days(expires) else {
+                anyhow::bail!(
+                    "provider {:?}: `expires` must be a \"YYYY-MM-DD\" date (got {:?}).",
+                    p.slug,
+                    expires
+                );
+            };
+            if expiry_days < today_days {
+                anyhow::bail!(
+                    "provider {:?}: its non-ZDR attestation expired on {} — refusing to start. \
+                     Renew the attestation deliberately if you still mean it.",
+                    p.slug,
+                    expires
+                );
+            }
+            if expiry_days > today_days + NON_ZDR_MAX_ARM_DAYS {
+                anyhow::bail!(
+                    "provider {:?}: `expires` = {} is more than {} days out. A non-ZDR attestation \
+                     may be dated at most {} days ahead — a hard cap on how long the capability \
+                     stays armed, not a reminder. Refusing to start.",
+                    p.slug,
+                    expires,
+                    NON_ZDR_MAX_ARM_DAYS,
+                    NON_ZDR_MAX_ARM_DAYS
+                );
+            }
+        }
+
+        // Gate 3: the per-session environment second factor — lives in no file.
+        if !env_present {
+            anyhow::bail!(
+                "the non-ZDR pool is configured and attested, but the per-session second factor is \
+                 missing: set {NON_ZDR_ENV_VAR}=1 in the launching environment. A config file \
+                 alone can never arm non-ZDR routing."
+            );
+        }
+        // Gate 4: the per-invocation flag — the final deliberate act, hidden from --help.
+        if !flag_passed {
+            anyhow::bail!(
+                "non-ZDR routing is one deliberate act away: pass --route-non-zdr-this-run on \
+                 this invocation to route to a non-ZDR endpoint for this run."
+            );
+        }
+        Ok(true)
+    }
 }
 
 /// Build the candidate pool: fold each model's effective ratings (by `canonical_key`, decayed) into
@@ -293,6 +447,29 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     // violation (fail-closed) — before any network, store write, or pick.
     validate_pool_privacy(cfg)?;
 
+    // The non-ZDR consent chain (dormant unless a `no-zdr` provider is configured). The flag and
+    // env-var reads exist only on the opt-in build; a default build passes inert values and the
+    // chain can only refuse (or stay dormant).
+    #[cfg(feature = "allow-non-zdr")]
+    let (non_zdr_flag, non_zdr_env) = (
+        args.route_non_zdr_this_run,
+        std::env::var(NON_ZDR_ENV_VAR).is_ok_and(|v| !v.trim().is_empty()),
+    );
+    #[cfg(not(feature = "allow-non-zdr"))]
+    let (non_zdr_flag, non_zdr_env) = (false, false);
+    let non_zdr_armed =
+        validate_non_zdr_gates(cfg, non_zdr_flag, non_zdr_env, config::today_epoch_days())?;
+    if non_zdr_armed {
+        // Session-level disclosure ONLY: naming the alias (or the per-request route) would deblind
+        // the harness — and because the operator cannot tell which requests hit the non-ZDR arm,
+        // the whole session must be treated as non-private anyway.
+        eprintln!(
+            "\n!! NON-ZDR SESSION: this pool contains a model on a non-ZDR endpoint — its \
+             provider may log or train on prompts. Which alias it is stays blind, so treat \
+             EVERYTHING sent in this session as non-private.\n"
+        );
+    }
+
     let store = open_store()?;
     let mut rng = rand::thread_rng();
 
@@ -384,6 +561,19 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
         privacy,
         capture_path,
     )?;
+    // When the pick landed on the no-zdr arm, arm the fail-closed per-request audit trail (the
+    // gates above already passed or we would not be here). Request granularity + real_slug —
+    // deliberately not the alias mapping, so the file can't deblind the session's ratings.
+    #[cfg(feature = "allow-non-zdr")]
+    let backend = if privacy == Privacy::NoZdr {
+        let dir = config::default_state_dir()
+            .context("cannot determine state dir (set XDG_STATE_HOME or HOME)")?;
+        std::fs::create_dir_all(&dir)
+            .with_context(|| format!("creating {} for the non-ZDR audit trail", dir.display()))?;
+        backend.with_non_zdr_audit(dir.join("non-zdr-audit.log"), sid)
+    } else {
+        backend
+    };
     // The forwarding target: the wire path takes a `VettedEndpoint`, and the only way to obtain the
     // `VettedRequest` it sends is `prepare`, which applies the privacy injection above.
     let endpoint = VettedEndpoint::new(route.base_url);
@@ -878,6 +1068,12 @@ pub struct RunArgs {
     /// In launcher mode, skip the end-of-session rating prompt.
     #[arg(long)]
     pub no_rate: bool,
+    // The final gate of the non-ZDR consent chain: per-invocation, hidden from --help, revealed
+    // only by the startup error once every earlier gate has passed. (A regular comment, not a doc
+    // comment — a doc comment would become clap help text.)
+    #[cfg(feature = "allow-non-zdr")]
+    #[arg(long, hide = true)]
+    pub route_non_zdr_this_run: bool,
 }
 
 /// `blindcoder rate`: append a performance/difficulty rating for a past session (difficulty is
@@ -1206,6 +1402,213 @@ mod tests {
             &[("groq_manual_steps_done", true), ("bogus", true)],
         ));
         assert!(validate_pool_privacy(&c).is_err());
+    }
+
+    /// One `no-zdr` provider with one placeholder model, with the attestation list and expiry as
+    /// given. Placeholder slug only — no vendor or model name anywhere.
+    fn no_zdr_cfg(attested: &[&str], expires: Option<&str>) -> Config {
+        let p = ProviderConfig {
+            slug: "pwd".into(),
+            base_url: "https://api.example.test/v1".into(),
+            privacy: Some(Privacy::NoZdr),
+            non_zdr_attested_models: attested.iter().map(ToString::to_string).collect(),
+            expires: expires.map(String::from),
+            models: vec![ModelConfig {
+                canonical_key: "non-zdr-model".into(),
+                real_slug: "example/non-zdr-model".into(),
+                input_per_mtok: Some(0.1),
+                output_per_mtok: Some(0.4),
+            }],
+            ..Default::default()
+        };
+        cfg_of(p)
+    }
+
+    /// The chain is completely dormant without a `no-zdr` provider: even with the env var and flag
+    /// supplied, nothing is checked and nothing is armed (they are silently inert).
+    #[test]
+    fn non_zdr_chain_is_dormant_without_a_no_zdr_provider() {
+        let c = mixed_pool_config();
+        assert!(!validate_non_zdr_gates(&c, true, true, 0).unwrap());
+    }
+
+    /// A `no-zdr` provider passes the generic pool gate (no host binding, no bool attestation);
+    /// the consent chain, not `validate_pool_privacy`, is what stands in the way.
+    #[test]
+    fn pool_privacy_gate_accepts_a_no_zdr_declaration() {
+        assert!(validate_pool_privacy(&no_zdr_cfg(&[], None)).is_ok());
+    }
+
+    /// The no-zdr consent fields are scoped to the no-zdr protocol — on any other provider they
+    /// are refused, not ignored.
+    #[test]
+    fn pool_privacy_gate_rejects_non_zdr_fields_on_other_protocols() {
+        let mut p = provider_with(
+            "groq",
+            "https://api.groq.com/openai/v1",
+            Some(Privacy::Groq),
+            &[("groq_manual_steps_done", true)],
+        );
+        p.expires = Some("2026-09-01".into());
+        let err = validate_pool_privacy(&cfg_of(p)).unwrap_err().to_string();
+        assert!(err.contains("no-zdr"), "{err}");
+    }
+
+    /// Reveal order 0: on a default (feature-less) build, a `no-zdr` provider is refused with the
+    /// documented feature requirement — and none of the undocumented later gates leak.
+    #[cfg(not(feature = "allow-non-zdr"))]
+    #[test]
+    fn default_build_reveals_only_the_feature_requirement() {
+        // Even a fully attested config must stop at the feature gate.
+        let c = no_zdr_cfg(&["example/non-zdr-model"], Some("2026-09-01"));
+        let err = validate_non_zdr_gates(&c, true, true, 0)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("allow-non-zdr"), "{err}");
+        for later in [
+            "no_zdr_models_i_accept_training_on",
+            "expires",
+            "BLINDCODER",
+            "--route",
+        ] {
+            assert!(!err.contains(later), "must not leak {later:?}: {err}");
+        }
+    }
+
+    /// The ordered, short-circuiting reveal chain: each run surfaces exactly one gate's
+    /// requirement, never a later token before an earlier gate passes.
+    #[cfg(feature = "allow-non-zdr")]
+    #[test]
+    fn non_zdr_chain_reveals_one_gate_per_run_in_order() {
+        let today = config::date_to_epoch_days("2026-08-23").unwrap();
+        let later_than_attestation = [
+            "expires",
+            "30",
+            "BLINDCODER_NON_ZDR_SESSION_OK",
+            "route-non-zdr-this-run",
+        ];
+
+        // 1: attestation absent → the key is revealed, nothing later.
+        let err = validate_non_zdr_gates(&no_zdr_cfg(&[], None), true, true, today)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("no_zdr_models_i_accept_training_on"), "{err}");
+        assert!(
+            err.contains("real_slug"),
+            "the shape (exact slugs) is stated: {err}"
+        );
+        for later in later_than_attestation {
+            assert!(!err.contains(later), "must not leak {later:?}: {err}");
+        }
+
+        // 1b: attestation present but not the exact slug set → the specific mismatch, no new token.
+        let err = validate_non_zdr_gates(&no_zdr_cfg(&["example/other"], None), true, true, today)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("example/non-zdr-model"),
+            "names the unattested model: {err}"
+        );
+        assert!(
+            err.contains("example/other"),
+            "names the stray attestation: {err}"
+        );
+        for later in ["expires", "BLINDCODER", "route-non-zdr"] {
+            assert!(!err.contains(later), "must not leak {later:?}: {err}");
+        }
+
+        // 2: attested, no expiry → `expires` is required; the 30-day bound stays invisible.
+        let ok_models = &["example/non-zdr-model"];
+        let err = validate_non_zdr_gates(&no_zdr_cfg(ok_models, None), true, true, today)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expires"), "{err}");
+        for later in ["30", "BLINDCODER", "route-non-zdr"] {
+            assert!(!err.contains(later), "must not leak {later:?}: {err}");
+        }
+
+        // 2 (malformed): a non-date reveals the format, nothing later.
+        let err = validate_non_zdr_gates(&no_zdr_cfg(ok_models, Some("soon")), true, true, today)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("YYYY-MM-DD"), "{err}");
+        assert!(!err.contains("30"), "{err}");
+
+        // 2b: expired → hard stop.
+        let err = validate_non_zdr_gates(
+            &no_zdr_cfg(ok_models, Some("2026-08-01")),
+            true,
+            true,
+            today,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("expired"), "{err}");
+        assert!(!err.contains("BLINDCODER"), "{err}");
+
+        // 2c: dated too far ahead → ONLY NOW the 30-day cap surfaces.
+        let err = validate_non_zdr_gates(
+            &no_zdr_cfg(ok_models, Some("2026-12-01")),
+            true,
+            true,
+            today,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(err.contains("30 days"), "{err}");
+        assert!(!err.contains("BLINDCODER"), "{err}");
+        // …while a compliant near-future date sails past without ever mentioning the bound.
+        // Exactly 30 days out is compliant (a hard maximum, boundary included).
+        let exactly_30 = validate_non_zdr_gates(
+            &no_zdr_cfg(ok_models, Some("2026-09-22")),
+            true,
+            true,
+            today,
+        );
+        assert!(exactly_30.is_ok(), "{exactly_30:?}");
+
+        // 3: config gates all pass, env unset → the env var is revealed; the flag is not.
+        let ok_cfg = no_zdr_cfg(ok_models, Some("2026-08-30"));
+        let err = validate_non_zdr_gates(&ok_cfg, true, false, today)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("BLINDCODER_NON_ZDR_SESSION_OK"), "{err}");
+        assert!(!err.contains("route-non-zdr"), "{err}");
+
+        // 4: env set, flag missing → the flag is revealed.
+        let err = validate_non_zdr_gates(&ok_cfg, false, true, today)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("--route-non-zdr-this-run"), "{err}");
+
+        // ✓: all four satisfied → armed.
+        assert!(validate_non_zdr_gates(&ok_cfg, true, true, today).unwrap());
+    }
+
+    /// Requirement 9: the cost path is fully live for a `no-zdr` model — it is priced and
+    /// normalized exactly like any other provider (non-ZDR does not imply free).
+    #[cfg(feature = "allow-non-zdr")]
+    #[test]
+    fn non_zdr_model_is_priced_like_any_other() {
+        let store = Store::open_in_memory().unwrap();
+        let mut cfg = mixed_pool_config();
+        cfg.providers
+            .extend(no_zdr_cfg(&["example/non-zdr-model"], Some("2026-08-30")).providers);
+        let mut rng = StdRng::seed_from_u64(5);
+        seed_pool(&store, &cfg, &mut rng).unwrap();
+        let (cands, entries) = build_pool(&store, &cfg).unwrap();
+        let nz = entries
+            .iter()
+            .position(|e| e.provider_slug == "pwd")
+            .unwrap();
+        // 0.1 * 0.7 + 0.4 * 0.3 = 0.19 blended — a real, nonzero shelf price in the pool.
+        assert!((entries[nz].raw_price - 0.19).abs() < 1e-12);
+        assert!(cands[nz].normalized_price > 0.0);
+        assert_eq!(
+            entries[nz].input_per_mtok,
+            Some(0.1),
+            "cap estimation stays live"
+        );
     }
 
     #[test]

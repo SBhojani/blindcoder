@@ -11,6 +11,13 @@ rust-version = "1.74"
 name = "blindcoder"
 path = "src/main.rs"
 
+[features]
+# Compiles in the opt-in non-ZDR / pay-with-data routing path (dormant unless configured, and
+# gated behind a chain of further per-provider and per-session attestations that surface at
+# startup). Default builds omit the path entirely and refuse a `privacy = "no-zdr"` provider.
+# See docs/specs/non-zdr-pay-with-data-routing.md.
+allow-non-zdr = ["backend/allow-non-zdr"]
+
 [workspace]
 members = ["crates/selector", "crates/config", "crates/alias", "crates/store", "crates/backend"]
 

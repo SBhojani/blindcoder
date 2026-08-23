@@ -90,6 +90,11 @@ curated_policy_max_age_days = 90
 #                     compliant endpoint matches. (Don't put zdr/data_collection in extra_body — the
 #                     protocol owns them.)
 #   * "groq"        — ZDR is an account-level console setting; nothing goes on the wire.
+#   * "no-zdr"      — OPT-IN, OFF BY DEFAULT: a non-ZDR / pay-with-data endpoint whose provider may
+#                     log or train on your prompts. A default build refuses it outright; it needs a
+#                     binary built with the `allow-non-zdr` Cargo feature, and the additional
+#                     required attestations then surface one at a time at startup. There is
+#                     deliberately no copy-pasteable working block for this mode.
 # Each value is verified against that provider's real endpoint host, so a declaration only counts for
 # that provider's actual API (a mismatch is refused). Some protocols also require a one-time
 # attestation that you completed their manual setup — if so, the run tells you exactly what to add.

@@ -19,6 +19,11 @@ async-stream = "0.3"
 warc = "0.4"
 chrono = "0.4"
 
+[features]
+# Compiles in the per-request non-ZDR audit trail of the opt-in pay-with-data routing path.
+# Off by default; see docs/specs/non-zdr-pay-with-data-routing.md.
+allow-non-zdr = []
+
 [dev-dependencies]
 tokio = { version = "1", features = ["macros", "rt", "rt-multi-thread"] }
 tempfile = "3"
