@@ -1066,6 +1066,15 @@ mod tests {
         assert_eq!(latest[0].input_per_mtok, Some(0.55));
     }
 
+    /// The `session_end` columns asserted on below, as one readable name.
+    type EndRow = (
+        Option<f64>,
+        Option<String>,
+        Option<String>,
+        Option<i64>,
+        Option<String>,
+    );
+
     #[test]
     fn session_lifecycle_records_start_and_terminated_end() {
         let s = Store::open_in_memory().unwrap();
@@ -1096,7 +1105,7 @@ mod tests {
             },
         )
         .unwrap();
-        let (cost, src, ek, es, term): (Option<f64>, Option<String>, Option<String>, Option<i64>, Option<String>) = s
+        let (cost, src, ek, es, term): EndRow = s
             .conn
             .query_row(
                 "SELECT realized_cost, cost_source, error_kind, error_status, terminated_by FROM session_end WHERE session_id = ?1",

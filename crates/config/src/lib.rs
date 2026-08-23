@@ -250,9 +250,11 @@ fn default_wire() -> String {
     "openai".to_string()
 }
 
-/// Parse a strict `"YYYY-MM-DD"` calendar date into days since the Unix epoch (proleptic
+/// Parse a strict `"YYYY-MM-DD"` **calendar** date into days since the Unix epoch (proleptic
 /// Gregorian, Hinnant's civil-days algorithm — no time-of-day, no timezone, no date dependency).
-/// `None` for anything else. Used for the `expires` bound on `no-zdr` providers; pure so the
+/// `None` for anything that is not a real date: besides the shape checks, the day is validated
+/// against its month (leap years included), so `2026-02-31` is rejected rather than silently
+/// rolling over into March. Used for the `expires` bound on `no-zdr` providers; pure so the
 /// expiry checks can be tested against a fixed "today".
 pub fn date_to_epoch_days(s: &str) -> Option<i64> {
     let mut parts = s.split('-');
@@ -261,7 +263,7 @@ pub fn date_to_epoch_days(s: &str) -> Option<i64> {
         return None;
     }
     let (y, m, d): (i64, i64, i64) = (y.parse().ok()?, m.parse().ok()?, d.parse().ok()?);
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+    if !(1..=12).contains(&m) || !(1..=days_in_month(y, m)).contains(&d) {
         return None;
     }
     let yy = if m <= 2 { y - 1 } else { y };
@@ -270,6 +272,18 @@ pub fn date_to_epoch_days(s: &str) -> Option<i64> {
     let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     Some(era * 146_097 + doe - 719_468)
+}
+
+/// Length of one proleptic-Gregorian month in `date_to_epoch_days`: February grows to 29 only on
+/// a leap year (divisible by 4, except centuries not divisible by 400). Caller guarantees
+/// `1 <= m <= 12`.
+fn days_in_month(y: i64, m: i64) -> i64 {
+    const LEN: [i64; 12] = [31, 28, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31];
+    if m == 2 && y % 4 == 0 && (y % 100 != 0 || y % 400 == 0) {
+        29
+    } else {
+        LEN[(m - 1) as usize]
+    }
 }
 
 /// Today (UTC) in days since the Unix epoch — the one clock read callers pass into the pure
@@ -557,9 +571,26 @@ output_per_mtok = 0.4
             "2026-01-32",
             "soon",
             "",
+            // impossible calendar dates must be rejected, not rolled over into the next month
+            "2026-02-31",
+            "2026-02-30",
+            "2024-02-30",
+            "2023-02-29", // common year
+            "1900-02-29", // century not divisible by 400 → not a leap year
+            "2100-02-29",
+            "2026-04-31",
+            "2026-06-31",
+            "2026-09-31",
+            "2026-11-31",
         ] {
             assert_eq!(date_to_epoch_days(bad), None, "{bad:?} must not parse");
         }
+        // leap years keep their extra day, exactly once per four years (with the two exceptions)
+        assert_eq!(date_to_epoch_days("2000-02-29"), Some(11_016)); // day before the anchor above
+        assert_eq!(date_to_epoch_days("2024-02-29"), Some(19_782));
+        // centuries divisible by 400 are leap; other centuries are not — on both sides of epoch
+        assert_eq!(date_to_epoch_days("1900-02-28"), Some(-25_509));
+        assert_eq!(date_to_epoch_days("2100-02-28"), Some(47_540));
     }
 
     #[test]

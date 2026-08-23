@@ -55,21 +55,35 @@ fn classify_http(code: u16) -> ErrorKind {
     }
 }
 
-/// The fail-closed audit trail of the opt-in non-ZDR routing path: every request forwarded to a
-/// `no-zdr` model appends `timestamp · session_id · real_slug` to a dedicated append-only file
-/// (created `0600`). Deliberately *not* the per-response alias mapping — session-id granularity
-/// keeps the file from becoming an oracle for deblinding the current session's ratings.
+/// The fail-closed accountability trail of the opt-in non-ZDR routing path: every request
+/// forwarded to a `no-zdr` model appends one `<UTC hour> · <real_slug>` line to a dedicated
+/// append-only log (file created `0600`, inside a `0700` directory — even the log's existence
+/// admits a pay-with-data endpoint is configured, so nothing around it may widen access).
+///
+/// What this file guarantees is **aggregate accountability only**: which real models have been
+/// sent prompts, and in which clock hours. It deliberately carries **no session identifier** —
+/// the store keys ratings on `session_id`, so an id-bearing audit file would join straight onto
+/// the ratings table and deblind every non-ZDR session and its rating, and could be read
+/// mid-session to unmask a session before it is rated. A per-session random token fails the same
+/// way: tail the file once and the freshly-appearing token's slug names the live session. For
+/// the same reason the timestamp is bucketed to whole hours — minute-level times would let an
+/// operator pin a just-run session's model by recalling roughly when it ran, while requests from
+/// concurrent sessions within one hour are indistinguishable by construction. Unmasking a
+/// specific session happens only through the reveal gate; this log is not a second path there.
+///
+/// Each record is formatted into one buffer and emitted with a single `write_all`, so under
+/// `O_APPEND` it lands as one indivisible line even when several processes append concurrently
+/// to the shared log. Appends are fail-closed: any error is returned and the caller must refuse
+/// the request — no routing without a durable record.
 #[cfg(feature = "allow-non-zdr")]
 #[derive(Clone, Debug)]
 pub struct NonZdrAudit {
     path: PathBuf,
-    session_id: i64,
 }
 
 #[cfg(feature = "allow-non-zdr")]
 impl NonZdrAudit {
-    /// Durably append one routed-request record. Any failure is returned and the caller must
-    /// refuse the request — no routing without a durable record (fail-closed).
+    /// Durably append one routed-request record: `<YYYY-MM-DDTHH>\t<real_slug>\n`.
     fn append(&self, real_slug: &str) -> std::io::Result<()> {
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
@@ -78,13 +92,15 @@ impl NonZdrAudit {
             .append(true)
             .mode(0o600)
             .open(&self.path)?;
-        writeln!(
-            f,
-            "{}\t{}\t{}",
-            chrono::Utc::now().to_rfc3339(),
-            self.session_id,
+        // Format into one buffer, then a single `write_all`: `writeln!` on a raw file issues
+        // several `write(2)` calls, and two concurrent appenders can interleave those fragments
+        // into corrupt half-lines despite `O_APPEND`. One write per record cannot fragment.
+        let line = format!(
+            "{}\t{}\n",
+            chrono::Utc::now().format("%Y-%m-%dT%H"),
             real_slug
-        )?;
+        );
+        f.write_all(line.as_bytes())?;
         f.sync_all()
     }
 }
@@ -134,12 +150,15 @@ impl ProxyBackend {
         })
     }
 
-    /// Arm the fail-closed non-ZDR audit trail for this session: every forwarded request appends
-    /// to `path` (or is refused if the append fails). Only meaningful — and only compiled — on the
-    /// opt-in routing path; the router calls this solely when the pick landed on a `no-zdr` model.
+    /// Arm the fail-closed non-ZDR accountability trail: every forwarded request appends one
+    /// `<UTC hour> · <real_slug>` line to `path` (or is refused if the append fails). The path
+    /// is the whole configuration — no session identity crosses this boundary, so the log can
+    /// never join onto the store's ratings; see [`NonZdrAudit`]. Only meaningful — and only
+    /// compiled — on the opt-in routing path; the router calls this solely when the pick landed
+    /// on a `no-zdr` model.
     #[cfg(feature = "allow-non-zdr")]
-    pub fn with_non_zdr_audit(mut self, path: PathBuf, session_id: i64) -> Self {
-        self.non_zdr_audit = Some(NonZdrAudit { path, session_id });
+    pub fn with_non_zdr_audit(mut self, path: PathBuf) -> Self {
+        self.non_zdr_audit = Some(NonZdrAudit { path });
         self
     }
 }
@@ -920,9 +939,10 @@ mod tests {
         );
     }
 
-    /// The non-ZDR audit trail (feature-gated): every forwarded request appends one
-    /// `timestamp \t session_id \t real_slug` line to the 0600 audit file — request-level
-    /// granularity, and the real slug (never the alias) so the file can't deblind ratings.
+    /// The non-ZDR accountability trail (feature-gated): every forwarded request appends one
+    /// `<UTC hour> \t real_slug` line to the 0600 audit file. Aggregate accountability only:
+    /// no session id (the store keys ratings on it — an id would join the file onto the ratings
+    /// table and deblind), no alias, and no sub-hour time precision.
     #[cfg(feature = "allow-non-zdr")]
     #[tokio::test]
     async fn non_zdr_audit_appends_one_line_per_forwarded_request() {
@@ -952,7 +972,7 @@ mod tests {
             None,
         )
         .unwrap()
-        .with_non_zdr_audit(audit_path.clone(), 42);
+        .with_non_zdr_audit(audit_path.clone());
         let pick = Pick {
             canonical_key: "non-zdr-model".into(),
             real_slug: "example/non-zdr-model".into(),
@@ -979,10 +999,22 @@ mod tests {
         assert_eq!(lines.len(), 2, "one line per forwarded request: {text:?}");
         for line in lines {
             let fields: Vec<&str> = line.split('\t').collect();
-            assert_eq!(fields.len(), 3, "timestamp/session/slug: {line:?}");
-            assert!(fields[0].starts_with("20"), "timestamp field: {line:?}");
-            assert_eq!(fields[1], "42");
-            assert_eq!(fields[2], "example/non-zdr-model");
+            assert_eq!(fields.len(), 2, "hour bucket + slug only: {line:?}");
+            // Whole-hour UTC bucket: exactly `YYYY-MM-DDTHH` — no minutes or seconds to pin a
+            // session by. (`NaiveDateTime::parse_from_str` needs a fully-determined datetime,
+            // so validate the date part and the two-digit hour separately.)
+            let (day, hour) = fields[0]
+                .split_once('T')
+                .unwrap_or_else(|| panic!("bucket must carry a T separator: {line:?}"));
+            assert!(
+                chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_ok(),
+                "bucket date must be YYYY-MM-DD: {line:?}"
+            );
+            assert!(
+                hour.len() == 2 && hour.parse::<u8>().is_ok_and(|h| h < 24),
+                "bucket time must be a two-digit hour 00-23: {line:?}"
+            );
+            assert_eq!(fields[1], "example/non-zdr-model");
             assert!(
                 !line.contains("al:al"),
                 "the alias must never enter the audit file"
@@ -1025,7 +1057,7 @@ mod tests {
             None,
         )
         .unwrap()
-        .with_non_zdr_audit(tmp.path().to_path_buf(), 7); // a directory: append must fail
+        .with_non_zdr_audit(tmp.path().to_path_buf()); // a directory: append must fail
         let pick = Pick {
             canonical_key: "non-zdr-model".into(),
             real_slug: "example/non-zdr-model".into(),
@@ -1048,6 +1080,65 @@ mod tests {
         );
     }
 
+    /// Concurrency safety of the audit log: each record is one buffer, one `write_all`, so
+    /// `O_APPEND` lands it as an indivisible line. Many threads appending to the SAME path (the
+    /// shared-log situation two blindcoder processes would hit) must therefore produce exactly
+    /// one intact, parseable line per append — never interleaved fragments.
+    #[cfg(feature = "allow-non-zdr")]
+    #[test]
+    fn non_zdr_audit_concurrent_appends_stay_whole_lines() {
+        const THREADS: usize = 8;
+        const APPENDS_PER_THREAD: usize = 64;
+        let tmp = tempfile::tempdir().unwrap();
+        let audit_path = tmp.path().join("non-zdr-audit.log");
+
+        let handles: Vec<_> = (0..THREADS)
+            .map(|t| {
+                let path = audit_path.clone();
+                std::thread::spawn(move || {
+                    let audit = NonZdrAudit { path };
+                    let slug = format!("example/concurrent-{t}");
+                    for _ in 0..APPENDS_PER_THREAD {
+                        audit.append(&slug).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for h in handles {
+            h.join().unwrap();
+        }
+
+        let text = std::fs::read_to_string(&audit_path).unwrap();
+        assert_eq!(
+            text.lines().count(),
+            THREADS * APPENDS_PER_THREAD,
+            "every append landed as exactly one line: {text:?}"
+        );
+        let mut per_slug = std::collections::HashMap::<String, usize>::new();
+        for line in text.lines() {
+            let fields: Vec<&str> = line.split('\t').collect();
+            assert_eq!(fields.len(), 2, "each record is one intact line: {line:?}");
+            assert!(
+                {
+                    let (day, hour) = fields[0]
+                        .split_once('T')
+                        .unwrap_or_else(|| panic!("fragmented bucket: {line:?}"));
+                    chrono::NaiveDate::parse_from_str(day, "%Y-%m-%d").is_ok()
+                        && hour.len() == 2
+                        && hour.parse::<u8>().is_ok_and(|h| h < 24)
+                },
+                "intact YYYY-MM-DDTHH hour bucket: {line:?}"
+            );
+            *per_slug.entry(fields[1].to_string()).or_insert(0) += 1;
+        }
+        for t in 0..THREADS {
+            assert_eq!(
+                per_slug.get(&format!("example/concurrent-{t}")),
+                Some(&APPENDS_PER_THREAD),
+                "thread {t}: every record arrived uncorrupted"
+            );
+        }
+    }
     /// At the `replay` capture level, a completed exchange writes all four legs (cli_request,
     /// provider_request, provider_response, cli_response) byte-exact to the WARC archive — with the
     /// raw upstream body kept unmasked and the CLI-facing body masked.

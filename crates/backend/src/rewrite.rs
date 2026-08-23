@@ -215,7 +215,7 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    fn map(v: Value) -> Map<String, Value> {
+    fn map(v: &Value) -> Map<String, Value> {
         v.as_object().cloned().unwrap_or_default()
     }
 
@@ -237,7 +237,7 @@ mod tests {
         let mut body = json!({ "model": "alias", "messages": [] });
         // A provider extra_body that (adversarially) also sets `model` must not win — else it could
         // route around the blind. `require_parameters` is a normal provider-routing flag.
-        let extra = map(json!({
+        let extra = map(&json!({
             "provider": { "require_parameters": true },
             "model": "attacker/override",
         }));

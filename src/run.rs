@@ -223,6 +223,17 @@ const NON_ZDR_ENV_VAR: &str = "BLINDCODER_NON_ZDR_SESSION_OK";
 #[cfg(feature = "allow-non-zdr")]
 const NON_ZDR_MAX_ARM_DAYS: i64 = 30;
 
+/// The session-level non-ZDR disclosure text. Session-level ONLY: naming the alias (or the
+/// per-request route) would deblind the harness — and because the operator cannot tell which
+/// requests hit the non-ZDR arm, the whole session must be treated as non-private anyway.
+/// Emitted once before launch, and re-asserted after a LAUNCHED CLI exits (see
+/// [`disclosure_reassertion`] — a full-screen agentic TUI buries whatever preceded it).
+#[cfg(feature = "allow-non-zdr")]
+const NON_ZDR_DISCLOSURE: &str = "\
+!! NON-ZDR SESSION: this pool contains a model on a non-ZDR endpoint — its provider may log or \
+train on prompts. Which alias it is stays blind, so treat EVERYTHING sent in this session as \
+non-private.";
+
 /// The non-ZDR consent chain (docs/specs/non-zdr-pay-with-data-routing.md): completely dormant
 /// unless a `privacy = "no-zdr"` provider is present in the parsed config (the env var and flag
 /// are silently inert without one). When one is present, a single ordered check short-circuits at
@@ -439,6 +450,41 @@ fn choose<R: Rng + ?Sized>(cands: &[Candidate], t: &Tuneables, rng: &mut R) -> u
     active[pick(&sub, t, rng)]
 }
 
+/// Whether the post-session wrap-up must RE-ASSERT [`NON_ZDR_DISCLOSURE`]: armed pool AND a
+/// launched command. In launcher mode the pre-launch copy scrolls away the instant the agentic
+/// CLI takes over the terminal with its own full-screen UI, so the wrap-up repeats it where the
+/// operator reads the session summary and answers the still-blind rating prompt. A standing
+/// proxy never covers the terminal, so its original banner stays visible and gets no repeat.
+/// Pure so the launcher-only rule is unit-testable.
+#[cfg(feature = "allow-non-zdr")]
+fn disclosure_reassertion(
+    non_zdr_armed: bool,
+    launched_command: &[String],
+) -> Option<&'static str> {
+    (non_zdr_armed && !launched_command.is_empty()).then_some(NON_ZDR_DISCLOSURE)
+}
+
+/// Create `dir` (parents included) with the leaf forced to mode `0700`, tightening an existing,
+/// looser leaf too. Used for the non-ZDR accountability log: even the file's existence discloses
+/// that a pay-with-data endpoint is configured — a bit every local user could otherwise read off
+/// a world-traversable directory listing. Parent directories keep default permissions; only the
+/// leaf is private. Idempotent.
+#[cfg(feature = "allow-non-zdr")]
+fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    if let Some(parent) = dir.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    if let Err(e) = std::fs::create_dir(dir) {
+        if e.kind() != std::io::ErrorKind::AlreadyExists {
+            return Err(e);
+        }
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+}
+
 /// `blindcoder run [cli args…]`: pick a blinded model and stand up the forwarding proxy. With a
 /// command, launch it against the proxy (session ends when it exits, then rate inline); without
 /// one, run a standing proxy you point a CLI at yourself (end with Ctrl-C).
@@ -460,14 +506,16 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     let non_zdr_armed =
         validate_non_zdr_gates(cfg, non_zdr_flag, non_zdr_env, config::today_epoch_days())?;
     if non_zdr_armed {
-        // Session-level disclosure ONLY: naming the alias (or the per-request route) would deblind
-        // the harness — and because the operator cannot tell which requests hit the non-ZDR arm,
-        // the whole session must be treated as non-private anyway.
-        eprintln!(
-            "\n!! NON-ZDR SESSION: this pool contains a model on a non-ZDR endpoint — its \
-             provider may log or train on prompts. Which alias it is stays blind, so treat \
-             EVERYTHING sent in this session as non-private.\n"
-        );
+        // Session-level disclosure ONLY (see [`NON_ZDR_DISCLOSURE`]): naming the alias (or the
+        // per-request route) would deblind the harness. This copy fires before launch; a launched
+        // CLI buries it the moment it paints its full-screen UI, so run() re-asserts it once the
+        // child exits and releases the terminal.
+        // A default build can never get here (the chain above refuses), so the emission — and
+        // with it the disclosure constant — exists only on the opt-in build.
+        #[cfg(feature = "allow-non-zdr")]
+        eprintln!("\n{NON_ZDR_DISCLOSURE}\n");
+        #[cfg(not(feature = "allow-non-zdr"))]
+        unreachable!("a default build cannot arm non-ZDR routing");
     }
 
     let store = open_store()?;
@@ -561,16 +609,20 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
         privacy,
         capture_path,
     )?;
-    // When the pick landed on the no-zdr arm, arm the fail-closed per-request audit trail (the
-    // gates above already passed or we would not be here). Request granularity + real_slug —
-    // deliberately not the alias mapping, so the file can't deblind the session's ratings.
+    // When the pick landed on the no-zdr arm, arm the fail-closed per-request accountability
+    // trail (the gates above already passed or we would not be here). Aggregate accountability
+    // only — UTC-hour bucket + real_slug, deliberately NO session id: the store keys ratings on
+    // session_id, so an id-bearing audit file would join onto the ratings table and deblind the
+    // session (and could be read mid-session to unmask it before rating). Unmasking stays the
+    // reveal gate's job alone. The log lives in a 0700 directory: its mere existence admits a
+    // pay-with-data endpoint is configured.
     #[cfg(feature = "allow-non-zdr")]
     let backend = if privacy == Privacy::NoZdr {
         let dir = config::default_state_dir()
             .context("cannot determine state dir (set XDG_STATE_HOME or HOME)")?;
-        std::fs::create_dir_all(&dir)
+        ensure_private_dir(&dir)
             .with_context(|| format!("creating {} for the non-ZDR audit trail", dir.display()))?;
-        backend.with_non_zdr_audit(dir.join("non-zdr-audit.log"), sid)
+        backend.with_non_zdr_audit(dir.join("non-zdr-audit.log"))
     } else {
         backend
     };
@@ -597,6 +649,14 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
         out_price,
         command: &args.command,
     }))?;
+
+    // Launcher mode buried the pre-launch disclosure (the child took over the terminal);
+    // re-assert it now that the child has exited and released the terminal — the operator sees
+    // it again directly above the summary and the rating prompt they answer while still blind.
+    #[cfg(feature = "allow-non-zdr")]
+    if let Some(disclosure) = disclosure_reassertion(non_zdr_armed, &args.command) {
+        eprintln!("{disclosure}");
+    }
 
     // Record the terminal event: how it ended, and the realized cost — the provider-reported figure
     // when the transport captured one (authoritative), otherwise our tokens × shelf-price estimate.
@@ -1791,5 +1851,52 @@ mod tests {
             (cands0[free_i].track.mean() - 0.5).abs() < 1e-12,
             "sensitivity 0 ignores failures"
         );
+    }
+
+    #[cfg(feature = "allow-non-zdr")]
+    #[test]
+    fn disclosure_is_re_asserted_only_for_a_launched_armed_session() {
+        // Armed + launched: the pre-launch copy was buried by the child's full-screen UI, so the
+        // wrap-up must repeat it where the operator reads the summary and rates still blind.
+        let launched = vec!["opencode".to_string()];
+        let text =
+            disclosure_reassertion(true, &launched).expect("armed launcher session must re-assert");
+        assert!(text.contains("NON-ZDR SESSION"), "{text:?}");
+        assert!(
+            text.contains("treat EVERYTHING"),
+            "the wording must keep the treat-everything instruction: {text:?}"
+        );
+        // Standing-proxy mode kept the original banner visible throughout: no repeat.
+        assert_eq!(disclosure_reassertion(true, &[]), None);
+        // Nothing armed → never any disclosure.
+        assert_eq!(disclosure_reassertion(false, &launched), None);
+    }
+
+    #[cfg(feature = "allow-non-zdr")]
+    #[test]
+    fn audit_dir_gets_0700_even_when_it_pre_exists_looser() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("state").join("blindcoder");
+
+        ensure_private_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "fresh leaf must be 0700");
+
+        // A directory created earlier by an older build at 0755 must be tightened: a loose
+        // directory listing leaks the existence of the non-ZDR log.
+        let loose = tmp.path().join("legacy");
+        std::fs::create_dir(&loose).unwrap();
+        std::fs::set_permissions(&loose, std::fs::Permissions::from_mode(0o755)).unwrap();
+        ensure_private_dir(&loose).unwrap();
+        let mode = std::fs::metadata(&loose).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o700,
+            "pre-existing loose leaf must be tightened"
+        );
+
+        // Idempotent.
+        ensure_private_dir(&loose).unwrap();
     }
 }

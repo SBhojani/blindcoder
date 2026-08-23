@@ -377,17 +377,12 @@ mod tests {
         cap: f64,
         unit_price_per_token: f64,
     ) -> Result<SessionOutcome> {
-        loop {
-            match sess.next_event().await? {
-                SessionEvent::Usage(u) => {
-                    let spent = u.cost_so_far.unwrap_or_else(|| {
-                        (u.prompt_tokens + u.completion_tokens) as f64 * unit_price_per_token
-                    });
-                    if cap > 0.0 && spent >= cap {
-                        sess.abort(AbortReason::CostCap).await;
-                    }
-                }
-                SessionEvent::Ended => break,
+        while let SessionEvent::Usage(u) = sess.next_event().await? {
+            let spent = u.cost_so_far.unwrap_or_else(|| {
+                (u.prompt_tokens + u.completion_tokens) as f64 * unit_price_per_token
+            });
+            if cap > 0.0 && spent >= cap {
+                sess.abort(AbortReason::CostCap).await;
             }
         }
         sess.finish().await
