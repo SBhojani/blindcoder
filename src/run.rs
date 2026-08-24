@@ -831,6 +831,14 @@ fn pi_models_json(existing: Option<&str>, base_url: &str, alias: &str) -> String
         .and_then(|s| serde_json::from_str(s).ok())
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
+    upsert_blindcoder_provider(&mut root, base_url, alias);
+    serde_json::to_string_pretty(&root).expect("a Value serializes")
+}
+
+/// Insert or overwrite the `blindcoder` provider in a parsed models document root (the shared
+/// provider shape of the pi-family injections): proxy URL, OpenAI-compatible wire API, a dummy
+/// key (the real one rides on the proxied requests), and one model keyed by the session **alias**.
+fn upsert_blindcoder_provider(root: &mut serde_json::Value, base_url: &str, alias: &str) {
     let providers = root
         .as_object_mut()
         .expect("root is an object by construction")
@@ -851,7 +859,6 @@ fn pi_models_json(existing: Option<&str>, base_url: &str, alias: &str) -> String
                 "models": [{ "id": alias, "contextWindow": 128000, "maxTokens": 4096 }]
             }),
         );
-    serde_json::to_string_pretty(&root).expect("a Value serializes")
 }
 
 /// Populate the per-session pi agent dir injected via `PI_CODING_AGENT_DIR` — the pi counterpart
@@ -871,34 +878,128 @@ fn populate_pi_agent_dir(
     base_url: &str,
     alias: &str,
 ) -> std::io::Result<()> {
+    let skipped = mirror_agent_dir(dir, real, &["models.json"])?;
+    let existing = skipped
+        .iter()
+        .find(|(name, _)| name == "models.json")
+        .map(|(_, contents)| contents.as_str());
+    std::fs::write(
+        dir.join("models.json"),
+        pi_models_json(existing, base_url, alias),
+    )
+}
+
+/// omp's counterpart of [`populate_pi_agent_dir`]. It shares pi's `PI_CODING_AGENT_DIR` skeleton,
+/// but omp *migrates* `models.json` into its own cached `models.yml` and thereafter prefers the
+/// yml — an installed omp would silently ignore our injected json. So when a `models.yml` exists
+/// the merge targets it (parsed and rewritten as YAML; only yml-side providers survive, matching
+/// what omp itself would load); otherwise the pi-style json merge applies. A yml that fails to
+/// parse degrades to an empty root — the user's real file is never touched, only this session's
+/// view. Both models files are always excluded from symlinking so exactly one merged copy wins.
+fn populate_omp_agent_dir(
+    dir: &std::path::Path,
+    real: &std::path::Path,
+    base_url: &str,
+    alias: &str,
+) -> std::io::Result<()> {
+    let skipped = mirror_agent_dir(dir, real, &["models.json", "models.yml"])?;
+    let read = |want: &str| {
+        skipped
+            .iter()
+            .find(|(name, _)| name == want)
+            .map(|(_, contents)| contents.as_str())
+    };
+    let (file_name, contents) = match read("models.yml") {
+        Some(yml) => {
+            let mut root: serde_json::Value = serde_yaml::from_str(yml)
+                .ok()
+                .filter(serde_json::Value::is_object)
+                .unwrap_or_else(|| serde_json::json!({}));
+            upsert_blindcoder_provider(&mut root, base_url, alias);
+            (
+                "models.yml",
+                serde_yaml::to_string(&root).expect("a Value serializes"),
+            )
+        }
+        None => (
+            "models.json",
+            pi_models_json(read("models.json"), base_url, alias),
+        ),
+    };
+    std::fs::write(dir.join(file_name), contents)
+}
+
+/// Shared skeleton of the pi-family agent-dir injection (pi and omp both honor
+/// `PI_CODING_AGENT_DIR`): ensure `extensions/` and `sessions/` exist in the real dir, then
+/// symlink every real entry into the injected dir except the named models files, whose contents
+/// are returned for merging instead. Symlinking means writes through the injected dir land in
+/// the user's real files; skipping the models files lets the caller place exactly one merged
+/// copy that shadows whatever the real dir holds.
+fn mirror_agent_dir(
+    dir: &std::path::Path,
+    real: &std::path::Path,
+    skip: &[&str],
+) -> std::io::Result<Vec<(std::ffi::OsString, String)>> {
     for keep in ["extensions", "sessions"] {
         std::fs::create_dir_all(real.join(keep))?;
     }
-    let mut existing = None;
+    let mut skipped = Vec::new();
     for entry in std::fs::read_dir(real)? {
         let entry = entry?;
-        if entry.file_name() == "models.json" {
-            existing = std::fs::read_to_string(entry.path()).ok();
+        let name = entry.file_name();
+        if skip.iter().any(|s| std::ffi::OsStr::new(s) == name) {
+            if let Ok(contents) = std::fs::read_to_string(entry.path()) {
+                skipped.push((name, contents));
+            }
         } else {
-            std::os::unix::fs::symlink(entry.path(), dir.join(entry.file_name()))?;
+            std::os::unix::fs::symlink(entry.path(), dir.join(name))?;
         }
     }
-    std::fs::write(
-        dir.join("models.json"),
-        pi_models_json(existing.as_deref(), base_url, alias),
-    )
+    Ok(skipped)
 }
 
 /// Build the injected pi agent dir from the user's `~/.pi/agent`. The returned guard removes the
 /// temp dir (the symlinks and the merged `models.json`, never their targets) when dropped.
 fn pi_agent_dir(base_url: &str, alias: &str) -> std::io::Result<tempfile::TempDir> {
-    let home = std::env::var_os("HOME")
-        .ok_or_else(|| std::io::Error::other("HOME is not set; cannot locate ~/.pi/agent"))?;
-    let real = std::path::PathBuf::from(home).join(".pi").join("agent");
-    let dir = tempfile::Builder::new()
-        .prefix("blindcoder-pi-")
-        .tempdir()?;
-    populate_pi_agent_dir(dir.path(), &real, base_url, alias)?;
+    agent_dir_for(
+        ".pi",
+        "blindcoder-pi-",
+        base_url,
+        alias,
+        populate_pi_agent_dir,
+    )
+}
+
+/// omp counterpart of [`pi_agent_dir`]: same injection env var, rooted at the user's `~/.omp/agent`.
+fn omp_agent_dir(base_url: &str, alias: &str) -> std::io::Result<tempfile::TempDir> {
+    agent_dir_for(
+        ".omp",
+        "blindcoder-omp-",
+        base_url,
+        alias,
+        populate_omp_agent_dir,
+    )
+}
+
+/// Shared builder behind [`pi_agent_dir`] / [`omp_agent_dir`]: locate the real agent dir under
+/// `$HOME`, create a guarded temp dir, populate it via the CLI-specific merge function.
+fn agent_dir_for(
+    home_dotdir: &str,
+    temp_prefix: &str,
+    base_url: &str,
+    alias: &str,
+    populate: fn(&std::path::Path, &std::path::Path, &str, &str) -> std::io::Result<()>,
+) -> std::io::Result<tempfile::TempDir> {
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        std::io::Error::other(format!(
+            "HOME is not set; cannot locate ~/{home_dotdir}/agent"
+        ))
+    })?;
+    let real = std::path::PathBuf::from(home)
+        .join(home_dotdir)
+        .join("agent");
+    let dir = tempfile::Builder::new().prefix(temp_prefix).tempdir()?;
+    populate(dir.path(), &real, base_url, alias)?;
     Ok(dir)
 }
 
@@ -912,6 +1013,7 @@ fn pi_agent_dir(base_url: &str, alias: &str) -> std::io::Result<tempfile::TempDi
 enum CliAdapter {
     OpenCode,
     Pi,
+    Omp,
     Generic,
 }
 
@@ -924,6 +1026,7 @@ impl CliAdapter {
         {
             Some("opencode") => Self::OpenCode,
             Some("pi") => Self::Pi,
+            Some("omp") => Self::Omp,
             _ => Self::Generic,
         }
     }
@@ -1044,9 +1147,9 @@ async fn drive_session(params: DriveParams<'_>) -> Result<backend::SessionOutcom
         // universal contract, honored by any env-respecting OpenAI-compatible CLI
         cmd.env("OPENAI_BASE_URL", &base_url)
             .env("OPENAI_API_KEY", "blindcoder");
-        // recognized-CLI adapters add complete setup on top; the guard (pi) must outlive the
-        // child — dropping it deletes the injected dir
-        let mut _pi_dir = None;
+        // recognized-CLI adapters add complete setup on top; the guard (pi, omp) must outlive
+        // the child — dropping it deletes the injected dir
+        let mut _injected_dir = None;
         match adapter {
             CliAdapter::OpenCode => {
                 cmd.env(
@@ -1059,7 +1162,7 @@ async fn drive_session(params: DriveParams<'_>) -> Result<backend::SessionOutcom
                 match pi_agent_dir(&base_url, alias_display) {
                     Ok(dir) => {
                         cmd.env("PI_CODING_AGENT_DIR", dir.path());
-                        _pi_dir = Some(dir);
+                        _injected_dir = Some(dir);
                         if !has_model_arg(&args) {
                             args.push("--model".to_string());
                             args.push(format!("blindcoder/{alias_display}"));
@@ -1068,6 +1171,24 @@ async fn drive_session(params: DriveParams<'_>) -> Result<backend::SessionOutcom
                     Err(err) => eprintln!(
                         "blindcoder: pi config injection unavailable ({err}); \
                          pi would need a manual models.json pointing at {base_url}."
+                    ),
+                }
+            }
+            CliAdapter::Omp => {
+                // omp shares pi's injection env var; failure likewise degrades to the universal
+                // contract with a warning rather than aborting the session
+                match omp_agent_dir(&base_url, alias_display) {
+                    Ok(dir) => {
+                        cmd.env("PI_CODING_AGENT_DIR", dir.path());
+                        _injected_dir = Some(dir);
+                        if !has_model_arg(&args) {
+                            args.push("--model".to_string());
+                            args.push(format!("blindcoder/{alias_display}"));
+                        }
+                    }
+                    Err(err) => eprintln!(
+                        "blindcoder: omp config injection unavailable ({err}); \
+                         omp would need a manual models.yml pointing at {base_url}."
                     ),
                 }
             }
@@ -1082,7 +1203,7 @@ async fn drive_session(params: DriveParams<'_>) -> Result<backend::SessionOutcom
             command[0]
         );
         match adapter {
-            CliAdapter::OpenCode | CliAdapter::Pi => {
+            CliAdapter::OpenCode | CliAdapter::Pi | CliAdapter::Omp => {
                 println!("  model shown in the CLI:  blindcoder/{alias_display}");
             }
             CliAdapter::Generic => {
@@ -1249,6 +1370,11 @@ mod tests {
         assert_eq!(CliAdapter::detect("opencode"), CliAdapter::OpenCode);
         assert_eq!(CliAdapter::detect("pi"), CliAdapter::Pi);
         assert_eq!(CliAdapter::detect("/nix/store/abc/bin/pi"), CliAdapter::Pi);
+        assert_eq!(CliAdapter::detect("omp"), CliAdapter::Omp);
+        assert_eq!(
+            CliAdapter::detect("/nix/store/abc/bin/omp"),
+            CliAdapter::Omp
+        );
         assert_eq!(CliAdapter::detect("./aider"), CliAdapter::Generic);
         // "pi" as a path *component* is not a match
         assert_eq!(CliAdapter::detect("/opt/pi/aider"), CliAdapter::Generic);
@@ -1315,6 +1441,100 @@ mod tests {
                 keep
             );
         }
+    }
+
+    #[test]
+    fn populate_omp_agent_dir_merges_into_yml_when_present_else_json() {
+        // Case 1: an installed omp (models.yml cache exists) — yml wins, json is ignored, exactly
+        // as omp itself would load them.
+        let real = tempfile::tempdir().unwrap();
+        let injected = tempfile::tempdir().unwrap();
+        std::fs::write(real.path().join("auth.json"), r#"{"k":"v"}"#).unwrap();
+        std::fs::write(
+            real.path().join("models.json"),
+            r#"{"providers":{"json-only":{"baseUrl":"http://json.test/v1"}}}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            real.path().join("models.yml"),
+            "providers:\n  yml-provider:\n    baseUrl: http://yml.test/v1\n",
+        )
+        .unwrap();
+
+        populate_omp_agent_dir(
+            injected.path(),
+            real.path(),
+            "http://127.0.0.1:9/v1",
+            "x7k2:q4m9",
+        )
+        .unwrap();
+
+        // non-models entries are symlinked; the winning models file is a merged real copy and
+        // the losing one is absent entirely (omp loads only one of them)
+        assert!(injected
+            .path()
+            .join("auth.json")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!injected
+            .path()
+            .join("models.yml")
+            .symlink_metadata()
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(!injected.path().join("models.json").exists());
+        let merged: serde_json::Value = serde_yaml::from_str(
+            &std::fs::read_to_string(injected.path().join("models.yml")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            merged["providers"]["blindcoder"]["baseUrl"],
+            "http://127.0.0.1:9/v1"
+        );
+        assert_eq!(
+            merged["providers"]["blindcoder"]["models"][0]["id"],
+            "x7k2:q4m9"
+        );
+        // yml-side providers survive; json-side ones are absent (omp would not load them)
+        assert_eq!(
+            merged["providers"]["yml-provider"]["baseUrl"],
+            "http://yml.test/v1"
+        );
+        assert!(merged["providers"].get("json-only").is_none());
+
+        // Case 2: a fresh install (no models.yml) — fall back to the pi-style json merge.
+        let real = tempfile::tempdir().unwrap();
+        let injected = tempfile::tempdir().unwrap();
+        std::fs::write(
+            real.path().join("models.json"),
+            r#"{"providers":{"their-provider":{"baseUrl":"http://their.test/v1"}}}"#,
+        )
+        .unwrap();
+
+        populate_omp_agent_dir(
+            injected.path(),
+            real.path(),
+            "http://127.0.0.1:9/v1",
+            "x7k2:q4m9",
+        )
+        .unwrap();
+
+        assert!(!injected.path().join("models.yml").exists());
+        let merged: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(injected.path().join("models.json")).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            merged["providers"]["their-provider"]["baseUrl"],
+            "http://their.test/v1"
+        );
+        assert_eq!(
+            merged["providers"]["blindcoder"]["baseUrl"],
+            "http://127.0.0.1:9/v1"
+        );
     }
 
     #[test]

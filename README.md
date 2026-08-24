@@ -86,7 +86,7 @@ Once you have declared a pool in your config (see [Configuration](#configuration
 way is **launcher mode** — hand `run` your agentic CLI and it does the rest:
 
 ```sh
-blindcoder run opencode          # or: blindcoder run pi
+blindcoder run opencode          # or: blindcoder run pi / omp
 blindcoder run -- aider --some-flag
 ```
 
@@ -105,6 +105,12 @@ exits — records the session and asks you the two rating questions inline. Setu
     `--model` flag, if any, wins). The injected model pins `maxTokens` well below pi's default,
     because some gateways' per-minute token limits count `prompt + max_tokens` — a large default
     output *reservation* can get a request rejected even when the actual prompt fits.
+  - **omp (Oh My Pi):** pi-derived and speaking the same `PI_CODING_AGENT_DIR` injection contract,
+    rooted at `~/.omp/agent` instead. One wrinkle: omp *migrates* `models.json` into a cached
+    `models.yml` and thereafter prefers the yml, so the adapter merges the `blindcoder` provider
+    (keyed on the alias) into `models.yml` when one exists — falling back to the pi-style json
+    merge on a fresh install — and passes `--model blindcoder/<alias>` unless you picked a model
+    yourself.
 - **Anything else** gets the universal contract: `OPENAI_BASE_URL`/`OPENAI_API_KEY` env vars plus
   the printed endpoint and alias. Any CLI that honors those just works; one that doesn't needs its
   own adapter (`CliAdapter` in `src/run.rs` is the seam — contributions welcome).
