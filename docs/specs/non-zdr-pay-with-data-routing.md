@@ -107,11 +107,21 @@ treated as non-private.
 
 ### Fail-closed audit trail
 
-Every request routed to a `no-zdr` model appends `timestamp · session_id · real_slug` to a
-dedicated append-only file (mode `0600`). Granularity is deliberately **not** the per-response
-alias mapping — the audit file must not become an oracle for deblinding the current session's
-ratings. The audit is **fail-closed**: if the file cannot be opened or written, the request is
-**refused** — no routing without a durable record.
+Every request routed to a `no-zdr` model appends one `<YYYY-MM-DDTHH>\t<real_slug>` line to a
+dedicated append-only file (mode `0600`): a whole-UTC-hour bucket plus the real model slug, one
+line per forwarded request. The record deliberately carries **no session identifier**, and not a
+random per-session token either: the store keys ratings on `session_id`, so an id-bearing audit
+file would join onto the ratings table and deblind every non-ZDR session and its rating — and
+could be read mid-session to unmask the session before it is rated. A per-session token fails the
+same way (tail the file once and the freshly appearing token's slug names the live session), and
+minute-level timestamps would pin a just-run session by recalling roughly when it ran; the hour
+bucket makes requests from concurrent sessions within one hour indistinguishable by construction.
+The file therefore guarantees **aggregate accountability only** — which real models received
+prompts, in which clock hours — with per-session attribution impossible by construction;
+unmasking a specific session remains the reveal gate's sole job. Each record is formatted into one
+buffer and emitted with a single `write_all`, so under `O_APPEND` concurrent appenders cannot
+interleave fragments into corrupt half-lines. The audit remains **fail-closed**: if the file
+cannot be opened or written, the request is **refused** — no routing without a durable record.
 
 ### Cost path
 
@@ -135,7 +145,10 @@ paid pay-with-data endpoint is costed and capped normally.
 6. **Ordered, short-circuiting reveal** per the table above — one gate per run, never a later token
    before an earlier gate passes.
 7. **Session-level startup banner only**; no per-request identity disclosure.
-8. **Fail-closed append-only audit trail** at `timestamp · session_id · real_slug` granularity.
+8. **Fail-closed append-only audit trail** at `<YYYY-MM-DDTHH>\t<real_slug>` granularity —
+   whole-UTC-hour buckets plus the real slug, **no session identifier** (aggregate accountability
+   only; per-session attribution impossible by construction, and the reveal gate stays the sole
+   unmasking path).
 9. **Cost path fully live** for `no-zdr` (pricing + session cap).
 10. **Tests both ways:** default `cargo test --workspace` passes with the path compiled out; the
     `no-zdr` behaviour is tested under the feature. Fixtures use a placeholder slug
