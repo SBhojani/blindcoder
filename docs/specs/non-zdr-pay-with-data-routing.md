@@ -1,6 +1,7 @@
 # Spec: opt-in non-ZDR / pay-with-data routing
 
-**Status:** proposed
+**Status:** implemented on the `allow-non-zdr` feature (see Requirements 10 for the gated test
+invocations).
 **Scope:** add a new, generic privacy mode that lets the pool include a model whose provider does
 **not** offer Zero Data Retention (i.e. it may log or train on prompts) — a "pay-with-data"
 endpoint. The mode is compiled out by default, dormant unless configured, and can only fire after
@@ -63,12 +64,14 @@ all must be present:
 4. **Runtime flag** — a CLI flag on the invocation, hidden from `--help`. *(undocumented.)*
 
 Plus a bounded lifetime:
-
 5. **Expiry** — a required per-provider `expires` date. At startup, if a `no-zdr` provider is
    expired **or** dated more than 30 days in the future, blindcoder **refuses to start** (hard
-   stop, not a prune — the whole process halts). The 30-day rule caps how long the capability can
-   be armed; it is a hard maximum, not a reminder. *(the `expires` key is undocumented; the 30-day
-   bound is revealed only when violated — see below.)*
+   stop, not a prune — the whole process halts). The window is then enforced **per request**: the
+   fail-closed audit hook re-checks `expires` on every forward and refuses once it has passed,
+   so a standing proxy cannot route non-ZDR traffic past its attestation's window. The 30-day
+   rule caps how long the capability can be armed; it is a hard maximum, not a reminder.
+   *(the `expires` key is undocumented; the 30-day bound is revealed only when violated — see
+   below.)*
 
 ### Reveal chain (when each undocumented token surfaces)
 
@@ -108,8 +111,10 @@ treated as non-private.
 ### Fail-closed audit trail
 
 Every request routed to a `no-zdr` model appends one `<YYYY-MM-DDTHH>\t<real_slug>` line to a
-dedicated append-only file (mode `0600`): a whole-UTC-hour bucket plus the real model slug, one
-line per forwarded request. The record deliberately carries **no session identifier**, and not a
+dedicated append-only file (mode `0600`, re-tightened idempotently on every open so a file left
+looser by an older build cannot stay loose): a whole-UTC-hour bucket plus the real model slug,
+one line per forwarded request.
+The record deliberately carries **no session identifier**, and not a
 random per-session token either: the store keys ratings on `session_id`, so an id-bearing audit
 file would join onto the ratings table and deblind every non-ZDR session and its rating — and
 could be read mid-session to unmask the session before it is rated. A per-session token fails the
@@ -118,10 +123,15 @@ minute-level timestamps would pin a just-run session by recalling roughly when i
 bucket makes requests from concurrent sessions within one hour indistinguishable by construction.
 The file therefore guarantees **aggregate accountability only** — which real models received
 prompts, in which clock hours — with per-session attribution impossible by construction;
-unmasking a specific session remains the reveal gate's sole job. Each record is formatted into one
-buffer and emitted with a single `write_all`, so under `O_APPEND` concurrent appenders cannot
-interleave fragments into corrupt half-lines. The audit remains **fail-closed**: if the file
-cannot be opened or written, the request is **refused** — no routing without a durable record.
+unmasking a specific session remains the reveal gate's sole job. Each record is formatted into
+one small buffer and written under `O_APPEND`; what keeps concurrent lines intact is the
+**per-syscall atomicity of `write(2)` on a regular file** — each write atomically positions at
+end-of-file, so a record small enough to complete in one syscall lands as an indivisible line
+even with several processes appending to the shared log. The audit remains **fail-closed** in
+both directions: if the file cannot be opened or written, or the attestation's window has
+passed, the request is **refused** — no routing without a durable record. The blocking
+open/write/fsync runs on tokio's blocking pool — never stalling an async worker — and still
+completes before anything is forwarded.
 
 ### Cost path
 
@@ -141,7 +151,9 @@ paid pay-with-data endpoint is costed and capped normally.
 4. **Environment second factor** (undocumented) and **CLI flag** (undocumented, `--help`-hidden),
    both required in conjunction with the config.
 5. **Required `expires`** per `no-zdr` provider; **refuse to start** if absent, past, or > 30 days
-   out; the 30-day bound is revealed only on violation.
+   out; the 30-day bound is revealed only on violation. The window is re-checked **per request**
+   at the fail-closed audit hook: once `expires` passes, a standing proxy refuses further non-ZDR
+   forwards instead of routing past its window.
 6. **Ordered, short-circuiting reveal** per the table above — one gate per run, never a later token
    before an earlier gate passes.
 7. **Session-level startup banner only**; no per-request identity disclosure.
@@ -152,7 +164,10 @@ paid pay-with-data endpoint is costed and capped normally.
 9. **Cost path fully live** for `no-zdr` (pricing + session cap).
 10. **Tests both ways:** default `cargo test --workspace` passes with the path compiled out; the
     `no-zdr` behaviour is tested under the feature. Fixtures use a placeholder slug
-    (`example/non-zdr-model`) — never a real vendor or model name.
+    (`example/non-zdr-model`) — never a real vendor or model name. The feature-gated tests
+    compile out of default builds **by design** — do not add CI or un-gate them; run
+    `cargo test --workspace --features allow-non-zdr` (and the matching clippy invocation)
+    before changing this path.
 
 ## Disclosure boundary
 

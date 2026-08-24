@@ -622,7 +622,18 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
             .context("cannot determine state dir (set XDG_STATE_HOME or HOME)")?;
         ensure_private_dir(&dir)
             .with_context(|| format!("creating {} for the non-ZDR audit trail", dir.display()))?;
-        backend.with_non_zdr_audit(dir.join("non-zdr-audit.log"))
+        // Bound a standing proxy to the attestation's remaining window: the audit re-checks
+        // `expires` per request and refuses once it passes (fail-closed), so routing cannot
+        // outlive the startup-validated window. The gates above guarantee a valid date for an
+        // armed pick; if plumbing ever yields none, the audit refuses everything rather than
+        // route unbounded.
+        backend.with_non_zdr_audit(
+            dir.join("non-zdr-audit.log"),
+            provider
+                .expires
+                .as_deref()
+                .and_then(config::date_to_epoch_days),
+        )
     } else {
         backend
     };

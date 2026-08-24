@@ -71,20 +71,96 @@ fn classify_http(code: u16) -> ErrorKind {
 /// concurrent sessions within one hour are indistinguishable by construction. Unmasking a
 /// specific session happens only through the reveal gate; this log is not a second path there.
 ///
-/// Each record is formatted into one buffer and emitted with a single `write_all`, so under
-/// `O_APPEND` it lands as one indivisible line even when several processes append concurrently
-/// to the shared log. Appends are fail-closed: any error is returned and the caller must refuse
-/// the request — no routing without a durable record.
+/// Each record is formatted into one small buffer and emitted with `write_all`; what keeps
+/// concurrent lines intact is **per-syscall `O_APPEND` atomicity**: every `write(2)` to a regular
+/// file atomically positions at end-of-file and writes, so a record small enough to complete in
+/// one syscall lands as one indivisible line even when several processes append concurrently to
+/// the shared log — exactly what the concurrency test demonstrates. (`write_all` may loop over
+/// partial writes; a record this size does not.)
+///
+/// Appends are fail-closed in both directions: any filesystem error returns and the caller must
+/// refuse the request — no routing without a durable record — and so does an expired attestation.
+/// The expiry is checked **per request** here, not only once at startup, because a standing proxy
+/// (no launched command, ended by Ctrl-C) would otherwise outlive its window and route non-ZDR
+/// traffic indefinitely past `expires`. The blocking open/write/fsync runs on tokio's blocking
+/// pool via [`NonZdrAudit::append`], never on an async worker.
 #[cfg(feature = "allow-non-zdr")]
 #[derive(Clone, Debug)]
 pub struct NonZdrAudit {
     path: PathBuf,
+    /// The armed attestation's bounded lifetime in epoch days (`config::date_to_epoch_days` of
+    /// the provider's `expires`). `None` records no bounded lifetime → every append refuses
+    /// (fail-closed): an unbounded non-ZDR capability must never arm.
+    expires_epoch_days: Option<i64>,
+}
+
+/// Why [`NonZdrAudit`] refused to witness a request. Every variant is fail-closed: the caller
+/// must refuse the request — never forward unwitnessed.
+#[cfg(feature = "allow-non-zdr")]
+#[derive(Debug)]
+enum AuditRefusal {
+    /// The attestation carries no bounded lifetime — such a capability can never arm.
+    Unbounded,
+    /// The attestation's window ended: a standing proxy has run past `expires`.
+    Expired(String),
+    /// Any filesystem failure opening, tightening, writing, or syncing the record.
+    Io(std::io::Error),
+    /// The blocking-pool task died before proving a durable record either way.
+    Join,
+}
+
+#[cfg(feature = "allow-non-zdr")]
+impl std::fmt::Display for AuditRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unbounded => write!(f, "attestation carries no bounded lifetime"),
+            Self::Expired(date) => write!(f, "attestation expired on {date}"),
+            Self::Io(e) => write!(f, "{e}"),
+            Self::Join => write!(f, "audit worker terminated"),
+        }
+    }
+}
+
+#[cfg(feature = "allow-non-zdr")]
+impl From<std::io::Error> for AuditRefusal {
+    fn from(e: std::io::Error) -> Self {
+        Self::Io(e)
+    }
+}
+
+/// Render an epoch-day count back to `YYYY-MM-DD` for a refusal message.
+#[cfg(feature = "allow-non-zdr")]
+fn format_expiry(days: i64) -> String {
+    chrono::DateTime::from_timestamp(days.saturating_mul(86_400), 0)
+        .map_or_else(|| days.to_string(), |dt| dt.format("%Y-%m-%d").to_string())
 }
 
 #[cfg(feature = "allow-non-zdr")]
 impl NonZdrAudit {
-    /// Durably append one routed-request record: `<YYYY-MM-DDTHH>\t<real_slug>\n`.
-    fn append(&self, real_slug: &str) -> std::io::Result<()> {
+    /// Async front-end for [`Self::append_sync`]: runs the durable append on tokio's blocking
+    /// pool so the open/fsync never stalls an async worker. The caller still awaits completion
+    /// BEFORE forwarding — durability-before-forward and fail-closed refusal are unchanged.
+    async fn append(&self, real_slug: &str) -> Result<(), AuditRefusal> {
+        let audit = self.clone();
+        let slug = real_slug.to_owned();
+        tokio::task::spawn_blocking(move || audit.append_sync(&slug))
+            .await
+            .map_err(|_| AuditRefusal::Join)?
+    }
+
+    /// The blocking core: refuse if expired/unbounded, then open (creating `0600`), tighten an
+    /// existing looser file, durably write one record. Sync by design — it belongs on a blocking
+    /// thread.
+    fn append_sync(&self, real_slug: &str) -> Result<(), AuditRefusal> {
+        // Per-request expiry: startup validated the window once; this bounds a standing proxy to
+        // the same window. Same predicate as startup (`expires < today` ⇒ refused), so the day
+        // `expires` names stays routable until UTC midnight.
+        let Some(expires_days) = self.expires_epoch_days else {
+            return Err(AuditRefusal::Unbounded);
+        };
+        if config::today_epoch_days() > expires_days {
+            return Err(AuditRefusal::Expired(format_expiry(expires_days)));
+        }
         use std::io::Write;
         use std::os::unix::fs::OpenOptionsExt;
         let mut f = std::fs::OpenOptions::new()
@@ -92,16 +168,22 @@ impl NonZdrAudit {
             .append(true)
             .mode(0o600)
             .open(&self.path)?;
-        // Format into one buffer, then a single `write_all`: `writeln!` on a raw file issues
-        // several `write(2)` calls, and two concurrent appenders can interleave those fragments
-        // into corrupt half-lines despite `O_APPEND`. One write per record cannot fragment.
+        // `.mode()` applies only at creation, so a pre-existing looser file (older build, manual
+        // touch, umask) would stay loose — tighten it idempotently before anything is written
+        // into it: the file-level mirror of `run::ensure_private_dir`.
+        f.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+        // One small record, one buffer: under `O_APPEND` each `write(2)` on a regular file
+        // atomically positions at EOF and writes, so a record completing in one syscall cannot be
+        // interleaved by a concurrent appender. (`writeln!` would issue several `write(2)`s whose
+        // fragments CAN interleave between calls despite `O_APPEND`.)
         let line = format!(
             "{}\t{}\n",
             chrono::Utc::now().format("%Y-%m-%dT%H"),
             real_slug
         );
         f.write_all(line.as_bytes())?;
-        f.sync_all()
+        f.sync_all()?;
+        Ok(())
     }
 }
 
@@ -151,14 +233,19 @@ impl ProxyBackend {
     }
 
     /// Arm the fail-closed non-ZDR accountability trail: every forwarded request appends one
-    /// `<UTC hour> · <real_slug>` line to `path` (or is refused if the append fails). The path
-    /// is the whole configuration — no session identity crosses this boundary, so the log can
-    /// never join onto the store's ratings; see [`NonZdrAudit`]. Only meaningful — and only
-    /// compiled — on the opt-in routing path; the router calls this solely when the pick landed
-    /// on a `no-zdr` model.
+    /// `<UTC hour> · <real_slug>` line to `path` — or is refused, whether the append fails or
+    /// the attestation's bounded lifetime has ended. `expires_epoch_days` is
+    /// `config::date_to_epoch_days` of the provider's `expires`; `None` refuses every request,
+    /// so an unbounded capability can never arm. The path is the whole configuration beyond
+    /// that — no session identity crosses this boundary, so the log can never join onto the
+    /// store's ratings; see [`NonZdrAudit`]. Only meaningful — and only compiled — on the opt-in
+    /// routing path; the router calls this solely when the pick landed on a `no-zdr` model.
     #[cfg(feature = "allow-non-zdr")]
-    pub fn with_non_zdr_audit(mut self, path: PathBuf) -> Self {
-        self.non_zdr_audit = Some(NonZdrAudit { path });
+    pub fn with_non_zdr_audit(mut self, path: PathBuf, expires_epoch_days: Option<i64>) -> Self {
+        self.non_zdr_audit = Some(NonZdrAudit {
+            path,
+            expires_epoch_days,
+        });
         self
     }
 }
@@ -456,14 +543,18 @@ async fn proxy_handler(
         .endpoint
         .prepare(&body, &st.real_slug, &st.extra_body, st.privacy);
 
-    // Fail-closed non-ZDR audit: the durable record is appended BEFORE anything is forwarded, and
-    // a failed append refuses the request — no routing without a witness on disk.
+    // Fail-closed non-ZDR audit: the durable record is appended BEFORE anything is forwarded;
+    // any refusal — a filesystem failure or an expired/unbounded attestation — refuses the
+    // request. The blocking open/write/fsync runs on tokio's blocking pool, off the async
+    // workers; the await still completes before anything is sent upstream.
     #[cfg(feature = "allow-non-zdr")]
     if let Some(audit) = &st.non_zdr_audit {
-        if let Err(e) = audit.append(&st.real_slug) {
+        if let Err(e) = audit.append(&st.real_slug).await {
             return (
                 StatusCode::SERVICE_UNAVAILABLE,
-                format!("non-ZDR audit append failed ({e}); refusing to forward without a durable record"),
+                format!(
+                    "non-ZDR audit refused ({e}); refusing to forward without a durable record"
+                ),
             )
                 .into_response();
         }
@@ -972,7 +1063,7 @@ mod tests {
             None,
         )
         .unwrap()
-        .with_non_zdr_audit(audit_path.clone());
+        .with_non_zdr_audit(audit_path.clone(), Some(config::today_epoch_days() + 1));
         let pick = Pick {
             canonical_key: "non-zdr-model".into(),
             real_slug: "example/non-zdr-model".into(),
@@ -1057,7 +1148,10 @@ mod tests {
             None,
         )
         .unwrap()
-        .with_non_zdr_audit(tmp.path().to_path_buf()); // a directory: append must fail
+        .with_non_zdr_audit(
+            tmp.path().to_path_buf(), // a directory: append must fail
+            Some(config::today_epoch_days() + 1),
+        );
         let pick = Pick {
             canonical_key: "non-zdr-model".into(),
             real_slug: "example/non-zdr-model".into(),
@@ -1080,10 +1174,148 @@ mod tests {
         );
     }
 
-    /// Concurrency safety of the audit log: each record is one buffer, one `write_all`, so
-    /// `O_APPEND` lands it as an indivisible line. Many threads appending to the SAME path (the
-    /// shared-log situation two blindcoder processes would hit) must therefore produce exactly
-    /// one intact, parseable line per append — never interleaved fragments.
+    /// The per-request expiry bound (feature-gated): once the armed attestation's `expires`
+    /// date has passed, a STANDING proxy refuses further non-ZDR routing — fail-closed, the
+    /// upstream never sees anything. This is what makes the 30-day cap a true maximum even when
+    /// the proxy outlives the window it was started inside.
+    #[cfg(feature = "allow-non-zdr")]
+    #[tokio::test]
+    async fn non_zdr_expiry_refuses_a_standing_proxies_requests() {
+        let hit = Arc::new(AtomicBool::new(false));
+        let up_hit = hit.clone();
+        let up_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let up_hit = up_hit.clone();
+                async move {
+                    up_hit.store(true, Ordering::Relaxed);
+                    axum::Json(json!({"choices": []}))
+                }
+            }),
+        );
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(up_listener, up_app).await.unwrap();
+        });
+
+        let tmp = tempfile::tempdir().unwrap();
+        // Expired yesterday relative to this machine's clock: always past, whatever today is.
+        let backend = ProxyBackend::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Some("k".into()),
+            vec![],
+            serde_json::Map::new(),
+            Privacy::NoZdr,
+            None,
+        )
+        .unwrap()
+        .with_non_zdr_audit(
+            tmp.path().join("non-zdr-audit.log"),
+            Some(config::today_epoch_days() - 1),
+        );
+        let pick = Pick {
+            canonical_key: "non-zdr-model".into(),
+            real_slug: "example/non-zdr-model".into(),
+            endpoint: crate::VettedEndpoint::new(format!("http://{up_addr}/v1")),
+        };
+        let sess = backend.start(&pick, "al:al").await.unwrap();
+        let addr = sess.endpoint().unwrap();
+
+        let resp = reqwest::Client::new()
+            .post(format!("http://{addr}/v1/chat/completions"))
+            .json(&json!({"model": "al:al", "messages": []}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(resp.status().as_u16(), 503, "refused once expired");
+        let text = resp.text().await.unwrap();
+        assert!(text.contains("expired"), "refusal names the cause: {text}");
+        let _ = sess.finish().await.unwrap();
+        assert!(
+            !hit.load(Ordering::Relaxed),
+            "upstream must never see a request past the attestation's window"
+        );
+    }
+
+    /// File-level mirror of run.rs's dir-tightening test: `.mode(0o600)` applies only at
+    /// creation, so a pre-existing looser audit file (older build, manual touch, umask) must be
+    /// tightened idempotently before records land in it.
+    #[cfg(feature = "allow-non-zdr")]
+    #[test]
+    fn non_zdr_audit_file_gets_0600_even_when_it_pre_exists_looser() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("non-zdr-audit.log");
+
+        let audit = NonZdrAudit {
+            path: path.clone(),
+            expires_epoch_days: Some(config::today_epoch_days() + 1),
+        };
+        // Fresh creation must be 0600 outright.
+        audit.append_sync("example/non-zdr-model").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600, "fresh file must be 0600");
+
+        // A file left looser by an older build / manual touch must be tightened: a loose audit
+        // file discloses the pay-with-data configuration to every local user who can read it.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        audit.append_sync("example/non-zdr-model").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "pre-existing loose file must be tightened"
+        );
+
+        // Idempotent.
+        audit.append_sync("example/non-zdr-model").unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o600);
+    }
+
+    /// Expiry refusals are fail-closed and write nothing: an attestation whose window ended — or
+    /// that carries no bounded lifetime at all — refuses the append itself.
+    #[cfg(feature = "allow-non-zdr")]
+    #[test]
+    fn non_zdr_audit_refuses_expired_or_unbounded_attestations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("non-zdr-audit.log");
+        let today = config::today_epoch_days();
+
+        // Live through today (+1 stays valid even if the UTC day flips mid-test): appends work.
+        let live = NonZdrAudit {
+            path: path.clone(),
+            expires_epoch_days: Some(today + 1),
+        };
+        live.append_sync("example/non-zdr-model").unwrap();
+
+        // Expired yesterday: refused.
+        let dead = NonZdrAudit {
+            path: path.clone(),
+            expires_epoch_days: Some(today - 1),
+        };
+        let err = dead.append_sync("example/non-zdr-model").unwrap_err();
+        assert!(matches!(err, AuditRefusal::Expired(_)), "{err:?}");
+
+        // No bounded lifetime recorded: refused — an unbounded capability never arms.
+        let unbounded = NonZdrAudit {
+            path: path.clone(),
+            expires_epoch_days: None,
+        };
+        let err = unbounded.append_sync("example/non-zdr-model").unwrap_err();
+        assert!(matches!(err, AuditRefusal::Unbounded), "{err:?}");
+
+        // Only the live record reached disk.
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.lines().count(), 1, "refusals must not write: {text:?}");
+    }
+
+    /// Concurrency safety of the audit log: each record is one small buffer written under
+    /// `O_APPEND`, whose per-syscall atomicity on regular files lands it as an indivisible line.
+    /// Many threads appending to the SAME path (the shared-log situation two blindcoder processes
+    /// would hit) must therefore produce exactly one intact, parseable line per append — never
+    /// interleaved fragments.
     #[cfg(feature = "allow-non-zdr")]
     #[test]
     fn non_zdr_audit_concurrent_appends_stay_whole_lines() {
@@ -1096,10 +1328,14 @@ mod tests {
             .map(|t| {
                 let path = audit_path.clone();
                 std::thread::spawn(move || {
-                    let audit = NonZdrAudit { path };
+                    let audit = NonZdrAudit {
+                        path,
+                        // Valid all day: these threads exercise atomicity, not expiry.
+                        expires_epoch_days: Some(config::today_epoch_days() + 1),
+                    };
                     let slug = format!("example/concurrent-{t}");
                     for _ in 0..APPENDS_PER_THREAD {
-                        audit.append(&slug).unwrap();
+                        audit.append_sync(&slug).unwrap();
                     }
                 })
             })

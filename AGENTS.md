@@ -33,6 +33,13 @@ Requires a Rust stable toolchain (edition 2021). The repo ships a Nix flake prov
 reproducible dev shell (`nix develop`) — recommended for a matching toolchain, but not required:
 plain rustup works too. Either way, Nix is dev/build only, never a runtime requirement.
 
+The opt-in non-ZDR routing path (`privacy = "no-zdr"`) compiles in only under the
+`allow-non-zdr` Cargo feature, and every test covering it is `#[cfg(feature = "allow-non-zdr")]`
+— so a plain `cargo test --workspace` compiles those tests out, by design. Before changing
+anything under that gate, run the feature-on suite as well:
+`cargo test --workspace --features allow-non-zdr` and
+`cargo clippy --workspace --features allow-non-zdr`.
+
 ## Architecture — split by durability, not by feature
 
 The permanent core is written for real now; only the I/O edge below one trait is stubbed and
