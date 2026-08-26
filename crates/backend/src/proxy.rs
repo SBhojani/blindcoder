@@ -41,15 +41,17 @@ use crate::{
 };
 
 /// Map an upstream HTTP status to an [`ErrorKind`] (for the "no clean completion" case).
-fn classify_http(code: u16) -> ErrorKind {
-    match code {
-        429 => ErrorKind::RateLimit,
-        401 | 403 => ErrorKind::Auth,
-        413 => ErrorKind::TooLarge, // request too large: context window or a per-minute token cap
-        404 => ErrorKind::Unavailable, // model/route not available to you (delisted, free-retired, ZDR-filtered)
-        400..=499 => ErrorKind::BadRequest, // other 4xx: 400/422/…
-        500..=599 => ErrorKind::Http5xx,
-        // 1xx/3xx/≥600 shouldn't reach here (we only classify non-2xx final statuses; reqwest
+fn classify_http(status: StatusCode) -> ErrorKind {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => ErrorKind::RateLimit,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ErrorKind::Auth,
+        // request too large: context window or a per-minute token cap
+        StatusCode::PAYLOAD_TOO_LARGE => ErrorKind::TooLarge,
+        // model/route not available to you (delisted, free-retired, ZDR-filtered)
+        StatusCode::NOT_FOUND => ErrorKind::Unavailable,
+        s if s.is_server_error() => ErrorKind::Http5xx,
+        s if s.is_client_error() => ErrorKind::BadRequest, // other 4xx: 400/422/…
+        // 1xx/2xx/3xx/≥600 shouldn't reach here (we only classify non-2xx final statuses; reqwest
         // follows redirects) — distinct Unknown bucket rather than mislabelling as bad_request.
         _ => ErrorKind::Unknown,
     }
@@ -312,6 +314,54 @@ fn spawn_warc_writer(
 /// Cumulative per-session usage + failure signals, shared between the request handlers and the
 /// session handle. Cost is accumulated in integer nano-dollars (float-atomic-free) and surfaced
 /// only when a response reported one. Failure state feeds [`error_kind`](Cumulative::error_kind).
+/// The most recent transport/body failure of a session. Encoded into an [`AtomicU64`] for lock-free
+/// storage inside [`Cumulative`] (`encode`/`decode` are the only place the numeric form appears): the
+/// `< 100` sentinels never collide with a real HTTP status, and `0` decodes to "no failure".
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Failure {
+    Network,          // no response from upstream
+    BodyError,        // a 2xx whose body carried an `error` payload
+    Http(StatusCode), // an upstream HTTP error status
+}
+
+impl Failure {
+    fn encode(self) -> u64 {
+        match self {
+            Failure::Network => 1,
+            Failure::BodyError => 2,
+            Failure::Http(status) => status.as_u16() as u64, // status >= 100 never collides with 1/2
+        }
+    }
+
+    fn decode(v: u64) -> Option<Self> {
+        match v {
+            0 => None,
+            1 => Some(Failure::Network),
+            2 => Some(Failure::BodyError),
+            // Only ever encoded from a real `StatusCode`, so `from_u16` round-trips; a value that
+            // somehow does not is dropped to `None` (treated as "no failure") rather than panicking.
+            v => StatusCode::from_u16(v as u16).ok().map(Failure::Http),
+        }
+    }
+
+    /// The learned failure tag this maps to.
+    fn kind(self) -> ErrorKind {
+        match self {
+            Failure::Network => ErrorKind::Network,
+            Failure::BodyError => ErrorKind::BadRequest,
+            Failure::Http(status) => classify_http(status),
+        }
+    }
+
+    /// The raw upstream HTTP status, if this failure had one (network / body errors do not).
+    fn status(self) -> Option<u16> {
+        match self {
+            Failure::Http(status) => Some(status.as_u16()),
+            Failure::Network | Failure::BodyError => None,
+        }
+    }
+}
+
 #[derive(Default)]
 struct Cumulative {
     prompt: AtomicU64,
@@ -319,10 +369,17 @@ struct Cumulative {
     cached_prompt: AtomicU64,
     cost_nano: AtomicU64,
     has_cost: AtomicBool,
-    any_success: AtomicBool,
-    http_error: AtomicU64, // 0 = none, 1 = network (no response), else the HTTP status
-    content_issue: AtomicU64, // 0 = none, 1 = truncated (length), 2 = refused (content_filter)
-    body_error: AtomicBool, // a 2xx response whose body carried an `error`
+    // Recency of the session's outcomes. Every clean completion and every transport/body failure is
+    // stamped with a monotonic `seq`; the failure tag is derived from whichever stamp is newer, so a
+    // run that dies on a terminal 413/429/5xx is learned as such even after earlier requests
+    // succeeded (a single earlier success no longer masks a terminal failure). Recording order
+    // approximates logical order — agentic CLIs issue requests sequentially, so the newest stamp is
+    // the session's last outcome.
+    seq: AtomicU64,              // event counter; each stamp is a distinct value >= 1
+    last_success_seq: AtomicU64, // stamp of the most recent clean completion (0 = none)
+    last_failure_seq: AtomicU64, // stamp of the most recent transport/body failure (0 = none)
+    last_failure: AtomicU64,     // the most recent failure, encoded via `Failure::encode` (0 = none)
+    content_issue: AtomicU64,    // 0 = none, 1 = truncated (length), 2 = refused (content_filter)
 }
 
 impl Cumulative {
@@ -369,17 +426,27 @@ impl Cumulative {
         )
     }
 
-    fn note_network(&self) {
-        self.http_error.store(1, Ordering::Relaxed);
+    /// Allocate the next monotonic event stamp (>= 1; 0 stays reserved for "no event yet").
+    fn next_seq(&self) -> u64 {
+        self.seq.fetch_add(1, Ordering::Relaxed) + 1
     }
-    fn note_http_error(&self, code: u16) {
-        self.http_error.store(code as u64, Ordering::Relaxed);
+    /// Record the most recent failure: store its encoding *before* its stamp so a reader that
+    /// observes the new stamp also observes the matching failure.
+    fn note_failure(&self, failure: Failure) {
+        self.last_failure.store(failure.encode(), Ordering::Relaxed);
+        self.last_failure_seq.store(self.next_seq(), Ordering::Relaxed);
+    }
+    fn note_network(&self) {
+        self.note_failure(Failure::Network);
+    }
+    fn note_http_error(&self, status: StatusCode) {
+        self.note_failure(Failure::Http(status));
     }
     fn note_success(&self) {
-        self.any_success.store(true, Ordering::Relaxed);
+        self.last_success_seq.store(self.next_seq(), Ordering::Relaxed);
     }
     fn note_body_error(&self) {
-        self.body_error.store(true, Ordering::Relaxed);
+        self.note_failure(Failure::BodyError);
     }
     fn note_finish_reason(&self, reason: &str) {
         let v = match reason {
@@ -392,20 +459,14 @@ impl Cumulative {
         }
     }
 
-    /// Derive the session's failure tag: a transport-level failure when nothing completed cleanly,
-    /// otherwise a content-level degradation (truncated / refused) from the last completion.
+    /// Derive the session's failure tag. When the session's most recent outcome was a transport or
+    /// body failure, that failure tags the session — even if earlier requests completed cleanly, so
+    /// a run that ends on a 413/429/5xx is learned as such. When the most recent outcome was instead
+    /// a clean completion (or the failure was an earlier one the CLI recovered from), only a
+    /// content-level degradation (truncated / refused) of a completion carries through.
     fn error_kind(&self) -> Option<ErrorKind> {
-        if !self.any_success.load(Ordering::Relaxed) {
-            let http = self.http_error.load(Ordering::Relaxed);
-            if http == 1 {
-                return Some(ErrorKind::Network);
-            }
-            if http != 0 {
-                return Some(classify_http(http as u16));
-            }
-            if self.body_error.load(Ordering::Relaxed) {
-                return Some(ErrorKind::BadRequest);
-            }
+        if let Some(failure) = self.terminal_failure() {
+            return Some(failure.kind());
         }
         match self.content_issue.load(Ordering::Relaxed) {
             1 => Some(ErrorKind::Truncated),
@@ -414,12 +475,21 @@ impl Cumulative {
         }
     }
 
-    /// The raw upstream HTTP status of a failure, if there was an HTTP one. `None` for a network
-    /// failure (sentinel `1`, no status) or no failure.
+    /// The raw upstream HTTP status of the *terminal* failure, if it was an HTTP one. `None` when the
+    /// session recovered, when the terminal failure was a network drop or a 2xx body error (neither
+    /// has a failing status), or when there was no failure.
     fn error_status(&self) -> Option<u16> {
-        match self.http_error.load(Ordering::Relaxed) {
-            0 | 1 => None,
-            code => Some(code as u16),
+        self.terminal_failure().and_then(Failure::status)
+    }
+
+    /// The most recent transport/body failure, but only if it was the session's last outcome (no
+    /// clean completion came after it). `None` when the session recovered or never failed.
+    fn terminal_failure(&self) -> Option<Failure> {
+        let last_failure = self.last_failure_seq.load(Ordering::Relaxed);
+        if last_failure != 0 && last_failure > self.last_success_seq.load(Ordering::Relaxed) {
+            Failure::decode(self.last_failure.load(Ordering::Relaxed))
+        } else {
+            None
         }
     }
 }
@@ -609,7 +679,7 @@ async fn proxy_handler(
     let status = upstream.status();
     let succeeded = status.is_success();
     if !succeeded {
-        st.cumulative.note_http_error(status.as_u16());
+        st.cumulative.note_http_error(status);
     }
     let content_type = upstream.headers().get(header::CONTENT_TYPE).cloned();
     let is_sse = content_type
@@ -923,17 +993,134 @@ mod tests {
         assert_eq!(outcome.terminated_by, None);
     }
 
+    /// A two-request session whose first call succeeds and whose second dies on a 413 must tag the
+    /// whole session `too_large`/413 — the on-the-wire counterpart of the unit test, exercising the
+    /// real stream path where `note_success` fires *after* the body streams and `note_http_error`
+    /// fires *before* it. Draining each response before sending the next fixes the ordering the way
+    /// a sequential agentic CLI does.
+    #[tokio::test]
+    async fn terminal_413_after_a_success_tags_too_large_end_to_end() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let up_calls = calls.clone();
+        let up_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let up_calls = up_calls.clone();
+                async move {
+                    if up_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                        (
+                            StatusCode::OK,
+                            axum::Json(json!({
+                                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                            })),
+                        )
+                    } else {
+                        (
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            axum::Json(json!({"error": {"message": "request too large"}})),
+                        )
+                    }
+                }
+            }),
+        );
+        let outcome = run_two_request_session(up_app).await;
+        assert_eq!(outcome.error_kind, Some(ErrorKind::TooLarge));
+        assert_eq!(outcome.error_status, Some(413)); // raw terminal status preserved
+    }
+
+    /// The mirror case: a 429 on the first request that the second request recovers from must leave
+    /// the session untagged — the stray throttle is not the session's outcome.
+    #[tokio::test]
+    async fn a_recovered_429_does_not_tag_the_session_end_to_end() {
+        let calls = Arc::new(AtomicU64::new(0));
+        let up_calls = calls.clone();
+        let up_app = Router::new().route(
+            "/v1/chat/completions",
+            post(move || {
+                let up_calls = up_calls.clone();
+                async move {
+                    if up_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                        (
+                            StatusCode::TOO_MANY_REQUESTS,
+                            axum::Json(json!({"error": {"message": "slow down"}})),
+                        )
+                    } else {
+                        (
+                            StatusCode::OK,
+                            axum::Json(json!({
+                                "choices": [{"message": {"content": "ok"}, "finish_reason": "stop"}],
+                                "usage": {"prompt_tokens": 10, "completion_tokens": 5}
+                            })),
+                        )
+                    }
+                }
+            }),
+        );
+        let outcome = run_two_request_session(up_app).await;
+        assert_eq!(outcome.error_kind, None);
+        assert_eq!(outcome.error_status, None);
+    }
+
+    /// Spawn `up_app` as the upstream, point a fresh proxy session at it, drive two sequential
+    /// requests (draining each response so the stream's trailing success/finish signals land in
+    /// order), and return the finished session outcome.
+    async fn run_two_request_session(up_app: Router) -> SessionOutcome {
+        let up_listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let up_addr = up_listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(up_listener, up_app).await.unwrap();
+        });
+
+        let backend = ProxyBackend::new(
+            "127.0.0.1:0".parse().unwrap(),
+            Some("k".into()),
+            vec![],
+            serde_json::Map::new(),
+            Privacy::OpenRouter,
+            None,
+        )
+        .unwrap();
+        let pick = Pick {
+            canonical_key: "m".into(),
+            real_slug: "prov/m".into(),
+            endpoint: crate::VettedEndpoint::new(format!("http://{up_addr}/v1")),
+        };
+        let sess = backend.start(&pick, "al:al").await.unwrap();
+        let proxy_addr = sess.endpoint().unwrap();
+
+        let client = reqwest::Client::new();
+        for _ in 0..2 {
+            let resp = client
+                .post(format!("http://{proxy_addr}/v1/chat/completions"))
+                .json(&json!({"model": "al:al", "messages": []}))
+                .send()
+                .await
+                .unwrap();
+            // Draining the body runs the stream generator to completion, including the trailing
+            // note_success / note_finish_reason; the next request is issued only afterwards.
+            let _ = resp.text().await.unwrap();
+        }
+        sess.finish().await.unwrap()
+    }
+
     #[test]
     fn classify_http_separates_too_large_from_bad_request_and_rate_limit() {
         // 413 is its own signal (request too large / TPM cap), NOT a malformed 400 or a 429 throttle.
-        assert_eq!(classify_http(413), ErrorKind::TooLarge);
-        assert_eq!(classify_http(429), ErrorKind::RateLimit);
+        assert_eq!(classify_http(StatusCode::PAYLOAD_TOO_LARGE), ErrorKind::TooLarge);
+        assert_eq!(classify_http(StatusCode::TOO_MANY_REQUESTS), ErrorKind::RateLimit);
         // 404 is its own persistent avoid-signal (model/route unavailable to you), NOT a malformed 400.
-        assert_eq!(classify_http(404), ErrorKind::Unavailable);
-        assert_eq!(classify_http(400), ErrorKind::BadRequest);
-        assert_eq!(classify_http(422), ErrorKind::BadRequest);
-        assert_eq!(classify_http(401), ErrorKind::Auth);
-        assert_eq!(classify_http(503), ErrorKind::Http5xx);
+        assert_eq!(classify_http(StatusCode::NOT_FOUND), ErrorKind::Unavailable);
+        assert_eq!(classify_http(StatusCode::BAD_REQUEST), ErrorKind::BadRequest);
+        assert_eq!(
+            classify_http(StatusCode::UNPROCESSABLE_ENTITY),
+            ErrorKind::BadRequest
+        );
+        assert_eq!(classify_http(StatusCode::UNAUTHORIZED), ErrorKind::Auth);
+        assert_eq!(
+            classify_http(StatusCode::SERVICE_UNAVAILABLE),
+            ErrorKind::Http5xx
+        );
         // Unavailable is a full-weight avoid-signal (like TooLarge), and round-trips through the wire.
         assert_eq!(ErrorKind::Unavailable.loss_weight(), 1.0);
         assert_eq!(
@@ -941,6 +1128,66 @@ mod tests {
             Some(ErrorKind::Unavailable)
         );
         assert_eq!(ErrorKind::Unavailable.as_str(), "unavailable");
+    }
+
+    #[test]
+    fn failure_encoding_round_trips_and_never_collides_with_a_status() {
+        for f in [
+            Failure::Network,
+            Failure::BodyError,
+            Failure::Http(StatusCode::PAYLOAD_TOO_LARGE),
+            Failure::Http(StatusCode::TOO_MANY_REQUESTS),
+        ] {
+            assert_eq!(Failure::decode(f.encode()), Some(f));
+        }
+        // 0 is the "no failure" sentinel; the < 100 sentinels can never be a real HTTP status.
+        assert_eq!(Failure::decode(0), None);
+        assert!(Failure::Http(StatusCode::CONTINUE).encode() >= 100);
+    }
+
+    /// A terminal transport failure tags the session even when earlier requests completed cleanly —
+    /// the case that previously mislabelled a session (`truncated`/413) or dropped the kind entirely
+    /// (`NULL`/429) because a single earlier success suppressed the HTTP failure.
+    #[test]
+    fn terminal_failure_outranks_an_earlier_success() {
+        let cum = Cumulative::default();
+        cum.note_success(); // an earlier request completed cleanly
+        cum.note_http_error(StatusCode::PAYLOAD_TOO_LARGE); // …then the session died on a 413
+        assert_eq!(cum.error_kind(), Some(ErrorKind::TooLarge));
+        assert_eq!(cum.error_status(), Some(413));
+
+        let cum = Cumulative::default();
+        cum.note_success();
+        cum.note_http_error(StatusCode::TOO_MANY_REQUESTS); // …then a terminal 429
+        assert_eq!(cum.error_kind(), Some(ErrorKind::RateLimit));
+        assert_eq!(cum.error_status(), Some(429));
+    }
+
+    /// A failure the CLI recovered from (a later request succeeded) does not tag the session: the
+    /// stray status is dropped rather than recorded as the session's outcome.
+    #[test]
+    fn a_recovered_failure_does_not_tag_the_session() {
+        let cum = Cumulative::default();
+        cum.note_http_error(StatusCode::TOO_MANY_REQUESTS); // a mid-session throttle…
+        cum.note_success(); // …that the next request recovered from
+        assert_eq!(cum.error_kind(), None);
+        assert_eq!(cum.error_status(), None);
+    }
+
+    /// A terminal truncation (finish_reason=length) on the last completion still tags the session,
+    /// and the content-level tag only applies when no transport failure came after it.
+    #[test]
+    fn terminal_truncation_tags_when_no_later_failure() {
+        let cum = Cumulative::default();
+        cum.note_success();
+        cum.note_finish_reason("length");
+        assert_eq!(cum.error_kind(), Some(ErrorKind::Truncated));
+        assert_eq!(cum.error_status(), None); // no HTTP failure
+
+        // A transport failure after the truncated completion outranks the content tag.
+        cum.note_http_error(StatusCode::SERVICE_UNAVAILABLE);
+        assert_eq!(cum.error_kind(), Some(ErrorKind::Http5xx));
+        assert_eq!(cum.error_status(), Some(503));
     }
 
     /// A session whose requests all fail upstream is tagged with the derived error_kind and the raw
