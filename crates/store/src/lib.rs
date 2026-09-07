@@ -145,7 +145,7 @@ fn migrations() -> Migrations<'static> {
         // transcripts. Pure observability — never fed to the selector. Nullable, no CHECK, and it
         // references only itself, so a plain ADD COLUMN suffices (no table rebuild, as with the v2
         // cost_source addition). A recovered forensic finding motivated this: the wire carried cache
-        // hits up to 99.8% (kimi-k2.7) that the DB never saw because parse_usage dropped the field.
+        // hits up to 99.8% that the DB never saw because parse_usage dropped the field.
         M::up("ALTER TABLE session_end ADD COLUMN cached_prompt_tokens INTEGER;"),
     ])
 }

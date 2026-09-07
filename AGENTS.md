@@ -76,8 +76,30 @@ grows in place. Nothing in the core knows the proxy/network exists.
 
 ## Commit / repo hygiene
 
-- **No AI-assistant attribution or vendor names in commits or tracked files.** Keep the repo
-  vendor-neutral so any agent or contributor can pick it up.
+- **No AI-assistant attribution** in commits or tracked files.
+- **Keep the repo vendor-neutral where the vendor is incidental.** Two cases, and only the second
+  is a violation:
+  - **Load-bearing — required, keep.** A `Privacy` protocol is *defined by* its vendor: the variants
+    are named for them and `matches_endpoint` validates a configured `base_url` against a hard-coded
+    host (`crates/config/src/lib.rs`: `Privacy::OpenRouter => Some("openrouter.ai")`,
+    `Privacy::Groq => Some("api.groq.com")`). That check is fail-closed and load-bearing, and the
+    same names must appear in `config.example.toml` and the protocol docs or the feature is
+    unusable. Manual-setup text naming a vendor's console is the same case.
+  - **Incidental — use placeholders.** Example and test **model slugs**, and the `provider` field in
+    a fixture response body, are opaque to the code under test: nothing branches on them. Use
+    `example/model-a`, `example/model-b`, … and `example-provider`. A real slug there dates the
+    repo, implies an endorsement, and invites someone to copy it as a working default.
+
+  **The sharpest case is a comment that cites where a finding came from.** This is a public repo, so
+  "recovered from real `<model>` transcripts" or "cache hits up to 99.8% (`<model>`)" publishes *the
+  operator's own usage* — which models they run, that they capture wire traffic, and measurements
+  taken from their private session DB. Keep the engineering rationale, drop the identity: "recovered
+  from real provider transcripts" justifies the code just as well. Treat this as a privacy rule, not
+  a style one.
+
+  The narrower rule that the **non-ZDR** path names no vendor or model anywhere (source, tests,
+  examples, spec) still holds absolutely — that one protects blindness, not neutrality. See
+  `docs/specs/non-zdr-pay-with-data-routing.md`.
 - Never commit user state: the SQLite DB (which contains the blind key), wire archives, real
   `config.toml`, or secrets. `.gitignore` covers these.
 - Ship `config.example.toml`; keep the real config out of the tree.

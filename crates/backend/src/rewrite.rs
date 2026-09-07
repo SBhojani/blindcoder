@@ -150,7 +150,7 @@ fn replace_bytes(hay: &[u8], needle: &[u8], repl: &[u8]) -> Vec<u8> {
 }
 
 /// The slug strings to scrub from a response body: the full real slug, plus its **base** — the part
-/// before a `:variant` suffix (e.g. `qwen/qwen3-coder` for `qwen/qwen3-coder:free`). A provider error
+/// before a `:variant` suffix (e.g. `example/model-c` for `example/model-c:free`). A provider error
 /// often names the base rather than the full slug (e.g. suggesting the paid slug when a `:free` tier
 /// is retired), which a full-slug replace alone would miss — leaking the model family. Ordered
 /// longest-first so the full slug is consumed before its base prefix. Empty for an empty slug.
@@ -226,8 +226,8 @@ mod tests {
             "messages": [{"role": "user", "content": "hi"}],
             "temperature": 0.2,
         });
-        rewrite_request(&mut body, "moonshotai/kimi-k2-instruct", &Map::new()).unwrap();
-        assert_eq!(body["model"], "moonshotai/kimi-k2-instruct");
+        rewrite_request(&mut body, "example/model-a", &Map::new()).unwrap();
+        assert_eq!(body["model"], "example/model-a");
         assert_eq!(body["temperature"], 0.2);
         assert_eq!(body["messages"][0]["content"], "hi");
     }
@@ -283,7 +283,7 @@ mod tests {
         assert!(parse_usage(&json!({ "choices": [] })).is_none());
 
         // Prompt-cache hit reported in the OpenAI-wire `prompt_tokens_details.cached_tokens` shape
-        // (the exact shape recovered from real kimi-k2.7 / hy3-free WARC transcripts).
+        // (the exact shape recovered from real provider WARC transcripts).
         let cached = parse_usage(&json!({
             "usage": {
                 "prompt_tokens": 134782,
@@ -299,14 +299,13 @@ mod tests {
     #[test]
     fn mask_json_body_replaces_model_and_strips_fingerprints() {
         let body = serde_json::to_vec(&json!({
-            "id": "gen-123", "model": "openai/gpt-oss-120b", "provider": "AkashML",
+            "id": "gen-123", "model": "example/model-b", "provider": "example-provider",
             "system_fingerprint": "fp_x", "choices": [{"message": {"content": "hi"}}],
             "usage": {"prompt_tokens": 5, "completion_tokens": 3}
         }))
         .unwrap();
         let out: Value =
-            serde_json::from_slice(&mask_json_body(&body, "openai/gpt-oss-120b", "x7k2:q4m9"))
-                .unwrap();
+            serde_json::from_slice(&mask_json_body(&body, "example/model-b", "x7k2:q4m9")).unwrap();
         assert_eq!(out["model"], "x7k2:q4m9"); // real slug masked to alias
         assert!(out.get("provider").is_none()); // fingerprint stripped
         assert!(out.get("system_fingerprint").is_none());
@@ -318,13 +317,13 @@ mod tests {
     fn mask_json_body_scrubs_the_slug_from_an_error_message() {
         // The exact Groq deblind: no top-level `model` field, the real slug is inside error.message.
         let body = serde_json::to_vec(&json!({
-            "error": {"message": "Request too large for model `openai/gpt-oss-120b` in organization `org_abc`",
+            "error": {"message": "Request too large for model `example/model-b` in organization `org_abc`",
                       "code": "rate_limit_exceeded"}
         })).unwrap();
-        let out = mask_json_body(&body, "openai/gpt-oss-120b", "x7k2:q4m9");
+        let out = mask_json_body(&body, "example/model-b", "x7k2:q4m9");
         let text = String::from_utf8(out).unwrap();
         assert!(
-            !text.contains("openai/gpt-oss-120b"),
+            !text.contains("example/model-b"),
             "real slug must not survive in the error text"
         );
         assert!(text.contains("x7k2:q4m9"), "the alias replaces it");
@@ -340,12 +339,12 @@ mod tests {
         // slug, which the full-slug replace alone would miss.
         let body = serde_json::to_vec(&json!({
             "error": {"message": "This model is unavailable for free. The paid version is available \
-                                  now - use this slug instead: qwen/qwen3-coder", "code": 404}
+                                  now - use this slug instead: example/model-c", "code": 404}
         })).unwrap();
-        let out = mask_json_body(&body, "qwen/qwen3-coder:free", "tsr0:tjea");
+        let out = mask_json_body(&body, "example/model-c:free", "tsr0:tjea");
         let text = String::from_utf8(out).unwrap();
         assert!(
-            !text.contains("qwen/qwen3-coder"),
+            !text.contains("example/model-c"),
             "neither the full slug nor its base may survive: {text}"
         );
         assert!(text.contains("tsr0:tjea"), "the alias replaces it");
@@ -354,13 +353,10 @@ mod tests {
     #[test]
     fn slug_scrub_forms_adds_base_only_for_a_variant_slug() {
         assert_eq!(
-            slug_scrub_forms("qwen/qwen3-coder:free"),
-            vec!["qwen/qwen3-coder:free", "qwen/qwen3-coder"] // full first, then base
+            slug_scrub_forms("example/model-c:free"),
+            vec!["example/model-c:free", "example/model-c"] // full first, then base
         );
-        assert_eq!(
-            slug_scrub_forms("openai/gpt-oss-120b"),
-            vec!["openai/gpt-oss-120b"]
-        );
+        assert_eq!(slug_scrub_forms("example/model-b"), vec!["example/model-b"]);
         assert!(slug_scrub_forms("").is_empty());
     }
 
@@ -377,8 +373,8 @@ mod tests {
     #[test]
     fn mask_sse_line_masks_data_frames_only() {
         let masked = mask_sse_line(
-            r#"data: {"model":"qwen/qwen3.6-35b-a3b","provider":"AkashML"}"#,
-            "qwen/qwen3.6-35b-a3b",
+            r#"data: {"model":"example/model-d","provider":"example-provider"}"#,
+            "example/model-d",
             "al:al",
         );
         let v: Value = serde_json::from_str(masked.strip_prefix("data: ").unwrap()).unwrap();

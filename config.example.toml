@@ -120,8 +120,8 @@ curated_policy_max_age_days = 90
 # privacy = "groq"
 #
 #   [[providers.models]]
-#   canonical_key = "kimi-k2"
-#   real_slug = "moonshotai/kimi-k2-instruct"
+#   canonical_key = "model-a"
+#   real_slug = "example/model-a-instruct"
 
 # A priced gateway provider (same model, priced; attribution header + routing body knobs).
 # On a gateway like OpenRouter a model is served by several providers at DIFFERENT prices; the
@@ -153,7 +153,7 @@ curated_policy_max_age_days = 90
 # extra_body = { "provider" = { "sort" = "price" } }
 #
 #   [[providers.models]]
-#   canonical_key = "kimi-k2"            # same model as above → shared quality belief
-#   real_slug = "moonshotai/kimi-k2"
+#   canonical_key = "model-a"            # same model as above → shared quality belief
+#   real_slug = "example/model-a"
 #   input_per_mtok = 0.55
 #   output_per_mtok = 2.2
