@@ -369,8 +369,8 @@ struct Cumulative {
     seq: AtomicU64,              // event counter; each stamp is a distinct value >= 1
     last_success_seq: AtomicU64, // stamp of the most recent clean completion (0 = none)
     last_failure_seq: AtomicU64, // stamp of the most recent transport/body failure (0 = none)
-    last_failure: AtomicU64,     // the most recent failure, encoded via `Failure::encode` (0 = none)
-    content_issue: AtomicU64,    // 0 = none, 1 = truncated (length), 2 = refused (content_filter)
+    last_failure: AtomicU64, // the most recent failure, encoded via `Failure::encode` (0 = none)
+    content_issue: AtomicU64, // 0 = none, 1 = truncated (length), 2 = refused (content_filter)
 }
 
 impl Cumulative {
@@ -425,7 +425,8 @@ impl Cumulative {
     /// observes the new stamp also observes the matching failure.
     fn note_failure(&self, failure: Failure) {
         self.last_failure.store(failure.encode(), Ordering::Relaxed);
-        self.last_failure_seq.store(self.next_seq(), Ordering::Relaxed);
+        self.last_failure_seq
+            .store(self.next_seq(), Ordering::Relaxed);
     }
     fn note_network(&self) {
         self.note_failure(Failure::Network);
@@ -434,7 +435,8 @@ impl Cumulative {
         self.note_failure(Failure::Http(status));
     }
     fn note_success(&self) {
-        self.last_success_seq.store(self.next_seq(), Ordering::Relaxed);
+        self.last_success_seq
+            .store(self.next_seq(), Ordering::Relaxed);
     }
     fn note_body_error(&self) {
         self.note_failure(Failure::BodyError);
@@ -1095,11 +1097,20 @@ mod tests {
     #[test]
     fn classify_http_separates_too_large_from_bad_request_and_rate_limit() {
         // 413 is its own signal (request too large / TPM cap), NOT a malformed 400 or a 429 throttle.
-        assert_eq!(classify_http(StatusCode::PAYLOAD_TOO_LARGE), ErrorKind::TooLarge);
-        assert_eq!(classify_http(StatusCode::TOO_MANY_REQUESTS), ErrorKind::RateLimit);
+        assert_eq!(
+            classify_http(StatusCode::PAYLOAD_TOO_LARGE),
+            ErrorKind::TooLarge
+        );
+        assert_eq!(
+            classify_http(StatusCode::TOO_MANY_REQUESTS),
+            ErrorKind::RateLimit
+        );
         // 404 is its own persistent avoid-signal (model/route unavailable to you), NOT a malformed 400.
         assert_eq!(classify_http(StatusCode::NOT_FOUND), ErrorKind::Unavailable);
-        assert_eq!(classify_http(StatusCode::BAD_REQUEST), ErrorKind::BadRequest);
+        assert_eq!(
+            classify_http(StatusCode::BAD_REQUEST),
+            ErrorKind::BadRequest
+        );
         assert_eq!(
             classify_http(StatusCode::UNPROCESSABLE_ENTITY),
             ErrorKind::BadRequest
