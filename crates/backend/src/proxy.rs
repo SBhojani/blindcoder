@@ -86,7 +86,6 @@ fn classify_http(status: StatusCode) -> ErrorKind {
 /// (no launched command, ended by Ctrl-C) would otherwise outlive its window and route non-ZDR
 /// traffic indefinitely past `expires`. The blocking open/write/fsync runs on tokio's blocking
 /// pool via [`NonZdrAudit::append`], never on an async worker.
-#[cfg(feature = "allow-non-zdr")]
 #[derive(Clone, Debug)]
 pub struct NonZdrAudit {
     path: PathBuf,
@@ -98,7 +97,6 @@ pub struct NonZdrAudit {
 
 /// Why [`NonZdrAudit`] refused to witness a request. Every variant is fail-closed: the caller
 /// must refuse the request — never forward unwitnessed.
-#[cfg(feature = "allow-non-zdr")]
 #[derive(Debug)]
 enum AuditRefusal {
     /// The attestation carries no bounded lifetime — such a capability can never arm.
@@ -111,7 +109,6 @@ enum AuditRefusal {
     Join,
 }
 
-#[cfg(feature = "allow-non-zdr")]
 impl std::fmt::Display for AuditRefusal {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -123,7 +120,6 @@ impl std::fmt::Display for AuditRefusal {
     }
 }
 
-#[cfg(feature = "allow-non-zdr")]
 impl From<std::io::Error> for AuditRefusal {
     fn from(e: std::io::Error) -> Self {
         Self::Io(e)
@@ -131,13 +127,11 @@ impl From<std::io::Error> for AuditRefusal {
 }
 
 /// Render an epoch-day count back to `YYYY-MM-DD` for a refusal message.
-#[cfg(feature = "allow-non-zdr")]
 fn format_expiry(days: i64) -> String {
     chrono::DateTime::from_timestamp(days.saturating_mul(86_400), 0)
         .map_or_else(|| days.to_string(), |dt| dt.format("%Y-%m-%d").to_string())
 }
 
-#[cfg(feature = "allow-non-zdr")]
 impl NonZdrAudit {
     /// Async front-end for [`Self::append_sync`]: runs the durable append on tokio's blocking
     /// pool so the open/fsync never stalls an async worker. The caller still awaits completion
@@ -202,7 +196,6 @@ pub struct ProxyBackend {
     privacy: Privacy,
     capture_path: Option<PathBuf>,
     /// `Some` when this session routes to a `no-zdr` model: the per-request audit sink.
-    #[cfg(feature = "allow-non-zdr")]
     non_zdr_audit: Option<NonZdrAudit>,
     client: reqwest::Client,
 }
@@ -226,7 +219,6 @@ impl ProxyBackend {
             extra_body,
             privacy,
             capture_path,
-            #[cfg(feature = "allow-non-zdr")]
             non_zdr_audit: None,
             client: reqwest::Client::builder()
                 .build()
@@ -240,9 +232,8 @@ impl ProxyBackend {
     /// `config::date_to_epoch_days` of the provider's `expires`; `None` refuses every request,
     /// so an unbounded capability can never arm. The path is the whole configuration beyond
     /// that — no session identity crosses this boundary, so the log can never join onto the
-    /// store's ratings; see [`NonZdrAudit`]. Only meaningful — and only compiled — on the opt-in
-    /// routing path; the router calls this solely when the pick landed on a `no-zdr` model.
-    #[cfg(feature = "allow-non-zdr")]
+    /// store's ratings; see [`NonZdrAudit`]. The router calls this solely when the pick landed on a
+    /// `no-zdr` model.
     pub fn with_non_zdr_audit(mut self, path: PathBuf, expires_epoch_days: Option<i64>) -> Self {
         self.non_zdr_audit = Some(NonZdrAudit {
             path,
@@ -514,7 +505,6 @@ struct ProxyState {
     exchange_seq: AtomicU64,
     /// `Some` when this session routes to a `no-zdr` model: append before every forward, refuse on
     /// failure (fail-closed).
-    #[cfg(feature = "allow-non-zdr")]
     non_zdr_audit: Option<NonZdrAudit>,
 }
 
@@ -617,7 +607,6 @@ async fn proxy_handler(
     // any refusal — a filesystem failure or an expired/unbounded attestation — refuses the
     // request. The blocking open/write/fsync runs on tokio's blocking pool, off the async
     // workers; the await still completes before anything is sent upstream.
-    #[cfg(feature = "allow-non-zdr")]
     if let Some(audit) = &st.non_zdr_audit {
         if let Err(e) = audit.append(&st.real_slug).await {
             return (
@@ -812,7 +801,6 @@ impl Backend for ProxyBackend {
             cumulative: cumulative.clone(),
             capture_tx,
             exchange_seq: AtomicU64::new(0),
-            #[cfg(feature = "allow-non-zdr")]
             non_zdr_audit: self.non_zdr_audit.clone(),
         });
 
@@ -1277,11 +1265,10 @@ mod tests {
         );
     }
 
-    /// The non-ZDR accountability trail (feature-gated): every forwarded request appends one
+    /// The non-ZDR accountability trail: every forwarded request appends one
     /// `<UTC hour> \t real_slug` line to the 0600 audit file. Aggregate accountability only:
     /// no session id (the store keys ratings on it — an id would join the file onto the ratings
     /// table and deblind), no alias, and no sub-hour time precision.
-    #[cfg(feature = "allow-non-zdr")]
     #[tokio::test]
     async fn non_zdr_audit_appends_one_line_per_forwarded_request() {
         let up_app = Router::new().route(
@@ -1364,7 +1351,6 @@ mod tests {
 
     /// Fail-closed: when the audit record cannot be written the request is REFUSED — the upstream
     /// must never see it. (The audit path is a directory, so every append fails.)
-    #[cfg(feature = "allow-non-zdr")]
     #[tokio::test]
     async fn non_zdr_audit_failure_refuses_the_request() {
         let hit = Arc::new(AtomicBool::new(false));
@@ -1421,11 +1407,10 @@ mod tests {
         );
     }
 
-    /// The per-request expiry bound (feature-gated): once the armed attestation's `expires`
+    /// The per-request expiry bound: once the armed attestation's `expires`
     /// date has passed, a STANDING proxy refuses further non-ZDR routing — fail-closed, the
     /// upstream never sees anything. This is what makes the 30-day cap a true maximum even when
     /// the proxy outlives the window it was started inside.
-    #[cfg(feature = "allow-non-zdr")]
     #[tokio::test]
     async fn non_zdr_expiry_refuses_a_standing_proxies_requests() {
         let hit = Arc::new(AtomicBool::new(false));
@@ -1488,7 +1473,6 @@ mod tests {
     /// File-level mirror of run.rs's dir-tightening test: `.mode(0o600)` applies only at
     /// creation, so a pre-existing looser audit file (older build, manual touch, umask) must be
     /// tightened idempotently before records land in it.
-    #[cfg(feature = "allow-non-zdr")]
     #[test]
     fn non_zdr_audit_file_gets_0600_even_when_it_pre_exists_looser() {
         use std::os::unix::fs::PermissionsExt;
@@ -1523,7 +1507,6 @@ mod tests {
 
     /// Expiry refusals are fail-closed and write nothing: an attestation whose window ended — or
     /// that carries no bounded lifetime at all — refuses the append itself.
-    #[cfg(feature = "allow-non-zdr")]
     #[test]
     fn non_zdr_audit_refuses_expired_or_unbounded_attestations() {
         let tmp = tempfile::tempdir().unwrap();
@@ -1563,7 +1546,6 @@ mod tests {
     /// Many threads appending to the SAME path (the shared-log situation two blindcoder processes
     /// would hit) must therefore produce exactly one intact, parseable line per append — never
     /// interleaved fragments.
-    #[cfg(feature = "allow-non-zdr")]
     #[test]
     fn non_zdr_audit_concurrent_appends_stay_whole_lines() {
         const THREADS: usize = 8;

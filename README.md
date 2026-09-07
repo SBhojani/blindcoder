@@ -176,11 +176,11 @@ to prove it structurally rather than by hope:
 - **The append-only store cannot be quietly rewritten.** Corrections supersede; database
   triggers reject edits and deletes.
 - **Non-ZDR routing exists only as a multi-gated opt-in.** A `privacy = "no-zdr"` provider (a
-  pay-with-data endpoint that may log or train on prompts) is refused by default builds; it
-  requires a binary built with the `allow-non-zdr` Cargo feature, and further per-provider and
-  per-session attestations that surface one at a time at startup. Sessions containing such a
-  model are bannered as non-private and every routed request lands in a fail-closed audit file.
-  The ZDR pool's guarantees are unchanged.
+  pay-with-data endpoint that may log or train on prompts) is inert unless configured, and then
+  refused until per-provider and per-session attestations — which surface one at a time at
+  startup — are all satisfied. Sessions containing such a model are bannered as non-private and
+  every routed request lands in a fail-closed audit file. The ZDR pool's guarantees are
+  unchanged.
 
 ## Roadmap
 

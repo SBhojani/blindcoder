@@ -120,9 +120,8 @@ pub struct ProviderConfig {
     /// a blanket boolean, so a provider cannot be opted out once and then silently grow a second
     /// model. Like the flattened attestations, the key is intentionally absent from
     /// `config.example.toml` and the docs — it is revealed only by the fail-closed startup error
-    /// (see [`Privacy::non_zdr_attestation_key`]), and only after the build-feature gate passes.
-    /// Rejected on any other privacy protocol. The field parses in every build so a default
-    /// (feature-less) build fails with the feature-gate error, never a confusing parse error.
+    /// (see [`Privacy::non_zdr_attestation_key`]), as the first gate of the startup consent chain.
+    /// Rejected on any other privacy protocol.
     #[serde(default, rename = "no_zdr_models_i_accept_training_on")]
     pub non_zdr_attested_models: Vec<String>,
     /// Bounded lifetime of a `no-zdr` provider's consent, as a `"YYYY-MM-DD"` date. Required for
@@ -155,10 +154,8 @@ pub enum Privacy {
     Groq,
     /// A non-ZDR / pay-with-data endpoint: the provider may log or train on prompts. Config value:
     /// `"no-zdr"`. Provider-agnostic — no endpoint-host binding and no wire injection; the
-    /// enforcement is the multi-gate consent chain the router runs at startup (build feature +
-    /// per-model attestation + expiry + environment second factor + invocation flag), not this
-    /// variant. The variant itself parses in every build so a default (feature-less) build can
-    /// refuse it with the feature-gate error instead of an opaque parse failure.
+    /// enforcement is the multi-gate consent chain the router runs at startup (per-model
+    /// attestation + expiry + environment second factor + invocation flag), not this variant.
     NoZdr,
 }
 

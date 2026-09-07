@@ -211,16 +211,13 @@ fn validate_pool_privacy(cfg: &Config) -> Result<()> {
     Ok(())
 }
 
-/// (allow-non-zdr only) The environment second factor of the non-ZDR consent chain: must be set,
-/// non-empty, at launch. A committed config can therefore never arm non-ZDR routing on its own.
-/// The literal lives only in source and in the reveal error — never in docs, the example config,
-/// or `--help`.
-#[cfg(feature = "allow-non-zdr")]
+/// The environment second factor of the non-ZDR consent chain: must be set, non-empty, at launch.
+/// A committed config can therefore never arm non-ZDR routing on its own. The literal lives only
+/// in source and in the reveal error — never in docs, the example config, or `--help`.
 const NON_ZDR_ENV_VAR: &str = "BLINDCODER_NON_ZDR_SESSION_OK";
 
-/// (allow-non-zdr only) Hard cap on how far ahead a `no-zdr` provider's `expires` may be dated —
-/// the maximum time the capability can stay armed per attestation. Revealed only when violated.
-#[cfg(feature = "allow-non-zdr")]
+/// Hard cap on how far ahead a `no-zdr` provider's `expires` may be dated — the maximum time the
+/// capability can stay armed per attestation. Revealed only when violated.
 const NON_ZDR_MAX_ARM_DAYS: i64 = 30;
 
 /// The session-level non-ZDR disclosure text. Session-level ONLY: naming the alias (or the
@@ -228,7 +225,6 @@ const NON_ZDR_MAX_ARM_DAYS: i64 = 30;
 /// requests hit the non-ZDR arm, the whole session must be treated as non-private anyway.
 /// Emitted once before launch, and re-asserted after a LAUNCHED CLI exits (see
 /// [`disclosure_reassertion`] — a full-screen agentic TUI buries whatever preceded it).
-#[cfg(feature = "allow-non-zdr")]
 const NON_ZDR_DISCLOSURE: &str = "\
 !! NON-ZDR SESSION: this pool contains a model on a non-ZDR endpoint — its provider may log or \
 train on prompts. Which alias it is stays blind, so treat EVERYTHING sent in this session as \
@@ -247,6 +243,8 @@ fn validate_non_zdr_gates(
     env_present: bool,
     today_days: i64,
 ) -> Result<bool> {
+    use std::collections::BTreeSet;
+
     let non_zdr: Vec<&ProviderConfig> = cfg
         .providers
         .iter()
@@ -256,112 +254,95 @@ fn validate_non_zdr_gates(
         return Ok(false);
     }
 
-    // Gate 1 (documented): the routing path must be compiled in at all.
-    #[cfg(not(feature = "allow-non-zdr"))]
-    {
-        let _ = (flag_passed, env_present, today_days);
+    for p in &non_zdr {
+        // Gate 1: the per-model attestation — the exact real_slug of EVERY model under this
+        // provider, so a provider cannot be opted out once and silently grow a second model.
+        let key = Privacy::NoZdr
+            .non_zdr_attestation_key()
+            .expect("no-zdr defines its attestation key");
+        if p.non_zdr_attested_models.is_empty() {
+            anyhow::bail!(
+                "provider {:?} uses privacy = \"no-zdr\": its endpoint may log or train on \
+                 every prompt sent to it, and blindcoder will not route there on the strength \
+                 of a config value alone. Consent is per model — add\n\n\
+                 \x20   {} = [\"…\"]\n\n\
+                 to this provider, listing the exact `real_slug` of every model it offers.",
+                p.slug,
+                key
+            );
+        }
+        let want: BTreeSet<&str> = p.models.iter().map(|m| m.real_slug.as_str()).collect();
+        let have: BTreeSet<&str> = p
+            .non_zdr_attested_models
+            .iter()
+            .map(String::as_str)
+            .collect();
+        if have != want {
+            let missing: Vec<&&str> = want.difference(&have).collect();
+            let extra: Vec<&&str> = have.difference(&want).collect();
+            anyhow::bail!(
+                "provider {:?}: the non-ZDR model attestation must match this provider's \
+                 models exactly, by `real_slug`. Unattested models: {:?}; attested but not \
+                 among the provider's models: {:?}.",
+                p.slug,
+                missing,
+                extra
+            );
+        }
+
+        // Gate 1½: a bounded lifetime. Absent → required; past → hard stop; too far ahead →
+        // only now reveal the arming cap.
+        let Some(expires) = p.expires.as_deref() else {
+            anyhow::bail!(
+                "provider {:?}: a non-ZDR attestation must carry a bounded lifetime — add \
+                 `expires = \"YYYY-MM-DD\"` to this provider.",
+                p.slug
+            );
+        };
+        let Some(expiry_days) = config::date_to_epoch_days(expires) else {
+            anyhow::bail!(
+                "provider {:?}: `expires` must be a \"YYYY-MM-DD\" date (got {:?}).",
+                p.slug,
+                expires
+            );
+        };
+        if expiry_days < today_days {
+            anyhow::bail!(
+                "provider {:?}: its non-ZDR attestation expired on {} — refusing to start. \
+                 Renew the attestation deliberately if you still mean it.",
+                p.slug,
+                expires
+            );
+        }
+        if expiry_days > today_days + NON_ZDR_MAX_ARM_DAYS {
+            anyhow::bail!(
+                "provider {:?}: `expires` = {} is more than {} days out. A non-ZDR attestation \
+                 may be dated at most {} days ahead — a hard cap on how long the capability \
+                 stays armed, not a reminder. Refusing to start.",
+                p.slug,
+                expires,
+                NON_ZDR_MAX_ARM_DAYS,
+                NON_ZDR_MAX_ARM_DAYS
+            );
+        }
+    }
+
+    // Gate 2: the per-session environment second factor — lives in no file.
+    if !env_present {
         anyhow::bail!(
-            "provider {:?} declares privacy = \"no-zdr\" — a pay-with-data endpoint whose provider \
-             may log or train on prompts — but this build compiled that routing path out. \
-             Rebuild with the `allow-non-zdr` Cargo feature to proceed.",
-            non_zdr[0].slug
+            "the non-ZDR pool is configured and attested, but the per-session second factor is \
+             missing: set {NON_ZDR_ENV_VAR}=1 in the launching environment. A config file \
+             alone can never arm non-ZDR routing."
         );
     }
-
-    #[cfg(feature = "allow-non-zdr")]
-    {
-        use std::collections::BTreeSet;
-
-        for p in &non_zdr {
-            // Gate 2: the per-model attestation — the exact real_slug of EVERY model under this
-            // provider, so a provider cannot be opted out once and silently grow a second model.
-            let key = Privacy::NoZdr
-                .non_zdr_attestation_key()
-                .expect("no-zdr defines its attestation key");
-            if p.non_zdr_attested_models.is_empty() {
-                anyhow::bail!(
-                    "provider {:?} uses privacy = \"no-zdr\": its endpoint may log or train on \
-                     every prompt sent to it, and blindcoder will not route there on the strength \
-                     of a config value alone. Consent is per model — add\n\n\
-                     \x20   {} = [\"…\"]\n\n\
-                     to this provider, listing the exact `real_slug` of every model it offers.",
-                    p.slug,
-                    key
-                );
-            }
-            let want: BTreeSet<&str> = p.models.iter().map(|m| m.real_slug.as_str()).collect();
-            let have: BTreeSet<&str> = p
-                .non_zdr_attested_models
-                .iter()
-                .map(String::as_str)
-                .collect();
-            if have != want {
-                let missing: Vec<&&str> = want.difference(&have).collect();
-                let extra: Vec<&&str> = have.difference(&want).collect();
-                anyhow::bail!(
-                    "provider {:?}: the non-ZDR model attestation must match this provider's \
-                     models exactly, by `real_slug`. Unattested models: {:?}; attested but not \
-                     among the provider's models: {:?}.",
-                    p.slug,
-                    missing,
-                    extra
-                );
-            }
-
-            // Gate 2½: a bounded lifetime. Absent → required; past → hard stop; too far ahead →
-            // only now reveal the arming cap.
-            let Some(expires) = p.expires.as_deref() else {
-                anyhow::bail!(
-                    "provider {:?}: a non-ZDR attestation must carry a bounded lifetime — add \
-                     `expires = \"YYYY-MM-DD\"` to this provider.",
-                    p.slug
-                );
-            };
-            let Some(expiry_days) = config::date_to_epoch_days(expires) else {
-                anyhow::bail!(
-                    "provider {:?}: `expires` must be a \"YYYY-MM-DD\" date (got {:?}).",
-                    p.slug,
-                    expires
-                );
-            };
-            if expiry_days < today_days {
-                anyhow::bail!(
-                    "provider {:?}: its non-ZDR attestation expired on {} — refusing to start. \
-                     Renew the attestation deliberately if you still mean it.",
-                    p.slug,
-                    expires
-                );
-            }
-            if expiry_days > today_days + NON_ZDR_MAX_ARM_DAYS {
-                anyhow::bail!(
-                    "provider {:?}: `expires` = {} is more than {} days out. A non-ZDR attestation \
-                     may be dated at most {} days ahead — a hard cap on how long the capability \
-                     stays armed, not a reminder. Refusing to start.",
-                    p.slug,
-                    expires,
-                    NON_ZDR_MAX_ARM_DAYS,
-                    NON_ZDR_MAX_ARM_DAYS
-                );
-            }
-        }
-
-        // Gate 3: the per-session environment second factor — lives in no file.
-        if !env_present {
-            anyhow::bail!(
-                "the non-ZDR pool is configured and attested, but the per-session second factor is \
-                 missing: set {NON_ZDR_ENV_VAR}=1 in the launching environment. A config file \
-                 alone can never arm non-ZDR routing."
-            );
-        }
-        // Gate 4: the per-invocation flag — the final deliberate act, hidden from --help.
-        if !flag_passed {
-            anyhow::bail!(
-                "non-ZDR routing is one deliberate act away: pass --route-non-zdr-this-run on \
-                 this invocation to route to a non-ZDR endpoint for this run."
-            );
-        }
-        Ok(true)
+    // Gate 3: the per-invocation flag — the final deliberate act, hidden from --help.
+    if !flag_passed {
+        anyhow::bail!(
+            "non-ZDR routing is one deliberate act away: pass --route-non-zdr-this-run on \
+             this invocation to route to a non-ZDR endpoint for this run."
+        );
     }
+    Ok(true)
 }
 
 /// Build the candidate pool: fold each model's effective ratings (by `canonical_key`, decayed) into
@@ -456,7 +437,6 @@ fn choose<R: Rng + ?Sized>(cands: &[Candidate], t: &Tuneables, rng: &mut R) -> u
 /// operator reads the session summary and answers the still-blind rating prompt. A standing
 /// proxy never covers the terminal, so its original banner stays visible and gets no repeat.
 /// Pure so the launcher-only rule is unit-testable.
-#[cfg(feature = "allow-non-zdr")]
 fn disclosure_reassertion(
     non_zdr_armed: bool,
     launched_command: &[String],
@@ -469,7 +449,6 @@ fn disclosure_reassertion(
 /// that a pay-with-data endpoint is configured — a bit every local user could otherwise read off
 /// a world-traversable directory listing. Parent directories keep default permissions; only the
 /// leaf is private. Idempotent.
-#[cfg(feature = "allow-non-zdr")]
 fn ensure_private_dir(dir: &std::path::Path) -> std::io::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     if let Some(parent) = dir.parent() {
@@ -493,16 +472,11 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     // violation (fail-closed) — before any network, store write, or pick.
     validate_pool_privacy(cfg)?;
 
-    // The non-ZDR consent chain (dormant unless a `no-zdr` provider is configured). The flag and
-    // env-var reads exist only on the opt-in build; a default build passes inert values and the
-    // chain can only refuse (or stay dormant).
-    #[cfg(feature = "allow-non-zdr")]
+    // The non-ZDR consent chain (dormant unless a `no-zdr` provider is configured).
     let (non_zdr_flag, non_zdr_env) = (
         args.route_non_zdr_this_run,
         std::env::var(NON_ZDR_ENV_VAR).is_ok_and(|v| !v.trim().is_empty()),
     );
-    #[cfg(not(feature = "allow-non-zdr"))]
-    let (non_zdr_flag, non_zdr_env) = (false, false);
     let non_zdr_armed =
         validate_non_zdr_gates(cfg, non_zdr_flag, non_zdr_env, config::today_epoch_days())?;
     if non_zdr_armed {
@@ -510,12 +484,7 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
         // per-request route) would deblind the harness. This copy fires before launch; a launched
         // CLI buries it the moment it paints its full-screen UI, so run() re-asserts it once the
         // child exits and releases the terminal.
-        // A default build can never get here (the chain above refuses), so the emission — and
-        // with it the disclosure constant — exists only on the opt-in build.
-        #[cfg(feature = "allow-non-zdr")]
         eprintln!("\n{NON_ZDR_DISCLOSURE}\n");
-        #[cfg(not(feature = "allow-non-zdr"))]
-        unreachable!("a default build cannot arm non-ZDR routing");
     }
 
     let store = open_store()?;
@@ -616,7 +585,6 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     // session (and could be read mid-session to unmask it before rating). Unmasking stays the
     // reveal gate's job alone. The log lives in a 0700 directory: its mere existence admits a
     // pay-with-data endpoint is configured.
-    #[cfg(feature = "allow-non-zdr")]
     let backend = if privacy == Privacy::NoZdr {
         let dir = config::default_state_dir()
             .context("cannot determine state dir (set XDG_STATE_HOME or HOME)")?;
@@ -664,7 +632,6 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     // Launcher mode buried the pre-launch disclosure (the child took over the terminal);
     // re-assert it now that the child has exited and released the terminal — the operator sees
     // it again directly above the summary and the rating prompt they answer while still blind.
-    #[cfg(feature = "allow-non-zdr")]
     if let Some(disclosure) = disclosure_reassertion(non_zdr_armed, &args.command) {
         eprintln!("{disclosure}");
     }
@@ -1263,7 +1230,6 @@ pub struct RunArgs {
     // The final gate of the non-ZDR consent chain: per-invocation, hidden from --help, revealed
     // only by the startup error once every earlier gate has passed. (A regular comment, not a doc
     // comment — a doc comment would become clap help text.)
-    #[cfg(feature = "allow-non-zdr")]
     #[arg(long, hide = true)]
     pub route_non_zdr_this_run: bool,
 }
@@ -1745,30 +1711,8 @@ mod tests {
         assert!(err.contains("no-zdr"), "{err}");
     }
 
-    /// Reveal order 0: on a default (feature-less) build, a `no-zdr` provider is refused with the
-    /// documented feature requirement — and none of the undocumented later gates leak.
-    #[cfg(not(feature = "allow-non-zdr"))]
-    #[test]
-    fn default_build_reveals_only_the_feature_requirement() {
-        // Even a fully attested config must stop at the feature gate.
-        let c = no_zdr_cfg(&["example/non-zdr-model"], Some("2026-09-01"));
-        let err = validate_non_zdr_gates(&c, true, true, 0)
-            .unwrap_err()
-            .to_string();
-        assert!(err.contains("allow-non-zdr"), "{err}");
-        for later in [
-            "no_zdr_models_i_accept_training_on",
-            "expires",
-            "BLINDCODER",
-            "--route",
-        ] {
-            assert!(!err.contains(later), "must not leak {later:?}: {err}");
-        }
-    }
-
     /// The ordered, short-circuiting reveal chain: each run surfaces exactly one gate's
     /// requirement, never a later token before an earlier gate passes.
-    #[cfg(feature = "allow-non-zdr")]
     #[test]
     fn non_zdr_chain_reveals_one_gate_per_run_in_order() {
         let today = config::date_to_epoch_days("2026-08-23").unwrap();
@@ -1872,13 +1816,12 @@ mod tests {
             .to_string();
         assert!(err.contains("--route-non-zdr-this-run"), "{err}");
 
-        // ✓: all four satisfied → armed.
+        // ✓: all gates satisfied → armed.
         assert!(validate_non_zdr_gates(&ok_cfg, true, true, today).unwrap());
     }
 
-    /// Requirement 9: the cost path is fully live for a `no-zdr` model — it is priced and
+    /// Requirement 8: the cost path is fully live for a `no-zdr` model — it is priced and
     /// normalized exactly like any other provider (non-ZDR does not imply free).
-    #[cfg(feature = "allow-non-zdr")]
     #[test]
     fn non_zdr_model_is_priced_like_any_other() {
         let store = Store::open_in_memory().unwrap();
@@ -2084,7 +2027,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "allow-non-zdr")]
     #[test]
     fn disclosure_is_re_asserted_only_for_a_launched_armed_session() {
         // Armed + launched: the pre-launch copy was buried by the child's full-screen UI, so the
@@ -2103,7 +2045,6 @@ mod tests {
         assert_eq!(disclosure_reassertion(false, &launched), None);
     }
 
-    #[cfg(feature = "allow-non-zdr")]
     #[test]
     fn audit_dir_gets_0700_even_when_it_pre_exists_looser() {
         use std::os::unix::fs::PermissionsExt;
