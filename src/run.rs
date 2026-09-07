@@ -110,10 +110,27 @@ fn ensure_alias<R: Rng + ?Sized>(
     Ok(a)
 }
 
+/// Whether this run may route to `p`. A pay-with-data (`no-zdr`) provider is excluded from the pool
+/// unless the invocation opted in with `--enable-pay-with-data`. Without that opt-in the arm is
+/// simply absent, so an un-armed — or expired, or misattested — pay-with-data block cannot fail the
+/// run: the consent chain is never even consulted. One definition, used by both pool passes.
+fn in_pool(p: &ProviderConfig, include_pay_with_data: bool) -> bool {
+    include_pay_with_data || p.privacy != Some(Privacy::NoZdr)
+}
+
 /// Reflect the config pool into the store: upsert providers/models, append changed prices, and mint
 /// any missing aliases. Idempotent — safe to run on every `run`.
-fn seed_pool<R: Rng + ?Sized>(store: &Store, cfg: &Config, rng: &mut R) -> Result<()> {
-    for p in &cfg.providers {
+fn seed_pool<R: Rng + ?Sized>(
+    store: &Store,
+    cfg: &Config,
+    include_pay_with_data: bool,
+    rng: &mut R,
+) -> Result<()> {
+    for p in cfg
+        .providers
+        .iter()
+        .filter(|p| in_pool(p, include_pay_with_data))
+    {
         store.upsert_provider(&p.slug, &p.base_url, &p.wire)?;
         for m in &p.models {
             store.upsert_model(&m.canonical_key, &p.slug, &m.real_slug)?;
@@ -348,7 +365,11 @@ fn validate_non_zdr_gates(
 /// Build the candidate pool: fold each model's effective ratings (by `canonical_key`, decayed) into
 /// a track record, pair it with the entry's normalized price. Returns candidates aligned with the
 /// entries by index.
-fn build_pool(store: &Store, cfg: &Config) -> Result<(Vec<Candidate>, Vec<PoolEntry>)> {
+fn build_pool(
+    store: &Store,
+    cfg: &Config,
+    include_pay_with_data: bool,
+) -> Result<(Vec<Candidate>, Vec<PoolEntry>)> {
     let t = cfg.tuneables();
 
     // Fold ratings once, grouped by the provider-neutral identity the selector learns on.
@@ -381,7 +402,11 @@ fn build_pool(store: &Store, cfg: &Config) -> Result<(Vec<Candidate>, Vec<PoolEn
     let no_fails: Vec<Failure> = Vec::new();
 
     let mut entries = Vec::new();
-    for p in &cfg.providers {
+    for p in cfg
+        .providers
+        .iter()
+        .filter(|p| in_pool(p, include_pay_with_data))
+    {
         for m in &p.models {
             let alias = store
                 .alias_for(&m.canonical_key, &p.slug)?
@@ -398,6 +423,20 @@ fn build_pool(store: &Store, cfg: &Config) -> Result<(Vec<Candidate>, Vec<PoolEn
     }
 
     if entries.is_empty() {
+        // Distinguish "nothing configured" from "everything configured was pruned" — otherwise
+        // excluding the only arm reads as a missing config.
+        if !include_pay_with_data
+            && cfg
+                .providers
+                .iter()
+                .any(|p| p.privacy == Some(Privacy::NoZdr))
+        {
+            anyhow::bail!(
+                "no candidates in the pool — every configured provider is pay-with-data, and this \
+                 run excluded them. Pass --enable-pay-with-data to route to them, or configure a \
+                 ZDR provider."
+            );
+        }
         anyhow::bail!("no candidates in the pool — no models are configured");
     }
 
@@ -472,13 +511,31 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     // violation (fail-closed) — before any network, store write, or pick.
     validate_pool_privacy(cfg)?;
 
-    // The non-ZDR consent chain (dormant unless a `no-zdr` provider is configured).
-    let (non_zdr_flag, non_zdr_env) = (
-        args.route_non_zdr_this_run,
-        std::env::var(NON_ZDR_ENV_VAR).is_ok_and(|v| !v.trim().is_empty()),
-    );
-    let non_zdr_armed =
-        validate_non_zdr_gates(cfg, non_zdr_flag, non_zdr_env, config::today_epoch_days())?;
+    // Gate 0 (documented): the run must ask for the pay-with-data arm at all. Without
+    // `--enable-pay-with-data` the arm is pruned from the pool and the consent chain below is
+    // never consulted — so an un-armed, expired or misattested `no-zdr` block cannot fail a run
+    // that was only ever going to use the ZDR arms.
+    let non_zdr_armed = if args.enable_pay_with_data {
+        // The non-ZDR consent chain (dormant unless a `no-zdr` provider is configured).
+        let (non_zdr_flag, non_zdr_env) = (
+            args.route_non_zdr_this_run,
+            std::env::var(NON_ZDR_ENV_VAR).is_ok_and(|v| !v.trim().is_empty()),
+        );
+        validate_non_zdr_gates(cfg, non_zdr_flag, non_zdr_env, config::today_epoch_days())?
+    } else {
+        let pruned = cfg
+            .providers
+            .iter()
+            .filter(|p| p.privacy == Some(Privacy::NoZdr))
+            .count();
+        if pruned > 0 {
+            eprintln!(
+                "note: {pruned} pay-with-data provider(s) excluded from this run's pool — \
+                 pass --enable-pay-with-data to include them."
+            );
+        }
+        false
+    };
     if non_zdr_armed {
         // Session-level disclosure ONLY (see [`NON_ZDR_DISCLOSURE`]): naming the alias (or the
         // per-request route) would deblind the harness. This copy fires before launch; a launched
@@ -490,8 +547,8 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
     let store = open_store()?;
     let mut rng = rand::thread_rng();
 
-    seed_pool(&store, cfg, &mut rng)?;
-    let (cands, entries) = build_pool(&store, cfg)?;
+    seed_pool(&store, cfg, args.enable_pay_with_data, &mut rng)?;
+    let (cands, entries) = build_pool(&store, cfg, args.enable_pay_with_data)?;
     anyhow::ensure!(
         !cands.is_empty(),
         "no models configured — add [[providers.models]] entries to config.toml"
@@ -1227,6 +1284,10 @@ pub struct RunArgs {
     /// In launcher mode, skip the end-of-session rating prompt.
     #[arg(long)]
     pub no_rate: bool,
+    /// Include pay-with-data providers (`privacy = "no-zdr"`) in this run's pool. Off by default:
+    /// such an endpoint may log or train on your prompts, so it is excluded unless you ask for it.
+    #[arg(long)]
+    pub enable_pay_with_data: bool,
     // The final gate of the non-ZDR consent chain: per-invocation, hidden from --help, revealed
     // only by the startup error once every earlier gate has passed. (A regular comment, not a doc
     // comment — a doc comment would become clap help text.)
@@ -1681,6 +1742,132 @@ mod tests {
         cfg_of(p)
     }
 
+    /// A priced ZDR provider alongside the `no-zdr` one — the fixture the gate-0 pruning tests
+    /// need. `mixed_pool_config` does not fit: its providers declare no `privacy` at all and it
+    /// carries no `no-zdr` arm. The ZDR side must own a model, or "keeps the ZDR arms" would be
+    /// vacuously true.
+    fn zdr_and_pay_with_data_cfg(attested: &[&str], expires: Option<&str>) -> Config {
+        let zdr = ProviderConfig {
+            slug: "or".into(),
+            base_url: "https://openrouter.ai/api/v1".into(),
+            privacy: Some(Privacy::OpenRouter),
+            models: vec![ModelConfig {
+                canonical_key: "zdr-model".into(),
+                real_slug: "example/zdr-model".into(),
+                input_per_mtok: Some(1.0),
+                output_per_mtok: Some(2.0),
+            }],
+            ..Default::default()
+        };
+        let mut cfg = cfg_of(zdr);
+        cfg.providers
+            .extend(no_zdr_cfg(attested, expires).providers);
+        cfg
+    }
+
+    /// Gate 0: without `--enable-pay-with-data` the pay-with-data arm is not in the pool, while
+    /// every ZDR arm still is. The `no-zdr` provider here is FULLY VALID and attested — pruning
+    /// must follow from the flag alone, never from a failed attestation.
+    #[test]
+    fn unarmed_pool_prunes_pay_with_data_but_keeps_zdr_arms() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = zdr_and_pay_with_data_cfg(&["example/non-zdr-model"], Some("2026-08-30"));
+        let mut rng = StdRng::seed_from_u64(10);
+        seed_pool(&store, &cfg, false, &mut rng).unwrap();
+        let (cands, entries) = build_pool(&store, &cfg, false).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "{:?}",
+            entries.iter().map(|e| &e.provider_slug).collect::<Vec<_>>()
+        );
+        assert_eq!(entries[0].provider_slug, "or");
+        assert_eq!(cands.len(), entries.len(), "cands and entries stay aligned");
+    }
+
+    /// Passing the flag puts the arm back in the pool alongside the ZDR ones.
+    #[test]
+    fn enabling_pay_with_data_includes_the_arm() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = zdr_and_pay_with_data_cfg(&["example/non-zdr-model"], Some("2026-08-30"));
+        let mut rng = StdRng::seed_from_u64(11);
+        seed_pool(&store, &cfg, true, &mut rng).unwrap();
+        let (cands, entries) = build_pool(&store, &cfg, true).unwrap();
+        assert_eq!(
+            entries.len(),
+            2,
+            "{:?}",
+            entries.iter().map(|e| &e.provider_slug).collect::<Vec<_>>()
+        );
+        assert!(entries.iter().any(|e| e.provider_slug == "or"));
+        assert!(entries.iter().any(|e| e.provider_slug == "pwd"));
+        assert_eq!(cands.len(), entries.len(), "cands and entries stay aligned");
+    }
+
+    /// The regression this gate exists for: a long-expired attestation used to refuse the WHOLE
+    /// run. Un-armed, the chain is never consulted, so the ZDR arms are unaffected.
+    #[test]
+    fn an_expired_pay_with_data_provider_does_not_break_an_unarmed_run() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = zdr_and_pay_with_data_cfg(&["example/non-zdr-model"], Some("2020-01-01"));
+        let mut rng = StdRng::seed_from_u64(12);
+        seed_pool(&store, &cfg, false, &mut rng).unwrap();
+        let (cands, entries) = build_pool(&store, &cfg, false).unwrap();
+        assert_eq!(
+            entries.len(),
+            1,
+            "{:?}",
+            entries.iter().map(|e| &e.provider_slug).collect::<Vec<_>>()
+        );
+        assert_eq!(entries[0].provider_slug, "or");
+        assert_eq!(cands.len(), 1);
+        // And the chain would still have refused, had the run opted in.
+        let today = config::date_to_epoch_days("2026-09-07").unwrap();
+        let err = validate_non_zdr_gates(&cfg, true, true, today)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("expired"), "{err}");
+    }
+
+    /// Pruning the only configured provider must say so, not claim nothing is configured.
+    #[test]
+    fn pool_empty_after_pruning_names_the_flag() {
+        let store = Store::open_in_memory().unwrap();
+        let cfg = no_zdr_cfg(&["example/non-zdr-model"], Some("2026-08-30"));
+        let mut rng = StdRng::seed_from_u64(13);
+        seed_pool(&store, &cfg, false, &mut rng).unwrap();
+        // `.err()` rather than `unwrap_err()`: the latter needs `Debug` on the Ok type, and
+        // `PoolEntry` deliberately has none — it pairs an alias with its provider, so making it
+        // printable would turn any stray log line into a deblinding.
+        let err = build_pool(&store, &cfg, false)
+            .err()
+            .expect("pruning the only provider must fail the pool build")
+            .to_string();
+        assert!(err.contains("--enable-pay-with-data"), "{err}");
+        assert!(
+            !err.contains("no models are configured"),
+            "the generic message misleads when models exist but were excluded: {err}"
+        );
+    }
+
+    /// The disclosure boundary, locked in code: gate 0 is documented and must appear in `--help`;
+    /// the final gate stays hidden and must never surface there.
+    #[test]
+    fn help_documents_gate_zero_and_still_hides_the_final_flag() {
+        let help = RunArgs::augment_args(clap::Command::new("run"))
+            .render_long_help()
+            .to_string();
+        assert!(help.contains("--enable-pay-with-data"), "{help}");
+        assert!(
+            help.contains("pay-with-data providers"),
+            "the flag needs help text, not just a name: {help}"
+        );
+        assert!(
+            !help.contains("route-non-zdr-this-run"),
+            "the final gate must stay hidden from --help: {help}"
+        );
+    }
+
     /// The chain is completely dormant without a `no-zdr` provider: even with the env var and flag
     /// supplied, nothing is checked and nothing is armed (they are silently inert).
     #[test]
@@ -1829,8 +2016,8 @@ mod tests {
         cfg.providers
             .extend(no_zdr_cfg(&["example/non-zdr-model"], Some("2026-08-30")).providers);
         let mut rng = StdRng::seed_from_u64(5);
-        seed_pool(&store, &cfg, &mut rng).unwrap();
-        let (cands, entries) = build_pool(&store, &cfg).unwrap();
+        seed_pool(&store, &cfg, true, &mut rng).unwrap();
+        let (cands, entries) = build_pool(&store, &cfg, true).unwrap();
         let nz = entries
             .iter()
             .position(|e| e.provider_slug == "pwd")
@@ -1877,8 +2064,8 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let cfg = mixed_pool_config();
         let mut rng = StdRng::seed_from_u64(1);
-        seed_pool(&store, &cfg, &mut rng).unwrap();
-        seed_pool(&store, &cfg, &mut rng).unwrap(); // second run must not duplicate
+        seed_pool(&store, &cfg, true, &mut rng).unwrap();
+        seed_pool(&store, &cfg, true, &mut rng).unwrap(); // second run must not duplicate
 
         // Two aliases (one per provider) sharing one model-token.
         let n: i64 = store
@@ -1905,9 +2092,9 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let cfg = mixed_pool_config();
         let mut rng = StdRng::seed_from_u64(2);
-        seed_pool(&store, &cfg, &mut rng).unwrap();
+        seed_pool(&store, &cfg, true, &mut rng).unwrap();
 
-        let (cands, entries) = build_pool(&store, &cfg).unwrap();
+        let (cands, entries) = build_pool(&store, &cfg, true).unwrap();
         assert_eq!(cands.len(), 2);
         // The free entry normalizes to price 0; the priced entry to 1 (pool max).
         let free_i = entries
@@ -1929,7 +2116,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let cfg = mixed_pool_config();
         let mut rng = StdRng::seed_from_u64(3);
-        seed_pool(&store, &cfg, &mut rng).unwrap();
+        seed_pool(&store, &cfg, true, &mut rng).unwrap();
 
         // Rate a session on the free provider's alias; the belief is keyed on canonical_key, so the
         // priced provider's entry for the same model must see the same lifted track record. Start
@@ -1945,7 +2132,7 @@ mod tests {
             .unwrap();
         store.record_rating(sid, 2, 0, None).unwrap();
 
-        let (cands, entries) = build_pool(&store, &cfg).unwrap();
+        let (cands, entries) = build_pool(&store, &cfg, true).unwrap();
         let free_i = entries
             .iter()
             .position(|e| e.provider_slug == "free-prov")
@@ -1970,7 +2157,7 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let cfg = mixed_pool_config();
         let mut rng = StdRng::seed_from_u64(4);
-        seed_pool(&store, &cfg, &mut rng).unwrap();
+        seed_pool(&store, &cfg, true, &mut rng).unwrap();
 
         // A too_large failure on the free provider's alias — never rated, but it must still be learned
         // against, keyed on canonical_key so both providers' entries for the model see it.
@@ -1998,7 +2185,7 @@ mod tests {
             )
             .unwrap();
 
-        let (cands, entries) = build_pool(&store, &cfg).unwrap();
+        let (cands, entries) = build_pool(&store, &cfg, true).unwrap();
         let free_i = entries
             .iter()
             .position(|e| e.provider_slug == "free-prov")
@@ -2020,7 +2207,7 @@ mod tests {
         // failure_sensitivity = 0 makes it inert: the candidate is back at the blank prior.
         let mut cfg0 = cfg.clone();
         cfg0.failure_sensitivity = 0.0;
-        let (cands0, _) = build_pool(&store, &cfg0).unwrap();
+        let (cands0, _) = build_pool(&store, &cfg0, true).unwrap();
         assert!(
             (cands0[free_i].track.mean() - 0.5).abs() < 1e-12,
             "sensitivity 0 ignores failures"

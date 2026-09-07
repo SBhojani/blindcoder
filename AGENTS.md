@@ -34,8 +34,10 @@ reproducible dev shell (`nix develop`) — recommended for a matching toolchain,
 plain rustup works too. Either way, Nix is dev/build only, never a runtime requirement.
 
 The opt-in non-ZDR routing path (`privacy = "no-zdr"`) is always compiled in and stays dormant
-unless configured; its consent chain is enforced entirely at runtime. Its tests run in the plain
-`cargo test --workspace` suite — there is no feature flag to remember.
+unless configured; its consent chain is enforced entirely at runtime. Even when configured, such a
+provider is pruned from the pool unless the run passes `--enable-pay-with-data`, so it can never
+block or alter an ordinary run. Its tests run in the plain `cargo test --workspace` suite — there is
+no feature flag to remember.
 
 ## Architecture — split by durability, not by feature
 
