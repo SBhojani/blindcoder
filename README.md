@@ -173,7 +173,7 @@ Paths follow the XDG base-directory spec, so nothing is tied to a particular OS:
 | What | Location |
 |------|----------|
 | Config | `$XDG_CONFIG_HOME/blindcoder/config.toml` |
-| Authoritative event log (SQLite) | `$XDG_DATA_HOME/blindcoder/` |
+| Authoritative event log (SQLite) | `$XDG_DATA_HOME/blindcoder/blindcoder.db` |
 
 The event log also holds the alias↔model map (the blind key), so it is treated as private state
 and is never committed — see [`.gitignore`](.gitignore).
@@ -189,22 +189,24 @@ to prove it structurally rather than by hope:
   signal is recorded — no prompts, no code.
 - **The append-only store cannot be quietly rewritten.** Corrections supersede; database
   triggers reject edits and deletes.
-- **Non-ZDR routing exists only as a multi-gated opt-in.** A `privacy = "no-zdr"` provider (a
-  pay-with-data endpoint that may log or train on prompts) is **excluded from the pool entirely
-  unless you pass `--enable-pay-with-data`** — configuring one never blocks or alters an ordinary
-  run, it simply is not a candidate. Ask for it and the arm is then refused until per-provider and
-  per-session attestations — which surface one at a time at startup — are all satisfied. Sessions
-  containing such a model are bannered as non-private and every routed request lands in a
-  fail-closed audit file. The ZDR pool's guarantees are unchanged.
+- **Non-ZDR routing exists only as a multi-gated opt-in.** A `privacy = "no-zdr"` provider
+  (a pay-with-data endpoint that may log or train on prompts) is **excluded from the
+  pool entirely unless you pass `--enable-pay-with-data`** — configuring one never blocks
+  or alters an ordinary run, it simply is not a candidate. The arm requires five gates
+  to open: pool inclusion, config attestation, a per-session environment second factor,
+  an `expires` date (required, refuses to start if absent, past, or more than 30 days
+  out), and a runtime flag — each surfaces one at a time at startup and a run stops
+  at the first unmet gate. Sessions containing such a model are bannered as non-private
+  and every routed request lands in a fail-closed audit file. The ZDR pool's guarantees
+  are unchanged.
 
 ## Roadmap
 
 - **M0** — the persistent core (selector · store · config · alias), `simulate`/`sweep` (validation),
-  `run`/`rate` over a streaming forwarding proxy, and a `stats` leaderboard over the event log.
-  *shipped*
-- **M1** — the production proxy: the fail-closed, type-enforced per-request privacy gate
-  (`VettedRequest` typestate + host-bound, attested pool validation) is shipped; still to come is a
-  raw-capture tee for mid-stream usage accounting. ← *here*
+  `run`/`rate` over a streaming forwarding proxy, the type-enforced privacy gate, and a
+  `stats` leaderboard over the event log. *shipped*
+- **M1** — raw-capture tee for mid-stream usage accounting (token-by-token cap enforcement).
+  ← *here*
 - **M2** — capture levels and byte-exact wire archives; a standing serve mode.
 - **M3** — many providers, subscription cap-safety, optional market price tracking.
 

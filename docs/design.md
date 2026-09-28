@@ -203,6 +203,8 @@ time-to-converge, and prints a GO / MARGINAL / NO-GO verdict. Use it to size the
 per arm under *sparse* feedback. The `--rate-prob` knob (probability a session gets rated;
 `rate × rate_prob` = ratings/day) exposes this, and it is where the design's size ceiling comes
 from:
+> **Note:** The default simulate run is dense (`rate_prob = 1.0` — every session rated).
+> The sparsity claims above require `--rate-prob < 1` explicitly.
 
 - **A small pool (3–4) degrades gracefully** — at ~1 rating/day it still captures ~0.71–0.80 of
   the value gap (MARGINAL). This is the recommended operating point.
@@ -238,9 +240,10 @@ default the stationary metric likes.
 
 ## Storage
 
-An append-only, event-sourced SQLite log. The **capture level** (`metadata` | `contents` |
-reserved — it parses and is recorded on the row, but the only behavioral gate in the router is
-`>= replay`, so it captures nothing today. The default, `metadata`, records only the
+An append-only, event-sourced SQLite log. The **capture level** (`metadata` |
+`contents` | `replay` — it parses and is recorded on the row, but the only behavioral
+gate in the router is `>= replay`, so it captures nothing today. The default,
+`metadata`, records only the
 model↔rating↔cost↔time signal the selector needs — **no prompts or code**. Corrections supersede
 (a new row), never edit; database triggers enforce append-only.
 

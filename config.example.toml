@@ -58,7 +58,7 @@ curated_policy_max_age_days = 90
 # How much of each session is recorded. The default keeps only the signal the selector needs and
 # never touches your prompts or code:
 #   * "metadata" (default) — model ↔ rating ↔ cost ↔ time only, in the SQLite log. No wire data.
-#   * "contents"           — reserved for a future level.
+#   * "contents"           — parsed content projections stored in the DB.
 #   * "replay"             — additionally archive the raw four-leg wire exchange (cli/provider
 #                            request + response) byte-exact to a disposable WARC file under
 #                            $XDG_STATE_HOME/blindcoder/wire/<session_id>.warc (0600). These files

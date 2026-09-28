@@ -57,9 +57,9 @@ exhaustive-match compile-time review, the per-provider scoping, blindness, and t
   send-only-accepts-`VettedRequest` typestate invariant is unbroken and the exhaustive `match`
   still forces a reviewer to write this arm deliberately.
 
-### The four gates (a progressively-disclosed consent chain)
+### The five gates (a progressively-disclosed consent chain)
 
-The mode is inert unless **all four** independent channels are satisfied. This is a deliberate
+The mode is inert unless **all five** independent channels are satisfied. This is a deliberate
 *conjunction*, distinct from the normal `flag > env > file` precedence — none overrides another;
 all must be present:
 
@@ -110,7 +110,7 @@ flag to someone who has not yet passed the config gates.
 | 2c | `expires` more than 30 days out | **only now** the 30-day cap rule (refuse to start) |
 | 3 | all config gates pass; env var unset | the environment variable |
 | 4 | env set; flag not passed | the CLI flag |
-| ✓ | all four satisfied | startup banner fires; audit trail opens (fail-closed) |
+| ✓ | all five satisfied | startup banner fires; audit trail opens (fail-closed) |
 
 Properties: strictly sequential disclosure; the 30-day bound is invisible to a compliant
 near-future value; one thing revealed per run; dormant by default.

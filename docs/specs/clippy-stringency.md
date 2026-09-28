@@ -52,7 +52,7 @@ workspace stays `clippy`-clean and every test passes.
    `missing_errors_doc`, `doc_markdown`, `too_many_lines`) — out of scope for this pass.
 
 5. **Remove the `#[allow(clippy::too_many_arguments)]`** on `Store::record_session_end` and fix it
-   properly: bundle the **seven terminal-event fields** into a `SessionEnd` params struct, keeping
+   bundle the **eight terminal-event fields** into a `SessionEnd` params struct, keeping
    `session_id` as a separate key argument. Derive `Default` on the struct so the test seed-calls (most
    pass several `None`s) stay terse via `..Default::default()`. Update **all call sites** (there are
    ~8: one production caller in `src/run.rs`, the rest are test seeds in `src/run.rs`, `src/stats.rs`,

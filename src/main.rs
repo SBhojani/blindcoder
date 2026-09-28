@@ -37,8 +37,6 @@ enum Cmd {
     Run(run::RunArgs),
     /// Rate a past session after the fact (difficulty captured post-hoc; corrections supersede).
     Rate(run::RateArgs),
-    /// Unmask a session's model through the [`stats`] subcommand's `--reveal` flag — gated and logged.
-    Reveal,
     /// Show per-alias quality/cost/value leaderboards.
     Stats(stats::StatsArgs),
 }
@@ -53,13 +51,5 @@ fn main() -> anyhow::Result<()> {
         Cmd::Run(args) => run::run(&cfg, &args),
         Cmd::Rate(args) => run::rate(&args),
         Cmd::Stats(args) => stats::run(&args, &cfg),
-        Cmd::Reveal => {
-            eprintln!(
-                "`reveal` is available via the [`stats`] subcommand's `--reveal` flag; each \
-                 unmasking is journaled to the `reveals` table.\n\
-                 Try:  blindcoder stats --help"
-            );
-            std::process::exit(2);
-        }
     }
 }
