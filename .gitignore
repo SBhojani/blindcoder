@@ -10,6 +10,7 @@
 *.db-shm
 /wire/
 *.warc.gz
+*.warc
 
 # Real config and secrets (ship config.example.toml instead)
 /config.toml

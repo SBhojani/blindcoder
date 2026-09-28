@@ -1,37 +1,15 @@
 # Spec: `stats` subcommand — per-model leaderboard from the event store
 
 **Status:** implemented
-**Scope:** implement the currently-stubbed `stats` CLI subcommand. Read-only over the event store,
-reusing the existing selector math. Respects the blind by default.
+**Scope:** the `stats` subcommand is now implemented and ships. It reads from the event store, reusing the existing selector math, and respects the blind by default.
 
 ## Problem
 
-Everything blindcoder records — ratings, costs, tokens, failures — is currently invisible. The only
-readout is raw SQLite. `stats` is one of two stubbed subcommands (`src/main.rs`: `Cmd::Stats` prints
-"lands in a later milestone" and exits 2). We now have real sessions in the store (successful runs,
-ratings, and `too_large`/auth failures) with nothing to surface them.
-
-## Goal
-
-`blindcoder stats` prints a **per-model leaderboard** answering "which models are best per dollar,
-and how much have they cost me" — the project's core question — **without breaking the blind**.
-
-## The blind (read this first — it drives the design)
-
-- The selector learns per **`canonical_key`** (the provider-neutral model identity). This is the row
-  identity to aggregate on.
-- **`canonical_key` and the real slug are identifying.** Printing them deblinds an ongoing evaluation
-  (seeing "model X was great" biases your next rating). So they must **not** appear by default.
-- Each model has a stable **blind display token** (the alias / `model_token`). `stats` shows *that*
-  by default — you can compare rows without learning identities.
-- The **reveal gate** (`crates/alias`: `RevealGate::reveal(..)`, `RevealReason`) is the single audited
-  crossing point, and reveals are journaled (`reveals` table). Unmasking real model names in `stats`
-  must go **through the gate**, so it is opt-in and recorded.
+Everything blindcoder records — ratings, costs, tokens, failures — is now visible via the `stats` subcommand. The per-model leaderboard answers "which models are best per dollar, and how much have they cost me" — the project's core question — **without breaking the blind**.
 
 ## Requirements
 
-1. **Remove the stub.** `Cmd::Stats` runs the real command; drop it from the "later milestone" arm.
-2. **Aggregate per model (`canonical_key`)** over all recorded sessions. Each row shows:
+1. **Aggregate per model (`canonical_key`)** over all recorded sessions. Each row shows:
    - the **blind model token** (default) — never the real slug or `canonical_key` unless revealed;
    - **# sessions** and **# rated** sessions;
    - **avg performance** rating and **avg difficulty** (from effective, supersede-aware ratings);
@@ -50,16 +28,16 @@ and how much have they cost me" — the project's core question — **without br
      of the cost for agentic workloads;
    - **failures**: count of sessions with a non-null `session_end.error_kind`, ideally broken down by
      kind (e.g. `too_large:2 auth:1`).
-3. **Default sort = value score, descending** (best value first). Allow `--sort <col>` for at least
+2. **Default sort = value score, descending** (best value first). Allow `--sort <col>` for at least
    `value`, `quality`, `cost`, `sessions` (and `--asc` to reverse). Reasonable defaults over
    completeness.
-4. **Blind by default; `--reveal` to unmask.** Without `--reveal`, rows are keyed by the blind token.
+3. **Blind by default; `--reveal` to unmask.** Without `--reveal`, rows are keyed by the blind token.
    With `--reveal`, replace the blind token with the real model slug **via the reveal gate**
    (`RevealGate::reveal` with an appropriate `RevealReason`) so each unmasking is **journaled** to the
    `reveals` table. (Add a `RevealReason` variant if the existing ones don't fit; keep it minimal.)
-5. **Read-only** except the reveal journal rows written under `--reveal`. `stats` must never mutate
+4. **Read-only** except the reveal journal rows written under `--reveal`. `stats` must never mutate
    sessions/ratings/prices. Do not add `UPDATE`/`DELETE` to any integrity table (triggers forbid it).
-6. **Empty/degenerate input is friendly:** no sessions → print a short "no sessions recorded yet"
+5. **Empty/degenerate input is friendly:** no sessions → print a short "no sessions recorded yet"
    message and exit 0, not a panic or an empty crash. A model with sessions but zero ratings shows
    its cost/token/failure columns with blanks (or `—`) for the rating/quality columns.
 
@@ -101,8 +79,6 @@ and how much have they cost me" — the project's core question — **without br
   that only bites a real file. An all-in-memory test suite can be 100% green over a file-only crash.
 - Empty DB prints the friendly message and exits 0.
 - Build, tests, clippy, and `fmt --check` are all green.
-- No stale "stats lands in a later milestone" claims remain (`src/main.rs` module doc, README,
-  Milestones) — reconcile them to reflect that `stats` ships.
 
 ## Verification note for the reviewer
 

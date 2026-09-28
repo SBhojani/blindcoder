@@ -26,8 +26,9 @@ Blinding defends against the thing that actually biases ratings: **name-driven p
 is honest to say where it can leak:
 
 - **Cost and latency are tells.** A visibly pricey or conspicuously slow response narrows the
-  guess. Mitigation: the rating is collected *before* any cost is shown, so the number can't
-  anchor the score; cost enters only the selector's math, not your judgement.
+  guess. `run` shows the realized cost only at session end and asks both rating questions
+  separately, against the finished work — but the number *is* on screen before you answer, so a
+  known-expensive alias stays a weak tell.
 - **Models self-identify.** A model may name itself in its output, or have a recognizable style.
   Blinding can't prevent this; it only avoids *volunteering* the identity.
 - **A small pool is low-entropy.** With two or three candidates, a confident guess is sometimes
@@ -94,11 +95,13 @@ blindcoder is **provider-generic by construction.** Any OpenAI-compatible
 `/chat/completions` endpoint is a candidate; the code never branches on which provider it is.
 Everything provider-specific is *data* in the config, not a code path:
 
-- A provider is `{ slug, base_url, wire, key_env }` plus two passthrough hooks —
-  **`extra_headers`** (verbatim per-request headers, e.g. attribution) and **`extra_body`** (a
-  JSON object merged into every request body, e.g. provider-routing or data-policy/ZDR flags).
-  This is how per-provider behaviour is expressed without a branch, so adding a new backend is a
-  config edit, not a code change.
+- A provider is `{ slug, base_url, wire, key_env }`, a **required `privacy` declaration**, and two
+  passthrough hooks — **`extra_headers`** (verbatim per-request headers, e.g. attribution) and
+  **`extra_body`** (a JSON object merged into every request body, e.g. provider-routing knobs like
+  `sort` or `max_price`). `privacy` is the one field that must name a provider: it selects the ZDR
+  protocol, and a provider that omits it is excluded before any pick. The key itself may be inline
+  (`api_key`) rather than via `key_env`. This is how per-provider behaviour is expressed without a
+  branch, so adding a new backend is a config edit, not a code change.
 - Each provider lists its **models** as `{ canonical_key, real_slug, optional prices }`.
   `canonical_key` is the provider-neutral identity the selector learns on, so the *same* model
   offered by two providers shares one quality belief while the two compete on price. `real_slug`
@@ -110,12 +113,12 @@ $0), so the selector reduces to a pure quality race. Mixing in at least one pric
 what exercises the cost/quality trade-off — which is what the router is for.
 
 **The proxy is a rewrite, not a translation.** For one session the router picks a candidate,
-starts a session, and forwards requests to the chosen endpoint with just two edits to the wire
-body: the blind `model` field is replaced with the resolved `real_slug`, and the provider's
-`extra_body` is shallow-merged in. The resolved model is always written last, so a stray or
-hostile `extra_body.model` can never route around the blind. The blind→real crossing happens
-only inside the **reveal gate** (reason: routing) and is journaled, so it stays auditable and
-the real identity never leaks to the user.
+starts a session, and forwards requests to the chosen endpoint with three edits to the wire body:
+the provider's `extra_body` is shallow-merged in, the blind `model` field is replaced with the
+resolved `real_slug`, and the declared privacy protocol is applied. `extra_body` is merged first
+and the resolved model is written last, so a stray or hostile `extra_body.model` can never route
+around the blind. The blind→real crossing happens only inside the **reveal gate** (reason: routing)
+and is journaled, so it stays auditable and the real identity never leaks to the user.
 
 `run` performs the pick, resolves the route through the gate, and records the session; `rate`
 appends the two-question rating afterward (a correction supersedes rather than edits). Difficulty
@@ -236,9 +239,10 @@ default the stationary metric likes.
 ## Storage
 
 An append-only, event-sourced SQLite log. The **capture level** (`metadata` | `contents` |
-`replay`, a config enum recorded on each session row) sets how much is kept. The default,
-`metadata`, records only the model↔rating↔cost↔time signal the selector needs — **no prompts or
-code**. Corrections supersede (a new row), never edit; database triggers enforce append-only.
+reserved — it parses and is recorded on the row, but the only behavioral gate in the router is
+`>= replay`, so it captures nothing today. The default, `metadata`, records only the
+model↔rating↔cost↔time signal the selector needs — **no prompts or code**. Corrections supersede
+(a new row), never edit; database triggers enforce append-only.
 
 At `replay`, blindcoder additionally archives the **verbatim four-leg wire exchange** —
 `cli_request`, `provider_request`, `provider_response`, `cli_response` — byte-exact to a disposable
@@ -300,11 +304,13 @@ protocol is written and reviewed). Provider *names* appear here, and only here.
 
 ## Milestones
 
-- **M0** — the permanent core (selector · store · config · alias), `simulate`, and `run`/`rate`
-  over a streaming forwarding proxy (real blind pick, live proxying, cost cap, session logging).
+- **M0** — the permanent core (selector · store · config · alias), `simulate`/`sweep`, `run`/`rate`
+  over a streaming forwarding proxy (real blind pick, live proxying, cost cap, session logging),
+  and the `stats` leaderboard over the event log. (shipped)
 - **M1** — the production proxy: fail-closed, type-enforced per-request privacy (shipped); raw-capture
   tee for mid-stream usage accounting (remaining).
-- **M2** — capture levels, byte-exact wire archives, a standing serve mode.
+- **M2** — capture levels and a standing serve mode: the byte-exact four-leg wire archive and the
+  standing proxy are shipped; the `contents` capture level is remaining.
 - **M3** — many providers, subscription cap-safety, optional whole-market price tracking.
 
 Everything below the `Backend` trait grows in place across these milestones; everything above it

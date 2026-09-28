@@ -80,6 +80,20 @@ cargo run -- simulate --help
 It prints the best-arm pick-rate over training, cumulative regret against the random-choice
 baseline, and a time-to-converge estimate, ending in a plain GO / MARGINAL / NO-GO verdict.
 
+## sweep
+
+`sweep` is `simulate`'s grid form: the same harness run across combinations of pool size and
+exploration, one CSV row per cell — so a tuneable is chosen on evidence rather than taste.
+
+```sh
+cargo run -- sweep                        # defaults: pools 3,4,5,6,8 × exploration 0.5,0.7,1.0
+cargo run -- sweep --pools 5,8 --explorations 0.3,0.7
+cargo run -- sweep --help
+```
+
+Columns are `pool, exploration, value_eff, gap_captured, good_rate, best_rate, converged_frac,
+median_ttc, verdict`. The parameter header goes to **stderr**, so stdout stays a pipeable CSV.
+
 ## run and rate
 
 Once you have declared a pool in your config (see [Configuration](#configuration)), the easiest
@@ -185,7 +199,7 @@ to prove it structurally rather than by hope:
 
 ## Roadmap
 
-- **M0** — the persistent core (selector · store · config · alias), `simulate` (validation),
+- **M0** — the persistent core (selector · store · config · alias), `simulate`/`sweep` (validation),
   `run`/`rate` over a streaming forwarding proxy, and a `stats` leaderboard over the event log.
   *shipped*
 - **M1** — the production proxy: the fail-closed, type-enforced per-request privacy gate

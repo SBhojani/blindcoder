@@ -1,11 +1,10 @@
 //! blindcoder CLI entry point.
 //!
 //! One binary, several subcommands. [`simulate`] is the offline convergence harness that validates
-//! the selector with synthetic raters. [`run`] launches a blinded proxy that routes to a picked
-//! model and streams responses back; [`rate`] records (or corrects) a past session's quality.
-//! [`stats`] prints a per-model leaderboard from the event store. [`reveal`] lands in a later
-//! milestone.
-
+//! the selector with synthetic raters, and `sweep` is its grid form (CSV to stdout). [`run`]
+//! launches a blinded proxy that routes to a picked model and streams responses back; [`rate`]
+//! records (or corrects) a past session's quality. [`stats`] prints a per-model leaderboard from
+//! the event store; its `--reveal` flag unmasks through the gate, journaled to the `reveals` table.
 mod run;
 mod simulate;
 mod stats;
@@ -38,7 +37,7 @@ enum Cmd {
     Run(run::RunArgs),
     /// Rate a past session after the fact (difficulty captured post-hoc; corrections supersede).
     Rate(run::RateArgs),
-    /// Unmask a session's model — gated and logged. (Later milestone.)
+    /// Unmask a session's model through the [`stats`] subcommand's `--reveal` flag — gated and logged.
     Reveal,
     /// Show per-alias quality/cost/value leaderboards.
     Stats(stats::StatsArgs),
@@ -56,8 +55,8 @@ fn main() -> anyhow::Result<()> {
         Cmd::Stats(args) => stats::run(&args, &cfg),
         Cmd::Reveal => {
             eprintln!(
-                "`reveal` lands in a later milestone. Available now: `simulate`, `sweep`, \
-                 `run`, `rate`, `stats`.\n\
+                "`reveal` is available via the [`stats`] subcommand's `--reveal` flag; each \
+                 unmasking is journaled to the `reveals` table.\n\
                  Try:  blindcoder stats --help"
             );
             std::process::exit(2);

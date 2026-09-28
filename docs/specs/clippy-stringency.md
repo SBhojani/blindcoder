@@ -1,16 +1,17 @@
 # Spec: stricter, enforced lint baseline (and remove the one `#[allow]`)
 
-**Status:** proposed
-**Scope:** add a workspace lint configuration that is stricter than clippy's defaults, make the code
-satisfy it, and remove the single `#[allow(clippy::too_many_arguments)]` by fixing it properly. No
-behavior change.
+**Status:** implemented
+**Scope:** the workspace now runs a curated, enforced lint baseline — clippy's default groups
+denied, `unsafe_code = "forbid"`, and a small set of extra lints — and `Store::record_session_end`'s
+eight arguments are a `SessionEnd` struct instead of a suppressed lint. No behavior change.
 
 ## Problem
 
-The workspace has **no lint configuration** — just clippy's defaults. There is exactly one lint
-suppression in the tree: `#[allow(clippy::too_many_arguments)]` on `Store::record_session_end`
-(`crates/store/src/lib.rs`), which *suppresses* the lint instead of fixing the 8-argument signature.
-We want a deliberately stricter, **enforced** lint baseline, and the allow gone.
+The workspace used to run on **clippy's defaults** with no lint configuration of its own, and carried
+exactly one lint suppression: `#[allow(clippy::too_many_arguments)]` on `Store::record_session_end`
+(`crates/store/src/lib.rs`), which *suppressed* the lint instead of fixing the 8-argument signature.
+The baseline is now a deliberately stricter, **enforced** set declared once in the root `Cargo.toml`,
+and the lone `#[allow]` is gone — those eight arguments are a typed `SessionEnd` struct.
 
 `rust-version` is `1.74`, so the Cargo `[lints]` / `[workspace.lints]` table is available.
 
@@ -85,7 +86,7 @@ workspace stays `clippy`-clean and every test passes.
       pub error_status: Option<u16>,
       pub terminated_by: Option<&'a str>,
   }
-  // pub fn record_session_end(&self, session_id: i64, end: SessionEnd<'_>) -> Result<()>
+  // pub fn record_session_end(&self, session_id: i64, end: &SessionEnd<'_>) -> Result<()>
   ```
 - Work group-by-group: add the lint table, run `cargo clippy --workspace`, fix what it flags, repeat.
 

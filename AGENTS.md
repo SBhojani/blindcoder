@@ -51,9 +51,12 @@ grows in place. Nothing in the core knows the proxy/network exists.
   work only fills more columns. Append-only is enforced by DB triggers.
 - `crates/config` — TOML config with `flag > env > file > default` precedence; XDG paths.
 - `crates/alias` — random stored masking tokens + the reveal gate.
-- `crates/backend` — the central seam: the `Backend` transport trait. At M0 a trivial
-  rewrite proxy; M1+ grow the *same* trait into a full tee + fail-closed privacy proxy.
-- `src/` — the CLI binary and the `simulate` harness.
+- `crates/backend` — the central seam: the `Backend` transport trait. It grew in place from a
+  trivial rewrite proxy into the shipped fail-closed privacy proxy (the `VettedRequest` typestate);
+  what remains is the raw-capture tee for mid-stream usage accounting.
+- `src/` — the CLI binary: `main.rs` (subcommand dispatch), `run.rs` (the `run`/`rate` driver,
+  privacy gate, cost cap, WARC wiring), `stats.rs` (the leaderboard and its `--reveal` path), and
+  `simulate.rs` (the `simulate`/`sweep` harness).
 
 ## Invariants — do not regress these
 
@@ -101,5 +104,6 @@ grows in place. Nothing in the core knows the proxy/network exists.
   examples, spec) still holds absolutely — that one protects blindness, not neutrality. See
   `docs/specs/non-zdr-pay-with-data-routing.md`.
 - Never commit user state: the SQLite DB (which contains the blind key), wire archives, real
-  `config.toml`, or secrets. `.gitignore` covers these.
+  `config.toml`, or secrets. Archives are written outside the repo (the XDG state dir); `.gitignore`
+  covers the DB, `config.toml`, and any `*.warc` that does land in the tree.
 - Ship `config.example.toml`; keep the real config out of the tree.
