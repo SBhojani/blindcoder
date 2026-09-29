@@ -40,7 +40,7 @@ source, tests, examples, or this document.
 ## Goal
 
 A `no-zdr` privacy mode that is **safe by default at every layer** — dormant when unused, absent
-from the pool unless asked for, and gated behind a chain of four independent deliberate acts — while
+from the pool unless asked for, and gated behind a chain of conditions — while
 preserving the
 exhaustive-match compile-time review, the per-provider scoping, blindness, and the cost path.
 
@@ -57,37 +57,36 @@ exhaustive-match compile-time review, the per-provider scoping, blindness, and t
   send-only-accepts-`VettedRequest` typestate invariant is unbroken and the exhaustive `match`
   still forces a reviewer to write this arm deliberately.
 
-### The five gates (a progressively-disclosed consent chain)
+### The consent chain (sequential conditions)
 
-The mode is inert unless **all five** independent channels are satisfied. This is a deliberate
+The mode is inert unless **all conditions** are satisfied. This is a deliberate
 *conjunction*, distinct from the normal `flag > env > file` precedence — none overrides another;
 all must be present:
 
 0. **Pool inclusion** — the documented CLI flag `--enable-pay-with-data`. Absent, every `no-zdr`
    provider is **pruned from the candidate pool** before any pick and the run proceeds normally on
-   the ZDR remainder; a one-line stderr note names the flag. This gate is a *prune, not a refusal*
-   — the only one of the five that does not abort the run — and because the chain below is never
+   the ZDR remainder; a one-line stderr note names the flag. This condition is a *prune, not a refusal*
+   — the only one that does not abort the run — and because the chain below is never
    consulted without it, an un-armed, expired or misattested `no-zdr` block cannot fail a run that
    was only ever going to use the ZDR arms. *(documented — see Disclosure boundary.)*
 1. **Config attestation** — a per-provider key that must list the **exact `real_slug`** of every
-   `no-zdr` model under that provider. Not a blanket boolean: a provider cannot be opted out and
-   then silently grow a second model. *(undocumented.)*
-2. **Environment second factor** — an environment variable that must be set at launch. A committed
+   `no-zdr` model under that provider. Not a blanket boolean: a provider cannot be opted out and then
+   silently grow a second model. *(undocumented.)*
+1.5. **Attestation match** — the attested slugs must exactly match the provider's current model list.
+   A mismatch reveals which models are unattested or extra. *(undocumented.)*
+2. **Expiry `expires` present** — a required per-provider date. Without this, blindcoder refuses
+   to start. *(undocumented; requires disclosure.)*
+2.5. **Expiry validated** — two sub-conditions checked together:
+   - `expires` not in the past (hard stop: refuse to start)
+   - `expires` not more than 30 days ahead (hard stop: refuse to start)
+   The 30-day bound is revealed only when violated. *(undocumented; requires disclosure.)*
+3. **Environment second factor** — an environment variable that must be set at launch. A committed
    config can therefore never route non-ZDR on its own; an operator must opt in per-session,
    per-machine, through a channel that lives in no file. *(undocumented.)*
-3. **Runtime flag** — a CLI flag on the invocation, hidden from `--help`. *(undocumented.)*
+4. **Runtime flag** — a CLI flag on the invocation, hidden from `--help`. *(undocumented.)*
 
-Plus a bounded lifetime:
-4. **Expiry** — a required per-provider `expires` date. At startup, **on a run that passed gate 0**,
-   if a `no-zdr` provider is expired **or** dated more than 30 days in the future, blindcoder
-   **refuses to start** (hard stop, the whole process halts). Without gate 0 the provider was
-   already pruned and `expires` is never read, so a lapsed attestation cannot halt an ordinary run.
-   The window is then enforced **per request**: the
-   fail-closed audit hook re-checks `expires` on every forward and refuses once it has passed,
-   so a standing proxy cannot route non-ZDR traffic past its attestation's window. The 30-day
-   rule caps how long the capability can be armed; it is a hard maximum, not a reminder.
-   *(the `expires` key is undocumented; the 30-day bound is revealed only when violated — see
-   below.)*
+Plus a **per-request** expiry check: the `expires` validation is also checked on every forward in the
+fail-closed audit hook, so a standing proxy cannot route non-ZDR traffic past its attestation's window.
 
 ### Reveal chain (when each undocumented token surfaces)
 
@@ -95,24 +94,24 @@ The chain evaluates **only** when a provider with `privacy = "no-zdr"` is presen
 config **and** the run passed gate 0 by asking for it. Otherwise it is completely dormant — a normal
 user sees nothing, and setting the env var or flag with no `no-zdr` provider is silently inert.
 
-When such a provider is present, a single ordered check runs at startup and **short-circuits at the
-first unmet gate, revealing only that gate's requirement** — never a later one. So the literal
+When such a provider is present, a single ordered check runs at startup and **short-circuits** at
+the first unmet gate, revealing only that gate's requirement — never a later one. So the literal
 identifiers surface strictly in sequence, and a config-level error can never leak the env var or
 flag to someone who has not yet passed the config gates.
 
 | Order | Condition (all earlier gates already satisfied) | Revealed |
 |------:|--------------------------------------------------|----------|
 | 0 | `--enable-pay-with-data` **not passed** | *(documented)* nothing secret — the arm is pruned, not refused, and a stderr note names the flag |
-| 1 | attestation key **absent/empty** | the attestation key + that it must list each model's exact `real_slug` |
-| 1b | attestation present but ≠ the provider's model slugs | the specific mismatch (no new token) |
+| 1 | attestation key **absent/empty** | the attestation key name + that it must list each model's exact `real_slug` |
+| 1.5 | attestation present but ≠ the provider's model slugs | the specific mismatch (no new token) |
 | 2 | attestation satisfied; **no** `expires` | that `expires` is required |
-| 2b | `expires` in the past | "expired" (refuse to start) |
-| 2c | `expires` more than 30 days out | **only now** the 30-day cap rule (refuse to start) |
-| 3 | all config gates pass; env var unset | the environment variable |
-| 4 | env set; flag not passed | the CLI flag |
-| ✓ | all five satisfied | startup banner fires; audit trail opens (fail-closed) |
+| 2.5 | `expires` in the past | "expired" (refuse to start) |
+| 2.5 | `expires` more than 30 days out | **only now** the 30-day cap rule (refuse to start) |
+| 3 | all config gates pass; env var unset | the environment variable name |
+| 4 | env set; flag not passed | the CLI flag name |
+| ✓ | all conditions satisfied | startup banner fires; audit trail opens (fail-closed) |
 
-Properties: strictly sequential disclosure; the 30-day bound is invisible to a compliant
+**Properties:** strictly sequential disclosure; the 30-day bound is invisible to a compliant
 near-future value; one thing revealed per run; dormant by default.
 
 ### Blindness-preserving disclosure
@@ -164,16 +163,16 @@ paid pay-with-data endpoint is costed and capped normally.
    configured — even expired or misattested — pay-with-data provider can never fail, alter, or
    block a run that did not ask for it. A one-line stderr note names the flag; if pruning empties
    the pool, the error says so rather than claiming nothing is configured.
-3. **Per-model exact-slug attestation** (undocumented key); startup fails unless it exactly matches
-   the set of `real_slug`s under that provider.
-4. **Environment second factor** (undocumented) and **CLI flag** (undocumented, `--help`-hidden),
-   both required in conjunction with the config.
+3. **Per-model exact-slug attestation** (config key); startup fails unless it exactly matches the
+   set of `real_slug`s under that provider, and the per-request audit check verifies the match
+   on every forward.
+4. **Environment second factor** and **CLI flag**, both required in conjunction with the config.
 5. **Required `expires`** per `no-zdr` provider; **refuse to start** if absent, past, or > 30 days
    out; the 30-day bound is revealed only on violation. The window is re-checked **per request**
    at the fail-closed audit hook: once `expires` passes, a standing proxy refuses further non-ZDR
    forwards instead of routing past its window.
-6. **Ordered, short-circuiting reveal** per the table above — one gate per run, never a later token
-   before an earlier gate passes.
+6. **Ordered, short-circuiting reveal** per the table above — one condition per run, never a later
+   token before an earlier condition passes.
 7. **Session-level startup banner only**; no per-request identity disclosure.
 8. **Fail-closed append-only audit trail** at `<YYYY-MM-DDTHH>\t<real_slug>` granularity —
    whole-UTC-hour buckets plus the real slug, **no session identifier** (aggregate accountability
@@ -181,9 +180,9 @@ paid pay-with-data endpoint is costed and capped normally.
    unmasking path).
 9. **Cost path fully live** for `no-zdr` (pricing + session cap).
 10. **Tested in the default suite:** the `no-zdr` behaviour is covered by plain
-   `cargo test --workspace` — there is no second, feature-on invocation to remember, and no way
-   for these tests to compile out silently. Fixtures use a placeholder slug
-   (`example/non-zdr-model`) — never a real vendor or model name.
+    `cargo test --workspace` — there is no second, feature-on invocation to remember, and no way
+    for these tests to compile out silently. Fixtures use a placeholder slug
+    (`example/non-zdr-model`) — never a real vendor or model name.
 
 ## Disclosure boundary
 
@@ -195,17 +194,17 @@ enablement, not a determined source-reader (the intended operator). Concretely:
   flag that must be passed for the mode to be considered at all (it appears in `--help`). The
   example config carries a short **commented stub** (the mode, the flag, then "additional required
   attestations surface at startup") — never a copy-pasteable working block. Knowing the flag buys
-  nothing on its own: passing it only moves you to gate 1, which reveals one requirement at a time.
-- **Undocumented (source + errors only):** the attestation key, the environment variable, and the
-  CLI flag — their literal identifiers do **not** appear in the README, the example config,
-  `--help`, or this spec. This document describes their *shape and reveal conditions*; the exact
-  strings live only in the code and the runtime reveal messages.
+  nothing on its own: passing it only moves you to condition 1, which reveals one requirement at a time.
+- **Undocumented (source + errors only):** the attestation key name, `expires` field name, the
+  environment variable name, and the CLI flag name — their literal identifiers do **not** appear in
+  the README, the example config, `--help`, or this spec. This document describes their *shape and
+  reveal conditions*; the exact strings live only in the code and the runtime reveal messages.
 - **No vendor or model** appears anywhere in source, tests, examples, or docs.
 
 ## Enabling (operator side)
 
 Nothing needs building specially: the stock binary already carries the path, inert. Arming it is
-purely a runtime act — declare a `privacy = "no-zdr"` provider, then satisfy each gate as the
+purely a runtime act — declare a `privacy = "no-zdr"` provider, then satisfy each condition as the
 startup error reveals it, one per run. The build is no longer part of the consent chain, so the
 packaging story is the ordinary one and no `overrideAttrs` is required.
 
