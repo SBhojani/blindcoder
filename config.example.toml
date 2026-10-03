@@ -64,7 +64,16 @@ curated_policy_max_age_days = 90
 #                            $XDG_STATE_HOME/blindcoder/wire/<session_id>.warc (0600). These files
 #                            hold your prompts and the model's output verbatim — opt in knowingly.
 # capture_level = "metadata"
-
+#
+# --- proxy ------------------------------------------------------------------------------------
+#
+# Local address the `run` proxy listens on; point your agentic CLI at http://<this>/v1.
+# proxy_addr = "127.0.0.1:8787"
+#
+# Number of automatic port increments to retry on EADDRINUSE when binding the proxy listener.
+# 0 disables retry (default); set to N to try configured port, then +1..+N on conflict.
+# proxy_bind_retries = 0
+#
 # --- providers ------------------------------------------------------------------------------
 # Declare each backend and the models it offers. Provide the API key one of two ways:
 #   * key_env = "GROQ_API_KEY"  — name an env var holding the key (preferred; keep secrets out of

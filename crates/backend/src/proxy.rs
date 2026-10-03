@@ -188,6 +188,7 @@ impl NonZdrAudit {
 /// arrives in [`Backend::start`]'s [`Pick`].
 pub struct ProxyBackend {
     bind_addr: SocketAddr,
+    bind_retries: u32,
     api_key: Option<String>,
     extra_headers: Vec<(String, String)>,
     extra_body: serde_json::Map<String, Value>,
@@ -203,7 +204,6 @@ pub struct ProxyBackend {
 impl ProxyBackend {
     /// Build a proxy that will listen on `bind_addr` (use port 0 for an ephemeral port; read the
     /// bound address back via [`Session::endpoint`]). `capture_path`, when set, turns on the raw
-    /// four-leg WARC archive for the session (the `replay` capture level) at that file.
     pub fn new(
         bind_addr: SocketAddr,
         api_key: Option<String>,
@@ -211,9 +211,11 @@ impl ProxyBackend {
         extra_body: serde_json::Map<String, Value>,
         privacy: Privacy,
         capture_path: Option<PathBuf>,
+        bind_retries: u32,
     ) -> Result<Self> {
         Ok(Self {
             bind_addr,
+            bind_retries,
             api_key,
             extra_headers,
             extra_body,
@@ -773,9 +775,26 @@ struct ProxySession {
 #[async_trait]
 impl Backend for ProxyBackend {
     async fn start(&self, pick: &Pick, alias: &str) -> Result<Box<dyn Session>> {
-        let listener = TcpListener::bind(self.bind_addr)
-            .await
-            .with_context(|| format!("binding proxy listener on {}", self.bind_addr))?;
+        let mut bind_addr = self.bind_addr;
+        let mut retries = self.bind_retries;
+        let listener = loop {
+            match TcpListener::bind(bind_addr).await {
+                Ok(l) => break l,
+                Err(e) if e.kind() == std::io::ErrorKind::AddrInUse && retries > 0 && bind_addr.port() != 0 => {
+                    let next_port = bind_addr.port().saturating_add(1);
+                    if next_port == 0 {
+                        // Port wrapped (65535 -> 0), stop retrying
+                        return Err(anyhow::anyhow!("port exhausted after {} retries", self.bind_retries));
+                    }
+                    bind_addr = SocketAddr::new(bind_addr.ip(), next_port);
+                    retries -= 1;
+                    continue;
+                }
+                Err(e) => {
+                    return Err(e).with_context(|| format!("binding proxy listener on {}", bind_addr));
+                }
+            }
+        };
         let local_addr = listener.local_addr()?;
 
         let (usage_tx, usage_rx) = mpsc::unbounded_channel();
@@ -924,13 +943,14 @@ mod tests {
 
         // The proxy, pointed at the mock upstream's base.
         let backend = ProxyBackend::new(
-            "127.0.0.1:0".parse().unwrap(),
-            Some("test-key".into()),
-            vec![],
-            serde_json::Map::new(),
-            Privacy::OpenRouter,
-            None,
-        )
+                    "127.0.0.1:0".parse().unwrap(),
+                    Some("test-key".into()),
+                    vec![],
+                    serde_json::Map::new(),
+                    Privacy::OpenRouter,
+                    None,
+                    0,
+                )
         .unwrap();
         let pick = Pick {
             canonical_key: "model-x".into(),
@@ -1063,13 +1083,14 @@ mod tests {
         });
 
         let backend = ProxyBackend::new(
-            "127.0.0.1:0".parse().unwrap(),
-            Some("k".into()),
-            vec![],
-            serde_json::Map::new(),
-            Privacy::OpenRouter,
-            None,
-        )
+                    "127.0.0.1:0".parse().unwrap(),
+                    Some("k".into()),
+                    vec![],
+                    serde_json::Map::new(),
+                    Privacy::OpenRouter,
+                    None,
+                    0,
+                )
         .unwrap();
         let pick = Pick {
             canonical_key: "m".into(),
@@ -1209,13 +1230,14 @@ mod tests {
         });
 
         let backend = ProxyBackend::new(
-            "127.0.0.1:0".parse().unwrap(),
-            Some("k".into()),
-            vec![],
-            serde_json::Map::new(),
-            Privacy::OpenRouter,
-            None,
-        )
+                    "127.0.0.1:0".parse().unwrap(),
+                    Some("k".into()),
+                    vec![],
+                    serde_json::Map::new(),
+                    Privacy::OpenRouter,
+                    None,
+                    0,
+                )
         .unwrap();
         let pick = Pick {
             canonical_key: "m".into(),
@@ -1242,13 +1264,14 @@ mod tests {
     #[tokio::test]
     async fn models_list_returns_only_the_alias() {
         let backend = ProxyBackend::new(
-            "127.0.0.1:0".parse().unwrap(),
-            Some("test-key".into()),
-            vec![],
-            serde_json::Map::new(),
-            Privacy::OpenRouter,
-            None,
-        )
+                    "127.0.0.1:0".parse().unwrap(),
+                    Some("test-key".into()),
+                    vec![],
+                    serde_json::Map::new(),
+                    Privacy::OpenRouter,
+                    None,
+                    0,
+                )
         .unwrap();
         // base_url points nowhere reachable — the intercept must answer without forwarding upstream.
         let pick = Pick {
@@ -1300,13 +1323,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let audit_path = tmp.path().join("non-zdr-audit.log");
         let backend = ProxyBackend::new(
-            "127.0.0.1:0".parse().unwrap(),
-            Some("k".into()),
-            vec![],
-            serde_json::Map::new(),
-            Privacy::NoZdr,
-            None,
-        )
+                    "127.0.0.1:0".parse().unwrap(),
+                    Some("k".into()),
+                    vec![],
+                    serde_json::Map::new(),
+                    Privacy::NoZdr,
+                    None,
+                    0,
+                )
         .unwrap()
         .with_non_zdr_audit(audit_path.clone(), Some(config::today_epoch_days() + 1));
         let pick = Pick {
@@ -1384,13 +1408,14 @@ mod tests {
 
         let tmp = tempfile::tempdir().unwrap();
         let backend = ProxyBackend::new(
-            "127.0.0.1:0".parse().unwrap(),
-            Some("k".into()),
-            vec![],
-            serde_json::Map::new(),
-            Privacy::NoZdr,
-            None,
-        )
+                    "127.0.0.1:0".parse().unwrap(),
+                    Some("k".into()),
+                    vec![],
+                    serde_json::Map::new(),
+                    Privacy::NoZdr,
+                    None,
+                    0,
+                )
         .unwrap()
         .with_non_zdr_audit(
             tmp.path().to_path_buf(), // a directory: append must fail
@@ -1445,13 +1470,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // Expired yesterday relative to this machine's clock: always past, whatever today is.
         let backend = ProxyBackend::new(
-            "127.0.0.1:0".parse().unwrap(),
-            Some("k".into()),
-            vec![],
-            serde_json::Map::new(),
-            Privacy::NoZdr,
-            None,
-        )
+                    "127.0.0.1:0".parse().unwrap(),
+                    Some("k".into()),
+                    vec![],
+                    serde_json::Map::new(),
+                    Privacy::NoZdr,
+                    None,
+                    0,
+                )
         .unwrap()
         .with_non_zdr_audit(
             tmp.path().join("non-zdr-audit.log"),
@@ -1639,13 +1665,14 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let warc_path = tmp.path().join("sess.warc");
         let backend = ProxyBackend::new(
-            "127.0.0.1:0".parse().unwrap(),
-            Some("test-key".into()),
-            vec![],
-            serde_json::Map::new(),
-            Privacy::OpenRouter,
-            Some(warc_path.clone()),
-        )
+                    "127.0.0.1:0".parse().unwrap(),
+                    Some("test-key".into()),
+                    vec![],
+                    serde_json::Map::new(),
+                    Privacy::OpenRouter,
+                    Some(warc_path.clone()),
+                    0,
+                )
         .unwrap();
         let pick = Pick {
             canonical_key: "model-x".into(),

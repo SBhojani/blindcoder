@@ -318,6 +318,9 @@ pub struct Config {
     pub curated_policy_max_age_days: f64,
     /// Local address the `run` proxy listens on; point your agentic CLI at `http://<this>/v1`.
     pub proxy_addr: String,
+    /// Number of automatic port increments to retry on EADDRINUSE when binding the proxy
+    /// listener. 0 disables retry (default); set to N to try configured port, then +1..+N on conflict.
+    pub proxy_bind_retries: u32,
     /// How much of each session to capture (see [`CaptureLevel`]). Raising it above `metadata`
     /// writes your prompts/code to disk (on-box, `0600`); leave at the default unless you want that.
     pub capture_level: CaptureLevel,
@@ -342,6 +345,7 @@ impl Default for Config {
             max_session_cost_usd: 5.0,
             curated_policy_max_age_days: 90.0,
             proxy_addr: "127.0.0.1:8787".to_string(),
+            proxy_bind_retries: 0,
             capture_level: CaptureLevel::Metadata,
             providers: Vec::new(),
         }

@@ -27,16 +27,13 @@ use store::Store;
 
 /// One routable pool entry: a model at a provider, plus the alias that blinds it and its blended
 /// shelf price. The selector `Candidate` built from this shares its track record with every other
-/// entry of the same `canonical_key` (cross-provider), but keeps its own price.
-struct PoolEntry {
-    canonical_key: String,
-    provider_slug: String,
-    alias: Alias,
-    raw_price: f64,
-    /// Split shelf prices for this model at this provider (per Mtok); `None` = free. Used to
-    /// estimate realized cost and to drive the mid-session cost cap.
-    input_per_mtok: Option<f64>,
-    output_per_mtok: Option<f64>,
+pub struct PoolEntry {
+    pub canonical_key: String,
+    pub provider_slug: String,
+    pub alias: Alias,
+    pub raw_price: f64,
+    pub input_per_mtok: Option<f64>,
+    pub output_per_mtok: Option<f64>,
 }
 
 /// Open the authoritative DB at `$XDG_DATA_HOME/blindcoder/blindcoder.db`.
@@ -634,6 +631,7 @@ pub fn run(cfg: &Config, args: &RunArgs) -> Result<()> {
         extra_body,
         privacy,
         capture_path,
+        cfg.proxy_bind_retries,
     )?;
     // When the pick landed on the no-zdr arm, arm the fail-closed per-request accountability
     // trail (the gates above already passed or we would not be here). Aggregate accountability
